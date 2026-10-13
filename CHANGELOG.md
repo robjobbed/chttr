@@ -6,6 +6,9 @@ and the project uses [semantic versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- `chttr export [--format json|csv] [--since DATE] [MEETING...]`: writes meetings
+  (title, date, speakers, notes, action items, transcript) as JSON or CSV for
+  use in other tools.
 - Lingo (`chttr lingo`, the Lingo tab in `chttr ui`, and **Lingo: fix how words
   are spelled** in the chttr menu): pick the words that came out wrong in a past
   dictation, type the right spelling, and chttr uses it from the next dictation

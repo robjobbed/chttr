@@ -466,6 +466,7 @@ recorded. Tell people.
 | `chttr ask [-v] QUESTION` | Answer a question from your meetings, with citations |
 | `chttr mcp` | Your meetings as an MCP server for Claude Code / Claude Desktop |
 | `chttr ui [--port N] [--no-browser]` | The meeting library in your browser |
+| `chttr export [--format json\|csv] [--since DATE] [MEETING...]` | Export meetings as JSON or CSV |
 
 ## Config
 

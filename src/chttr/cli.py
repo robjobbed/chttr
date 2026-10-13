@@ -243,6 +243,103 @@ def cmd_ui(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_export(args: argparse.Namespace) -> int:
+    """Export meetings as JSON or CSV (title, date, speakers, notes, action items, transcript)."""
+    import csv
+
+    from . import library as L
+
+    target_ids = list(args.meetings or [])
+    if target_ids:
+        meeting_details = []
+        for mid in target_ids:
+            m = L.meeting(mid)
+            if m:
+                meeting_details.append(m)
+            else:
+                print(f"warning: meeting {mid!r} not found", file=sys.stderr)
+    else:
+        all_meetings = L.meetings(limit=1000)
+        if args.since:
+            all_meetings = [m for m in all_meetings if (m.get("when") or "")[:10] >= args.since]
+        meeting_details = []
+        for summary in all_meetings:
+            m = L.meeting(summary["id"])
+            if m:
+                meeting_details.append(m)
+
+    try:
+        all_actions = L.action_items()
+    except Exception:  # noqa: BLE001
+        all_actions = []
+
+    records = []
+    for m in meeting_details:
+        mid = m.get("id", "")
+        title = m.get("title") or "Meeting"
+        date_str = m.get("when", "")
+        speakers = list(m.get("speakers", {}).keys()) if isinstance(m.get("speakers"), dict) else list(m.get("speakers") or [])
+        notes = m.get("notes") or {}
+        action_items = notes.get("action_items") if isinstance(notes, dict) and notes.get("action_items") else [
+            {"owner": a.get("owner", ""), "task": a.get("task", ""), "due": a.get("due", "")}
+            for a in all_actions if a.get("meeting_id") == mid
+        ]
+        transcript = m.get("transcript") or []
+
+        records.append({
+            "id": mid,
+            "title": title,
+            "date": date_str,
+            "speakers": speakers,
+            "notes": notes,
+            "action_items": action_items,
+            "transcript": transcript,
+        })
+
+    if args.format == "json":
+        print(json.dumps(records, indent=2, ensure_ascii=False))
+    elif args.format == "csv":
+        writer = csv.writer(sys.stdout)
+        writer.writerow(["id", "title", "date", "speakers", "notes", "action_items", "transcript"])
+        for r in records:
+            notes_val = r["notes"]
+            if isinstance(notes_val, dict):
+                parts = []
+                for sec in notes_val.get("sections", []):
+                    sec_title = sec.get("title", "")
+                    if sec_title:
+                        parts.append(f"## {sec_title}")
+                    for item in sec.get("items", []):
+                        parts.append(f"- {item}")
+                notes_text = "\n".join(parts)
+            else:
+                notes_text = str(notes_val or "")
+
+            actions_text = "; ".join(
+                f"{a.get('owner', '')}: {a.get('task', '')} ({a.get('due', '')})".strip()
+                if isinstance(a, dict) else str(a)
+                for a in r["action_items"]
+            )
+
+            transcript_text = "\n".join(
+                f"{u.get('speaker', '')}: {u.get('text', '')}".strip()
+                if isinstance(u, dict) else str(u)
+                for u in r["transcript"]
+            )
+
+            writer.writerow([
+                r["id"],
+                r["title"],
+                r["date"],
+                ", ".join(r["speakers"]),
+                notes_text,
+                actions_text,
+                transcript_text,
+            ])
+
+    return 0
+
+
 def cmd_lingo(args: argparse.Namespace) -> int:
     """Lingo: fix how chttr spells your words, in the browser."""
     from .ui import serve
@@ -924,6 +1021,12 @@ def build_parser() -> argparse.ArgumentParser:
     ui.add_argument("--port", type=int, default=0, help="port on 127.0.0.1 (default: any free one)")
     ui.add_argument("--no-browser", action="store_true", help="only print the link")
     ui.set_defaults(func=cmd_ui)
+
+    ex = sub.add_parser("export", help="export meetings as JSON or CSV (title, date, speakers, notes, action items, transcript)")
+    ex.add_argument("--format", choices=["json", "csv"], default="json", help="export format (default: json)")
+    ex.add_argument("--since", metavar="DATE", help="only meetings on or after this date (YYYY-MM-DD)")
+    ex.add_argument("meetings", nargs="*", metavar="MEETING", help="meeting id(s) to export (default: all)")
+    ex.set_defaults(func=cmd_export)
 
     li = sub.add_parser("lingo", help="fix how chttr spells your words: pick them from past dictations, in your browser")
     li.add_argument("--port", type=int, default=0, help="port on 127.0.0.1 (default: any free one)")
