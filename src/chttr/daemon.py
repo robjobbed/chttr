@@ -26,11 +26,12 @@ from . import context as CX
 from . import devmode, levels, tidy
 from . import overlay_proto as OP
 from . import polish as P
+from .commands import local_command
 from .config import Config, Mode
 from .dictionary import Dictionary
 from .feedback import Feedback
 from .meeting import Session, launch_processing
-from .output import current_desktop, deliver, focused_window, grab_selection
+from .output import current_desktop, delete_selection, deliver, focused_window, grab_selection, press_enter, smart_join
 from .recorder import Recorder
 from .streaming import Streamer
 from .transcriber import Transcriber, engine_key
@@ -111,6 +112,7 @@ class Daemon:
         self.last_tap = 0.0
         self.atspi_misses = 0
         self.field: Future | None = None             # the focused text field, read at key press
+        self.field_stale = False                     # ...while an earlier dictation was still to be typed into it
         self.pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="chttr-context")
         self.offered: set[tuple[str, str]] = set()   # corrections already offered this session
         self._stop = threading.Event()
@@ -795,8 +797,8 @@ class Daemon:
             app, title = focused_window()
             selection = ""
             if kind == COMMAND:
-                mode = self.cfg.mode_for(app)
-                selection = grab_selection(terminal=bool(mode and mode.name == "terminal")).strip()
+                mode = self.cfg.mode_for(app, title)
+                selection = grab_selection(terminal=bool(mode and mode.in_terminal)).strip()
         except Exception:
             log.exception("reading the focused window failed")
             app, title, selection = "", "", ""
@@ -814,6 +816,7 @@ class Daemon:
         want_field = (self.cfg.polish.screen_context != "off" or self.cfg.history.learn_from_edits) \
             and self.atspi_misses < ATSPI_GIVE_UP
         self.field = self.pool.submit(self._read_field) if want_field and kind != COMMAND else None
+        self.field_stale = self.jobs > 0
         self.app, self.title, self.selection = app, title, selection
         self.heard_speech = False
         self.levels = levels.Tracker()
@@ -858,7 +861,8 @@ class Daemon:
         self.feedback.play("stop")
         if self.overlay is None and secs >= TAP:     # the overlay shows this itself; a tap shows nothing
             self.feedback.notify("Transcribing…", f"{secs:.1f}s of audio, peak {peak_db:.0f} dB", timeout_ms=10000)
-        job = (seq, audio, secs, peak_db, self.kind, self.app, self.title, self.selection, captions, self.field)
+        job = (seq, audio, secs, peak_db, self.kind, self.app, self.title, self.selection, captions, self.field,
+               self.field_stale)
         self.field = None
         threading.Thread(target=self._process, args=job, daemon=True).start()
         return {"ok": True, "state": self.state, "seconds": round(secs, 1), "peak_db": round(peak_db, 1)}
@@ -893,10 +897,11 @@ class Daemon:
 
     def _process(self, seq: int, audio: np.ndarray, secs: float, peak_db: float, kind: str,
                  app: str, title: str, selection: str, captions: threading.Thread | Streamer | None,
-                 field_future: Future | None = None) -> None:
+                 field_future: Future | None = None, field_stale: bool = False) -> None:
         raw = text = ""
         method = ""
         mode: Mode | None = None
+        enter_after = False
         try:
             if not self.model_ready.wait(0.3):
                 self.feedback.notify("Loading the speech model\u2026", "Your dictation is kept and typed when it is ready.",
@@ -929,24 +934,39 @@ class Daemon:
             fixed = dictionary.apply(raw, names)
             if fixed != raw:
                 log.debug("dictionary: %r", fixed)
-            mode = self.cfg.mode_for(app)
+            mode = self.cfg.mode_for(app, title)
             if kind == COMMAND:
-                text = self._run_command(fixed, selection, app, title, mode, dictionary)
+                text = self._run_command(fixed, selection, app, title, mode, dictionary, seq)
                 if not text:
                     return
             else:
-                coded = devmode.transform(fixed, bool(mode and mode.is_code))
+                coded = devmode.transform(fixed, bool(mode and mode.is_code), prose=bool(mode and mode.name != "terminal"))
+                coded, enter_after = (devmode.strip_enter(coded, strict=mode.name != "terminal")
+                                      if (mode and mode.is_code and self.cfg.output.spoken_enter) else (coded, False))
                 keep = devmode.keep_list(fixed, coded)
                 if coded != fixed:
                     log.debug("dev mode: %r", coded)
                 text = self._polish(coded, app, title, mode, dictionary, keep, names,
-                                    field.before if field and self.cfg.polish.screen_context == "full" else "")
+                                    field.before if field and self.cfg.polish.screen_context == "full" else "") \
+                    if coded else ""        # it was only "run it": nothing to type, just Enter
                 text = dictionary.expand_snippets(text)
+            ts_override = None
+            # an earlier dictation typed after the field was read changed what is before the cursor
+            if kind != COMMAND and field is not None and not field_stale and self.cfg.polish.screen_context != "off":
+                text, ts_override = smart_join(field.before, field.after, text, dictionary.vocabulary + names,
+                                               code=bool(mode and mode.is_code))
             self._wait_turn(seq)
             method = deliver(text, self.cfg.output,
                              mode=(mode.output if mode else ""),
-                             trailing_space=False if kind == COMMAND else (mode.trailing_space if mode else None),
-                             allow_paste=not (mode and mode.name == "terminal"))
+                             trailing_space=False if kind == COMMAND else (
+                                 ts_override if ts_override is not None else (mode.trailing_space if mode else None)),
+                             allow_paste=not (mode and mode.in_terminal),
+                             newline=(mode.newline if mode else "enter"))
+            if enter_after and method in ("type", "paste"):
+                press_enter(0.2 if method == "paste" else 0.0)
+                if not text:            # it was only "run it"
+                    self.feedback.notify("Pressed Enter", "", timeout_ms=1500)
+                    return
             label = "Replaced" if kind == COMMAND and selection else "Typed"
             if self.cfg.history.learn_from_edits and kind != COMMAND and method in ("type", "paste"):
                 timer = threading.Timer(8.0, self._learn_from_edits, args=(text,))
@@ -1124,18 +1144,40 @@ class Daemon:
             log.debug("could not write %s: %s", flag, exc)
 
     def _run_command(self, instruction: str, selection: str, app: str, title: str,
-                     mode: Mode | None, dictionary: Dictionary) -> str:
+                     mode: Mode | None, dictionary: Dictionary, seq: int | None = None) -> str:
+        if selection:
+            # with a model at hand, only exact phrases: a near miss is the model's to read
+            local = local_command(instruction, selection, fuzzy=P.backend(self.cfg.polish) == "none")
+            if local == "" and mode and mode.in_terminal:          # "delete that"
+                self.feedback.notify("Can't delete in a terminal", "Terminals have no key that deletes a selection.",
+                                     timeout_ms=3000)
+                return ""
+            if local == "":
+                log.info("command handled locally: delete")
+                if seq is not None:
+                    self._wait_turn(seq)        # after the dictations before it have been typed
+                delete_selection()
+                n = len(selection.split())
+                self.feedback.notify("Deleted", f"{n} word{'s' if n != 1 else ''}", timeout_ms=2000)
+                return ""
+            if local:
+                log.info("command handled locally")
+                return local
         if P.backend(self.cfg.polish) == "none":
             self.feedback.play("error")
             self.feedback.notify("Command mode needs a model",
-                                 "Add an Anthropic key to ~/.config/chttr/anthropic-api-key, or install and start Ollama.",
-                                 urgency="normal", timeout_ms=8000)
+                                 "Add a key (chttr connect claude) or run Ollama. Without a model these work on a "
+                                 "selection: upper case, lower case, title case, join lines, sort lines, bullet list, "
+                                 "numbered list, wrap in quotes, remove duplicates.",
+                                 urgency="normal", timeout_ms=10000)
             return ""
         try:
             t1 = time.monotonic()
             out = P.command(instruction, selection, self.cfg.polish, app, title, dictionary.vocabulary,
                             style=mode.style if mode else "")
-            log.info("command %.2fs: %r -> %r", time.monotonic() - t1, instruction, out[:200])
+            log.info("command %.2fs: %d words -> %d words", time.monotonic() - t1, len(instruction.split()),
+                     len(out.split()))
+            log.debug("command: %r -> %r", instruction, out[:200])
             return out
         except Exception as exc:  # noqa: BLE001
             log.warning("command failed: %s", exc)

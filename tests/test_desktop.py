@@ -107,3 +107,60 @@ def test_hyprland_is_found_from_its_sockets_without_the_env_var(tmp_path):
     assert DT.detect(env).compositor == "hyprland"
     assert DT.detect({"XDG_CURRENT_DESKTOP": "Hyprland"}) == DT.Desktop("wayland", "hyprland")
     assert DT.detect({"XDG_RUNTIME_DIR": str(tmp_path / "nothing"), "WAYLAND_DISPLAY": "w"}).compositor == "wlroots"
+
+
+def test_shortcut_commands_press_return(monkeypatch):
+    monkeypatch.setattr(DT, "have", only("hyprctl", "wtype", "xdotool", "ydotool"))
+    assert DT.shortcut_command(DT.Desktop("wayland", "hyprland"), "shift+return") == \
+        ["hyprctl", "dispatch", "sendshortcut", "SHIFT, RETURN,"]
+    assert DT.shortcut_command(DT.Desktop("wayland", "hyprland"), "return") == \
+        ["hyprctl", "dispatch", "sendshortcut", ", RETURN,"]
+    assert DT.shortcut_command(DT.Desktop("wayland", "sway"), "shift+return") == \
+        ["wtype", "-M", "shift", "-k", "Return", "-m", "shift"]
+    assert DT.shortcut_command(DT.Desktop("x11", "x11"), "shift+return") == \
+        ["xdotool", "key", "--clearmodifiers", "shift+Return"]
+    assert DT.shortcut_command(DT.Desktop("wayland", "kde"), "shift+return") == \
+        ["ydotool", "key", "42:1", "28:1", "28:0", "42:0"]
+    assert DT.shortcut_command(DT.Desktop("wayland", "kde"), "backspace") == ["ydotool", "key", "14:1", "14:0"]
+
+
+def test_shift_enter_line_breaks_are_pressed_between_typed_lines(monkeypatch):
+    monkeypatch.setattr(DT, "have", lambda name: True)
+    hypr = DT.Desktop("wayland", "hyprland")
+    shift_enter = ["hyprctl", "dispatch", "sendshortcut", "SHIFT, RETURN,"]
+    assert DT.typer_commands(hypr, "line1\nline2", newline="shift+enter") == \
+        [["wtype", "--", "line1"], shift_enter, ["wtype", "--", "line2"]]
+    assert DT.typer_commands(hypr, "a\n\nb\n", newline="shift+enter") == \
+        [["wtype", "--", "a"], shift_enter, shift_enter, ["wtype", "--", "b"], shift_enter]
+    assert DT.typer_commands(hypr, "line1\nline2") == [["wtype", "--", "line1\nline2"]]      # Enter: one command
+    assert DT.typer_commands(hypr, "one line", newline="shift+enter") == [["wtype", "--", "one line"]]
+
+
+def test_shift_enter_without_a_shortcut_tool_is_refused(monkeypatch):
+    monkeypatch.setattr(DT, "have", only("wtype"))
+    gnome = DT.Desktop("wayland", "gnome")
+    assert DT.typer_commands(gnome, "a\nb", newline="shift+enter") is None
+    assert DT.typer_commands(gnome, "a\nb") == [["wtype", "--", "a\nb"]]
+    with pytest.raises(FileNotFoundError, match="Shift\\+Enter"):
+        DT.type_text("a\nb", gnome, newline="shift+enter")
+
+
+def test_type_text_runs_each_command_in_order(monkeypatch):
+    monkeypatch.setattr(DT, "have", only("wtype"))
+    ran = []
+    monkeypatch.setattr(DT.subprocess, "run", lambda cmd, **kw: ran.append(cmd))
+    assert DT.type_text("hi\nthere", DT.Desktop("wayland", "sway"), newline="shift+enter") == "wtype"
+    assert ran == [["wtype", "--", "hi"], ["wtype", "-M", "shift", "-k", "Return", "-m", "shift"],
+                   ["wtype", "--", "there"]]
+
+
+@pytest.mark.parametrize(("newline", "script"), [
+    ("enter", "type first\nkey enter\ntype second\n"),
+    ("shift+enter", "type first\nkey shift+enter\ntype second\n"),
+])
+def test_dotool_gets_line_breaks_as_keys(monkeypatch, newline, script):
+    monkeypatch.setattr(DT, "have", only("dotool"))
+    seen = {}
+    monkeypatch.setattr(DT.subprocess, "run", lambda cmd, **kw: seen.update(cmd=cmd, input=kw["input"]))
+    assert DT.type_text("first\nsecond", DT.Desktop("wayland", "gnome"), newline=newline) == "dotool"
+    assert seen == {"cmd": ["dotool"], "input": script.encode()}

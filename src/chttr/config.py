@@ -99,6 +99,9 @@ paste_over = 400
 # Typing tool: "auto" (wtype on Hyprland/Sway/niri, ydotool on GNOME/KDE,
 # xdotool on X11), or "wtype" | "ydotool" | "xdotool" | "dotool"
 typer = "auto"
+# In terminals and code editors, ending a dictation with "run it" or "press enter" presses Enter after typing.
+# In a coding agent, where Enter sends the prompt, only after a pause: "Fix the tests. Send it."
+spoken_enter = true
 
 [polish]
 # Wispr Flow-style cleanup: fillers removed, punctuation fixed, self-corrections
@@ -242,13 +245,28 @@ calendar_file = "~/.config/chttr/calendar-urls"
 # Safety limit
 max_hours = 4
 
-# Per-app modes. The first mode whose `match` (regex, case-insensitive) matches
-# the focused window's class wins. `style` is extra guidance for the cleanup
-# step; `polish = false` types the raw transcript; `output` and
-# `trailing_space` override the [output] section.
+# Per-app modes. The first mode that matches the focused window wins: `match` is
+# a list of regexes (case-insensitive) for the window's class, `title` a list for
+# its title. With both, both must match (Claude Code in a terminal); with only
+# `title`, any app whose title matches (a Gmail tab in any browser). `style` is
+# extra guidance for the cleanup step; `polish = false` types the raw transcript;
+# `output` and `trailing_space` override the [output] section; `code = true`
+# turns on spoken file names, flags and symbols; `newline` is how line breaks are
+# typed: "enter" or "shift+enter".
+[[modes]]
+name = "agent"
+match = ["alacritty", "kitty", "foot", "wezterm", "ghostty", "xterm", "konsole", "gnome.terminal", "ptyxis", "tilix", "terminator"]
+# Claude Code renames the window to the task at hand with a status glyph in front ("✳ Fix the tests")
+title = ['^[·✢-✽⠀-⣿]\\s', '(?<![/.])\\b(claude|codex|aider|gemini|opencode)\\b(?![/.-])']
+style = "This is a prompt to an AI coding agent in a terminal: complete sentences and paragraphs are fine; keep identifiers, paths and flags exactly as spoken."
+trailing_space = false
+code = true
+# Enter would send the prompt half-written; Shift+Enter starts a new line
+newline = "shift+enter"
+
 [[modes]]
 name = "terminal"
-match = ["alacritty", "kitty", "foot", "wezterm", "ghostty", "xterm", "konsole", "gnome-terminal"]
+match = ["alacritty", "kitty", "foot", "wezterm", "ghostty", "xterm", "konsole", "gnome.terminal", "ptyxis", "tilix", "terminator"]
 style = "This is a terminal. Output a single line of plain text with no trailing period; keep commands, paths and flags exactly as spoken."
 trailing_space = false
 
@@ -262,6 +280,8 @@ trailing_space = false
 match = ["slack", "discord", "whatsapp", "signal", "telegram", "element", "messages", "beeper"]
 name = "chat"
 style = "This is a chat app. Keep it casual and concise; one short message; no sign-off."
+# Line breaks are typed as Shift+Enter so a dictated paragraph never sends the message early
+newline = "shift+enter"
 
 [[modes]]
 name = "email"
@@ -272,6 +292,32 @@ style = "This is an email client. Use complete, well-punctuated sentences and pa
 name = "docs"
 match = ["docs.google", "notion", "obsidian", "libreoffice", "writer", "typora", "logseq"]
 style = "This is a document editor. Use complete sentences and paragraphs; honour dictated headings and lists."
+
+# The same apps in a browser tab, recognised by the app's name in the tab's title
+[[modes]]
+name = "docs"
+match = ["chromium", "chrome", "firefox", "brave", "vivaldi", "zen", "librewolf"]
+title = ['[-–—|] (google docs|notion|confluence|obsidian)\\b']
+style = "This is a document editor. Use complete sentences and paragraphs; honour dictated headings and lists."
+
+[[modes]]
+name = "email"
+match = ["chromium", "chrome", "firefox", "brave", "vivaldi", "zen", "librewolf"]
+title = ['[-–—|] (gmail|outlook|proton mail|fastmail)\\b', '^inbox\\b']
+style = "This is an email client. Use complete, well-punctuated sentences and paragraphs where the user pauses between thoughts."
+
+[[modes]]
+name = "chat"
+match = ["chromium", "chrome", "firefox", "brave", "vivaldi", "zen", "librewolf"]
+title = ['^(\\(\\d+\\) )?(slack|discord|whatsapp|telegram)\\b', '[-–—|] (slack|discord|whatsapp|telegram)\\b']
+style = "This is a chat app. Keep it casual and concise; one short message; no sign-off."
+newline = "shift+enter"
+
+[[modes]]
+name = "assistant"
+match = ["chromium", "chrome", "firefox", "brave", "vivaldi", "zen", "librewolf"]
+title = ['claude', 'chatgpt', 'gemini', 'copilot']
+style = "This is a chat with an AI assistant: complete sentences; keep code, paths and identifiers exactly as spoken."
 """
 
 
@@ -315,6 +361,7 @@ class OutputCfg:
     fallback_to_clipboard: bool = True
     paste_over: int = 400
     typer: str = "auto"
+    spoken_enter: bool = True
 
 
 @dataclass
@@ -400,13 +447,26 @@ class Mode:
     output: str = ""              # "" = use [output].mode
     trailing_space: bool | None = None
     code: bool = False            # spoken file references ("at main dot py" -> @main.py)
+    title: list[str] = field(default_factory=list)   # regexes for the window title
+    newline: str = "enter"        # "enter" | "shift+enter" (chat apps: Enter sends)
 
     @property
     def is_code(self) -> bool:
         return self.code or self.name in ("code", "terminal")
 
-    def matches(self, window_class: str) -> bool:
-        return any(re.search(p, window_class, re.IGNORECASE) for p in self.match)
+    @property
+    def in_terminal(self) -> bool:
+        """Terminals: no Ctrl+C to copy (it interrupts), no Ctrl+V to paste."""
+        return self.name in ("terminal", "agent")
+
+    def matches(self, window_class: str, title: str = "") -> bool:
+        """`match` against the class and `title` against the title; a mode with only
+        `title` patterns matches any app with that title."""
+        if not self.match and not self.title:
+            return False
+        if self.match and not any(re.search(p, window_class, re.IGNORECASE) for p in self.match):
+            return False
+        return not self.title or any(re.search(p, title, re.IGNORECASE) for p in self.title)
 
 
 @dataclass
@@ -423,9 +483,11 @@ class Config:
     meeting: MeetingCfg = field(default_factory=MeetingCfg)
     modes: list[Mode] = field(default_factory=list)
 
-    def mode_for(self, window_class: str) -> Mode | None:
+    def mode_for(self, window_class: str, title: str = "") -> Mode | None:
+        if not window_class and not title:
+            return None
         for m in self.modes:
-            if window_class and m.matches(window_class):
+            if m.matches(window_class, title):
                 return m
         return None
 
@@ -441,11 +503,58 @@ def _default_modes() -> list[Mode]:
     return [_mode_from(d) for d in data.get("modes", [])]
 
 
+# The [[modes]] chttr 1.0 wrote into config.toml at setup. A config whose modes are
+# still exactly these gets today's defaults instead: nobody chose them, and this way
+# new modes (agent, assistant, browser tabs) reach installs made before them.
+_MODES_1_0 = """\
+[[modes]]
+name = "terminal"
+match = ["alacritty", "kitty", "foot", "wezterm", "ghostty", "xterm", "konsole", "gnome-terminal"]
+style = "This is a terminal. Output a single line of plain text with no trailing period; keep commands, paths and flags exactly as spoken."
+trailing_space = false
+
+[[modes]]
+name = "code"
+match = ["^code", "cursor", "zed", "neovide", "jetbrains", "idea", "pycharm", "webstorm", "sublime"]
+style = "This is a code editor. Keep identifiers, file names and symbols as spoken; use snake_case or camelCase if the user spells them that way. No trailing period unless it is a sentence in a comment."
+trailing_space = false
+
+[[modes]]
+match = ["slack", "discord", "whatsapp", "signal", "telegram", "element", "messages", "beeper"]
+name = "chat"
+style = "This is a chat app. Keep it casual and concise; one short message; no sign-off."
+
+[[modes]]
+name = "email"
+match = ["thunderbird", "mail", "gmail", "outlook", "proton", "hey"]
+style = "This is an email client. Use complete, well-punctuated sentences and paragraphs where the user pauses between thoughts."
+
+[[modes]]
+name = "docs"
+match = ["docs.google", "notion", "obsidian", "libreoffice", "writer", "typora", "logseq"]
+style = "This is a document editor. Use complete sentences and paragraphs; honour dictated headings and lists."
+"""
+
+
+def _untouched_defaults(modes: list) -> bool:
+    """`modes` (from a config file) are the defaults of an earlier release, unedited."""
+    return modes == tomllib.loads(_MODES_1_0)["modes"]
+
+
 def _mode_from(d: dict) -> Mode:
     m = Mode()
     _fill(m, d)
     if isinstance(m.match, str):
         m.match = [m.match]
+    if isinstance(m.title, str):
+        m.title = [m.title]
+    if m.newline not in ("enter", "shift+enter"):
+        raise ValueError(f"modes.newline must be enter or shift+enter (got {m.newline!r})")
+    for pattern in [*m.match, *m.title]:
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            raise ValueError(f"modes: {pattern!r} is not a valid regex ({exc})") from None
     return m
 
 
@@ -458,7 +567,7 @@ def load_config(path: Path = CONFIG_FILE) -> Config:
     for section in ("engine", "whisper", "audio", "output", "polish", "feedback", "history", "hotkeys", "integrations", "meeting"):
         if isinstance(data.get(section), dict):
             _fill(getattr(cfg, section), data[section])
-    if isinstance(data.get("modes"), list):
+    if isinstance(data.get("modes"), list) and not _untouched_defaults(data["modes"]):
         cfg.modes = [_mode_from(d) for d in data["modes"] if isinstance(d, dict)]
     if not cfg.polish.enabled:
         cfg.polish.backend = "none"

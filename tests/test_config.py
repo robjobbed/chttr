@@ -30,7 +30,7 @@ def test_every_default_key_exists_on_its_dataclass():
 def test_missing_file_gives_defaults(tmp_path):
     cfg = C.load_config(tmp_path / "missing.toml")
     assert cfg.engine.name == "parakeet"
-    assert [m.name for m in cfg.modes][:2] == ["terminal", "code"]
+    assert [m.name for m in cfg.modes][:3] == ["agent", "terminal", "code"]
 
 
 def test_modes_match_window_class_case_insensitively():
@@ -40,6 +40,71 @@ def test_modes_match_window_class_case_insensitively():
     assert cfg.mode_for("Slack").name == "chat"
     assert cfg.mode_for("") is None
     assert cfg.mode_for("some-unknown-app") is None
+
+
+@pytest.mark.parametrize(("window_class", "title", "mode"), [
+    ("chromium", "Inbox - Gmail", "email"),
+    ("chromium", "Inbox (3) - me@example.com - Gmail - Chromium", "email"),
+    ("firefox", "Mail - Rob - Outlook \u2014 Mozilla Firefox", "email"),
+    ("thunderbird", "Write: Re: budget - Thunderbird", "email"),       # native apps still match by class
+    ("ghostty", "\u2733 Claude Code", "agent"),
+    ("kitty", "codex", "agent"),
+    ("ghostty", "~", "terminal"),
+    ("ghostty", "", "terminal"),
+    ("chromium", "general (Channel) - Acme - Slack - Chromium", "chat"),
+    ("Slack", "general", "chat"),
+    ("chromium", "Plan - Google Docs - Chromium", "docs"),
+    ("chromium", "New chat - Claude - Chromium", "assistant"),
+    ("chromium", "Hacker News", None),
+    ("code-oss", "notion.md - project", "code"),                         # a title never beats the editor
+    ("com.mitchellh.ghostty", "\u2733 Fix the parser tests", "agent"),     # Claude Code names the window after the task
+    ("ghostty", "\u2836 Running the tests", "agent"),                       # with a spinner while it works
+    ("ghostty", "claude", "agent"),
+    ("ghostty", "nvim ~/.claude/CLAUDE.md", "terminal"),                  # a path is not the agent
+    ("ghostty", "~/Work/claude-notes", "terminal"),
+    ("org.gnome.Ptyxis", "~", "terminal"),
+    ("org.gnome.Terminal", "\u2733 Claude Code", "agent"),
+    ("chromium", "Notion \u2013 Gmail import guide - Google Docs", "docs"),  # the app is the suffix, not the subject
+    ("chromium", "Discord invite - me@example.com - Gmail", "email"),
+    ("chromium", "Slack | general | Acme", "chat"),
+    ("chromium", "(3) WhatsApp", "chat"),
+])
+def test_modes_match_the_window_title(window_class, title, mode):
+    cfg = C.load_config(C.Path("/nonexistent"))
+    found = cfg.mode_for(window_class, title)
+    assert (found.name if found else None) == mode
+
+
+def test_chat_apps_type_line_breaks_as_shift_enter():
+    cfg = C.load_config(C.Path("/nonexistent"))
+    assert cfg.mode_for("Slack").newline == "shift+enter"
+    assert cfg.mode_for("chromium", "Slack | general").newline == "shift+enter"
+    assert cfg.mode_for("thunderbird").newline == "enter"
+    agent = cfg.mode_for("ghostty", "\u2733 Claude Code")
+    assert agent.is_code and agent.in_terminal and agent.trailing_space is False
+    assert agent.newline == "shift+enter"                   # Enter would send the prompt
+
+
+def test_title_only_modes_match_any_app(tmp_path):
+    path = tmp_path / "c.toml"
+    path.write_text('[[modes]]\nname = "jira"\ntitle = "jira"\n')
+    cfg = C.load_config(path)
+    assert cfg.modes[0].title == ["jira"]                  # a single string becomes a list
+    assert cfg.mode_for("chromium", "PROJ-12 - Jira").name == "jira"
+    assert cfg.mode_for("chromium", "Inbox") is None
+    assert cfg.mode_for("", "PROJ-12 - Jira").name == "jira"
+
+
+def test_modes_left_as_an_earlier_release_wrote_them_follow_the_defaults(tmp_path):
+    path = tmp_path / "c.toml"
+    path.write_text("[output]\ntyper = \"wtype\"\n\n" + C._MODES_1_0)
+    cfg = C.load_config(path)
+    assert [m.name for m in cfg.modes] == [m.name for m in C._default_modes()]
+    assert cfg.mode_for("ghostty", "\u2733 Claude Code").name == "agent"
+    assert cfg.output.typer == "wtype"                   # the rest of the file is still read
+    # one changed word and they are yours
+    path.write_text(C._MODES_1_0.replace("no sign-off.", "no sign-off, no emoji."))
+    assert [m.name for m in C.load_config(path).modes] == ["terminal", "code", "chat", "email", "docs"]
 
 
 def test_user_modes_replace_the_defaults(tmp_path):
@@ -62,6 +127,8 @@ def test_legacy_polish_enabled_false_means_no_backend(tmp_path):
     '[engine]\nname = "vosk"\n',
     '[meeting]\nauto = "maybe"\n',
     '[polish]\nbackend = "gpt"\n',
+    '[[modes]]\nname = "x"\nmatch = "x"\nnewline = "tab"\n',
+    '[[modes]]\nname = "x"\ntitle = "(unclosed"\n',
 ])
 def test_invalid_values_are_rejected(tmp_path, snippet):
     path = tmp_path / "c.toml"

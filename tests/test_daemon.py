@@ -459,7 +459,7 @@ def test_an_unreachable_model_costs_one_notice_and_no_waiting(daemon, monkeypatc
     monkeypatch.setattr(Dm.P, "backend", lambda cfg: "claude")
     monkeypatch.setattr(Dm.P, "_claude", dead)
     t0 = time.monotonic()
-    assert dictate(daemon, "um git commit dash m fix the parser period") == "git commit dash m fix the parser"
+    assert dictate(daemon, "um git commit dash m fix the parser period") == "git commit -m fix the parser"
     assert time.monotonic() - t0 < 0.5
     assert dictate(daemon, "um and then run the whole test suite again") == "and then run the whole test suite again"
     assert len(calls) == 1                                     # the breaker skipped the second request
@@ -505,7 +505,8 @@ def test_a_slow_answer_does_not_silence_the_next_outage(daemon, monkeypatch, off
 def test_chat_keeps_line_breaks_when_they_are_typed_safely(daemon, monkeypatch):
     monkeypatch.setattr(Dm, "focused_window", lambda: ("Slack", "general"))
     chat = daemon.cfg.mode_for("Slack")
-    assert chat.name == "chat"
+    assert chat.name == "chat" and chat.newline == "shift+enter"      # the default: breaks never send
+    chat.newline = "enter"                                   # Enter would send: folded into one line
     assert dictate(daemon, "hi all new paragraph the build is green") == "Hi all. The build is green"
     chat.newline = "shift+enter"                             # line breaks typed without sending
     assert dictate(daemon, "hi all new paragraph the build is green") == "Hi all\n\nThe build is green"
@@ -1103,3 +1104,205 @@ def test_one_overlay_death_is_counted_once(pill):
         t.join()
     assert pill.overlay is None and pill.overlay_losses == 1
     assert proc.stdin.closed
+
+
+def typed_dictate(d, text, kind="start"):
+    d.transcriber.texts = [text]
+    d.handle(kind)
+    d.handle("release")
+    wait_idle(d)
+
+
+def test_dictation_joins_the_sentence_before_the_cursor(daemon, monkeypatch):
+    monkeypatch.setattr(Dm, "focused_window", lambda: ("thunderbird", "Write: Re: Friday"))
+    monkeypatch.setattr(Dm.CX, "read_field", lambda *a, **k: Dm.CX.Field("Mail", "as we said", ""))
+    typed_dictate(daemon, "Tomorrow works")
+    assert daemon.typed == [" tomorrow works"]
+
+
+def test_command_mode_sorts_lines_without_a_model(daemon, monkeypatch):
+    monkeypatch.setattr(Dm, "focused_window", lambda: ("code-oss", "notes.txt"))
+    monkeypatch.setattr(Dm, "grab_selection", lambda terminal: "b\na")
+    typed_dictate(daemon, "sort lines", "command")
+    assert daemon.typed == ["a\nb"]
+    assert "Command mode needs a model" not in daemon.feedback.notes
+
+
+def test_command_mode_needs_a_model_for_anything_else(daemon, monkeypatch):
+    monkeypatch.setattr(Dm, "grab_selection", lambda terminal: "some selected text")
+    typed_dictate(daemon, "make it sound friendlier", "command")
+    assert daemon.typed == []
+    assert "Command mode needs a model" in daemon.feedback.notes
+
+
+def test_delete_that_deletes_the_selection(daemon, monkeypatch):
+    deleted = []
+    monkeypatch.setattr(Dm, "focused_window", lambda: ("thunderbird", "Write"))
+    monkeypatch.setattr(Dm, "grab_selection", lambda terminal: "a sentence I regret")
+    monkeypatch.setattr(Dm, "delete_selection", lambda: deleted.append(1))
+    typed_dictate(daemon, "delete that", "command")
+    assert deleted == [1] and daemon.typed == []
+    assert "Deleted" in daemon.feedback.notes
+
+
+def test_command_mode_logs_no_words_at_info(daemon, monkeypatch, caplog):
+    monkeypatch.setattr(Dm.P, "backend", lambda cfg: "claude")
+    monkeypatch.setattr(Dm.P, "command", lambda *a, **k: "Secret rewritten text")
+    monkeypatch.setattr(Dm, "grab_selection", lambda terminal: "secret selected text")
+    with caplog.at_level("INFO", logger="chttr.daemon"):
+        typed_dictate(daemon, "make it sound friendlier", "command")
+    assert daemon.typed == ["Secret rewritten text"]
+    info = " ".join(r.getMessage() for r in caplog.records if r.levelname == "INFO" and "command" in r.getMessage())
+    assert "4 words -> 3 words" in info and "friendlier" not in info and "Secret" not in info
+
+
+def test_run_it_types_the_command_and_presses_enter(daemon, monkeypatch):
+    pressed = []
+    monkeypatch.setattr(Dm, "press_enter", lambda delay=0.0: pressed.append(delay))
+    typed_dictate(daemon, "git status, run it")
+    assert daemon.typed == ["git status"] and pressed == [0.0]
+
+
+def test_run_it_never_presses_enter_after_the_clipboard_fallback(daemon, monkeypatch):
+    pressed = []
+    monkeypatch.setattr(Dm, "press_enter", lambda delay=0.0: pressed.append(delay))
+    monkeypatch.setattr(Dm, "deliver", lambda text, cfg, **kw: daemon.typed.append(text) or "clipboard")
+    typed_dictate(daemon, "git status, run it")
+    assert daemon.typed == ["git status"] and pressed == []
+
+
+def test_run_it_can_be_turned_off(daemon, monkeypatch):
+    pressed = []
+    monkeypatch.setattr(Dm, "press_enter", lambda delay=0.0: pressed.append(delay))
+    daemon.cfg.output.spoken_enter = False
+    typed_dictate(daemon, "git status, run it")
+    assert daemon.typed == ["git status, run it"] and pressed == []
+
+
+def test_window_title_picks_the_mode(daemon, monkeypatch):
+    seen = []
+    monkeypatch.setattr(Dm, "deliver", lambda text, cfg, **kw: seen.append(kw) or "type")
+    monkeypatch.setattr(Dm.P, "backend", lambda cfg: "claude")
+    monkeypatch.setattr(Dm.P, "polish", lambda text, cfg, app, title, vocab, style="", **k: seen.append(style) or text)
+    monkeypatch.setattr(Dm, "focused_window", lambda: ("chromium", "Inbox - Gmail"))
+    typed_dictate(daemon, "thanks for the notes from this morning")
+    email = daemon.cfg.mode_for("chromium", "Inbox - Gmail")
+    assert email.name == "email" and seen[0] == email.style
+    assert seen[1]["newline"] == "enter" and seen[1]["allow_paste"] is True
+
+
+def test_chat_tabs_get_shift_enter_line_breaks(daemon, monkeypatch):
+    seen = []
+    monkeypatch.setattr(Dm, "deliver", lambda text, cfg, **kw: seen.append(kw) or "type")
+    monkeypatch.setattr(Dm, "focused_window", lambda: ("chromium", "Slack | general | Acme"))
+    typed_dictate(daemon, "sounds good")
+    assert seen[0]["newline"] == "shift+enter"
+
+
+def test_coding_agents_in_a_terminal_keep_their_sentences(daemon, monkeypatch):
+    styles, seen = [], []
+    monkeypatch.setattr(Dm, "deliver", lambda text, cfg, **kw: seen.append(kw) or "type")
+    monkeypatch.setattr(Dm.P, "backend", lambda cfg: "claude")
+    monkeypatch.setattr(Dm.P, "polish", lambda text, cfg, app, title, vocab, style="", **k: styles.append(style) or text)
+    monkeypatch.setattr(Dm, "focused_window", lambda: ("com.mitchellh.ghostty", "✳ Claude Code"))
+    typed_dictate(daemon, "Look at the failing test. Then fix it in at main dot py.")
+    assert "AI coding agent" in styles[0]
+    assert seen[0]["allow_paste"] is False and seen[0]["trailing_space"] is False
+
+
+def test_saying_only_run_it_presses_enter(daemon, monkeypatch):
+    pressed = []
+    monkeypatch.setattr(Dm, "press_enter", lambda delay=0.0: pressed.append(delay))
+    monkeypatch.setattr(Dm.P, "backend", lambda cfg: "claude")
+    monkeypatch.setattr(Dm.P, "polish", lambda *a, **k: pytest.fail("nothing to clean up"))
+    typed_dictate(daemon, "Run it.")
+    assert daemon.typed == [""] and pressed == [0.0]
+
+
+def wait_transcribing(d, left: int, timeout=2.0):
+    """Until the queued transcripts are down to `left`: the job before has taken its own."""
+    end = time.monotonic() + timeout
+    while len(d.transcriber.texts) > left and time.monotonic() < end:
+        time.sleep(0.005)
+
+
+def test_a_quick_second_dictation_does_not_join_against_stale_text(daemon, monkeypatch):
+    # the field is read at the key press, before the first dictation has been typed into it
+    monkeypatch.setattr(Dm, "focused_window", lambda: ("thunderbird", "Write: Re: Friday"))
+    monkeypatch.setattr(Dm.CX, "read_field", lambda *a, **k: Dm.CX.Field("Mail", "We met", ""))
+    daemon.transcriber.texts = ["Yesterday it rained.", "It was fun."]
+    daemon.transcriber.delays = [0.3, 0.0]
+    daemon.handle("start")
+    daemon.handle("release")
+    wait_transcribing(daemon, 1)
+    daemon.handle("start")
+    daemon.handle("release")
+    wait_idle(daemon)
+    assert daemon.typed == [" yesterday it rained.", "It was fun."]
+
+
+def test_saying_only_run_it_says_it_pressed_enter(daemon, monkeypatch):
+    learned = []
+    monkeypatch.setattr(daemon, "_learn_from_edits", learned.append)
+    daemon.cfg.history.learn_from_edits = True
+    typed_dictate(daemon, "Run it.")
+    assert "Pressed Enter" in daemon.feedback.notes and "Typed" not in daemon.feedback.notes
+    time.sleep(0.05)
+    assert learned == []
+
+
+def test_coding_agents_press_enter_only_after_a_pause(daemon, monkeypatch):
+    pressed = []
+    monkeypatch.setattr(Dm, "press_enter", lambda delay=0.0: pressed.append(delay))
+    monkeypatch.setattr(Dm, "focused_window", lambda: ("com.mitchellh.ghostty", "✳ Fix the parser tests"))
+    typed_dictate(daemon, "The tests pass but pytest won't run it")
+    typed_dictate(daemon, "Check the parser send it")
+    assert pressed == []
+    typed_dictate(daemon, "Check the parser. Send it.")
+    assert daemon.typed[-1].rstrip(".") == "Check the parser" and pressed == [0.0]
+
+
+def test_delete_that_in_a_terminal_explains_itself(daemon, monkeypatch):
+    deleted = []
+    monkeypatch.setattr(Dm, "grab_selection", lambda terminal: "git status")
+    monkeypatch.setattr(Dm, "delete_selection", lambda: deleted.append(1))
+    typed_dictate(daemon, "delete that", "command")
+    assert deleted == [] and daemon.typed == []
+    assert "Can't delete in a terminal" in daemon.feedback.notes
+    assert "Command mode needs a model" not in daemon.feedback.notes
+
+
+def test_deleted_counts_one_word(daemon, monkeypatch):
+    bodies = []
+    monkeypatch.setattr(Dm, "focused_window", lambda: ("thunderbird", "Write"))
+    monkeypatch.setattr(Dm, "grab_selection", lambda terminal: "oops")
+    monkeypatch.setattr(daemon.feedback, "notify", lambda title, body="", **kw: bodies.append((title, body)))
+    typed_dictate(daemon, "delete that", "command")
+    assert ("Deleted", "1 word") in bodies
+
+
+def test_with_a_model_a_near_miss_goes_to_the_model(daemon, monkeypatch):
+    asked = []
+    monkeypatch.setattr(Dm.P, "backend", lambda cfg: "claude")
+    monkeypatch.setattr(Dm.P, "command", lambda instruction, *a, **k: asked.append(instruction) or "ab")
+    monkeypatch.setattr(Dm, "focused_window", lambda: ("code-oss", "notes.txt"))
+    monkeypatch.setattr(Dm, "grab_selection", lambda terminal: "a b")
+    typed_dictate(daemon, "remove spaces", "command")
+    assert asked == ["remove spaces"] and daemon.typed == ["ab"]
+
+
+def test_delete_that_waits_for_the_dictation_before_it(daemon, monkeypatch):
+    events = []
+    monkeypatch.setattr(Dm, "focused_window", lambda: ("thunderbird", "Write"))
+    monkeypatch.setattr(Dm, "deliver", lambda text, cfg, **kw: events.append(("type", text)) or "type")
+    monkeypatch.setattr(Dm, "delete_selection", lambda: events.append(("delete", "")))
+    daemon.transcriber.texts = ["first words", "delete that"]
+    daemon.transcriber.delays = [0.3, 0.0]
+    daemon.handle("start")
+    daemon.handle("release")
+    wait_transcribing(daemon, 1)
+    monkeypatch.setattr(Dm, "grab_selection", lambda terminal: "old text")
+    daemon.handle("command")
+    daemon.handle("release")
+    wait_idle(daemon)
+    assert events == [("type", "First words"), ("delete", "")]      # tidied: no model in the fixture
