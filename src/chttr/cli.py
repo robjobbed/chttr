@@ -37,7 +37,19 @@ def cmd_daemon(args: argparse.Namespace) -> int:
         datefmt="%H:%M:%S",
     )
     C.write_default_config()
-    cfg = C.load_config()
+    try:
+        cfg = C.load_config()
+    except (ValueError, OSError) as exc:
+        # Exiting would only have systemd restart us into the same error; say it once and keep working.
+        import subprocess
+
+        logging.error("config.toml: %s; running with the defaults", exc)
+        try:
+            subprocess.run(["notify-send", "-a", "chttr", "-u", "critical", "-t", "0", "chttr: config.toml has a problem",
+                            f"{exc}. Running with the defaults until it is fixed."], check=False, timeout=5)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+        cfg = C.Config(modes=C._default_modes())
     from .daemon import run
 
     run(cfg)
@@ -529,9 +541,19 @@ def cmd_meeting_control(args: argparse.Namespace) -> int:
 
 def cmd_meeting_process(args: argparse.Namespace) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s", datefmt="%H:%M:%S")
-    from .meeting import notify_done, process, resolve, summary_line, update_meta
+    import signal
+
+    from .meeting import notify_done, process, read_json, resolve, summary_line, update_meta
 
     directory = resolve(args.meeting)
+
+    def interrupted(_signum, _frame):
+        # stopped by a shutdown or `systemctl --user stop`: leave a status you can act on
+        if (read_json(directory / "meta.json", {}) or {}).get("status") != "done":
+            update_meta(directory, status="failed", error=f"interrupted; retry: chttr meeting process {directory.name}")
+        raise SystemExit(143)
+
+    signal.signal(signal.SIGTERM, interrupted)
     cfg = C.load_config()
     try:
         md = process(directory, cfg, summary=False if args.no_summary else None)

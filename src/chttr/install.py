@@ -27,11 +27,13 @@ UNIT_TEXT = """\
 Description=chttr dictation and meeting daemon
 PartOf=graphical-session.target
 After=graphical-session.target pipewire.service
+StartLimitIntervalSec=120
+StartLimitBurst=4
 
 [Service]
 ExecStart={exe} daemon
 Restart=on-failure
-RestartSec=3
+RestartSec=5
 
 [Install]
 WantedBy=graphical-session.target
