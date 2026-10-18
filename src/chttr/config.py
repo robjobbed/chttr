@@ -16,6 +16,7 @@ DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"
 RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/{APP}-{os.getuid()}") / APP
 SOCKET_PATH = RUNTIME_DIR / "chttr.sock"
 STATE_FILE = RUNTIME_DIR / "state"
+STATE_JSON = RUNTIME_DIR / "state.json"       # the state plus pid, meeting, cleanup and keys, for the bar
 HISTORY_FILE = DATA_DIR / "history.jsonl"
 HISTORY_AUDIO_DIR = DATA_DIR / "history-audio"   # only with [history] keep_audio_days > 0
 MEETINGS_DATA_DIR = DATA_DIR / "meetings"        # per-meeting audio, events, intermediate results

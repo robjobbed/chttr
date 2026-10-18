@@ -256,3 +256,78 @@ def test_screen_context_backs_off_when_atspi_never_answers(daemon, monkeypatch):
         daemon.handle("release")
         wait_idle(daemon)
     assert len(calls) == Dm.ATSPI_GIVE_UP
+
+
+def _state_json(wait_for=None, timeout=2.0) -> dict:
+    """state.json once `wait_for(info)` holds (the cleanup probe rewrites it off-thread)."""
+    import json
+
+    end = time.monotonic() + timeout
+    while True:
+        info = json.loads(C.STATE_JSON.read_text(encoding="utf-8"))
+        if wait_for is None or wait_for(info) or time.monotonic() > end:
+            return info
+        time.sleep(0.01)
+
+
+def test_state_json_tells_the_bar_who_is_recording(daemon):
+    import os
+
+    daemon.cfg.hotkeys.dictate = "F9"
+    daemon.handle("start")
+    info = _state_json()
+    assert info["state"] == Dm.RECORDING and info["kind"] == Dm.PTT
+    assert info["pid"] == os.getpid()
+    assert info["hotkeys"]["dictate"] == "F9" and info["hotkeys"]["command"] == "Alt+Insert"
+    assert "backend" not in info["hotkeys"]
+    assert info["cleanup"] == "none" and info["model"] == "ready" and info["meeting"] is None
+    daemon.handle("cancel")
+    info = _state_json()
+    assert info["state"] == Dm.IDLE and info["kind"] == ""
+
+
+def test_state_json_carries_the_meeting(daemon, monkeypatch, tmp_path):
+    class FakeSession:
+        def __init__(self, cfg, code="", title="", source="manual"):
+            self.code, self.title, self.source = code, title or "Planning", source
+            self.dir = tmp_path
+            self.recorder = type("R", (), {"started": 1234.5})()
+            self.elapsed = 0.0
+
+        def start(self):
+            pass
+
+        def stop(self):
+            return 2.0
+
+        def discard(self):
+            pass
+
+    monkeypatch.setattr(Dm, "Session", FakeSession)
+    assert daemon.handle("meeting start")["recording"]
+    assert _state_json()["meeting"] == {"title": "Planning", "code": "", "started": 1234.5}
+    daemon.handle("meeting stop")                     # 2 s: too short, discarded
+    assert _state_json()["meeting"] is None
+
+
+def test_cleanup_backend_is_probed_off_thread_and_cached(daemon, monkeypatch):
+    calls = []
+    gate = threading.Event()
+
+    def slow_backend(cfg):
+        calls.append(cfg)
+        gate.wait(2)
+        return "ollama"
+
+    monkeypatch.setattr(Dm.P, "backend", slow_backend)
+    daemon.cfg.polish.backend = "auto"
+    started = time.monotonic()
+    daemon._write_state(Dm.IDLE)                       # must not wait for the probe
+    daemon._write_state(Dm.IDLE)                       # one probe at a time
+    assert time.monotonic() - started < 0.5
+    assert _state_json()["cleanup"] == "none"          # what was known before
+    gate.set()
+    assert _state_json(lambda i: i["cleanup"] == "ollama")["cleanup"] == "ollama"
+    daemon._write_state(Dm.IDLE)                       # fresh for a minute: no new probe
+    time.sleep(0.05)
+    assert len(calls) == 1

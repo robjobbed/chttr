@@ -126,10 +126,66 @@ class Daemon:
             self._write_state(state)
 
     def _write_state(self, state: str) -> None:
-        self.state = state
-        tmp = C.STATE_FILE.with_suffix(".tmp")
-        tmp.write_text(state, encoding="utf-8")
-        os.replace(tmp, C.STATE_FILE)
+        # The plain file is the state alone; state.json, which the bar reads, adds who
+        # wrote it (a pid that is gone means chttr is off), the meeting, the cleanup
+        # backend and the keys. The backend is probed off-thread at most once a minute
+        # (the Ollama check can take half a second) and the file rewritten when it changes.
+        lock = self.__dict__.setdefault("_state_lock", threading.Lock())
+        cache = getattr(self, "_cleanup_cache", None)
+        if cache is None:
+            cache = self._cleanup_cache = {"backend": "", "polish": None, "at": 0.0, "probing": False}
+
+        def dump() -> None:
+            m = getattr(self, "meeting", None)
+            since = getattr(self, "_state_since", None)
+            if not since or since[0] != self.state:
+                since = self._state_since = (self.state, time.time())
+            info = {"state": self.state, "kind": getattr(self, "kind", "") if self.state == RECORDING else "",
+                    "since": since[1], "pid": os.getpid(),
+                    "meeting": {"title": m.title, "code": m.code, "started": m.recorder.started} if m else None,
+                    "cleanup": cache["backend"],
+                    "hotkeys": {k: v for k, v in vars(self.cfg.hotkeys).items() if k != "backend"},
+                    "model": "loading" if self.state == "loading" else "ready"}
+            tmp = C.STATE_JSON.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(info), encoding="utf-8")
+            os.replace(tmp, C.STATE_JSON)
+
+        def probe(polish) -> None:
+            try:
+                found = P.backend(polish)
+            except Exception as exc:  # noqa: BLE001 - the bar's extra never takes the daemon down
+                log.debug("cleanup backend probe failed: %s", exc)
+                found = cache["backend"]
+            with lock:
+                if self.cfg.polish is not polish or polish.backend != "auto":   # reloaded meanwhile
+                    cache["probing"] = False
+                    return
+                changed = found != cache["backend"]
+                cache.update(backend=found, polish=polish, at=time.monotonic(), probing=False)
+                if changed:
+                    try:
+                        dump()
+                    except OSError as exc:
+                        log.debug("could not write %s: %s", C.STATE_JSON, exc)
+
+        with lock:
+            self.state = state
+            tmp = C.STATE_FILE.with_suffix(".tmp")
+            tmp.write_text(state, encoding="utf-8")
+            os.replace(tmp, C.STATE_FILE)
+            polish = self.cfg.polish
+            if polish.backend != "auto":             # nothing to probe (and probe again if it becomes auto)
+                cache.update(backend=polish.backend, polish=None)
+            elif (cache["polish"] is not polish or time.monotonic() - cache["at"] > 60) and not cache["probing"]:
+                cache["probing"] = True
+                try:
+                    threading.Thread(target=probe, args=(polish,), name="cleanup-probe", daemon=True).start()
+                except RuntimeError:                 # interpreter shutting down
+                    cache["probing"] = False
+            try:
+                dump()
+            except OSError as exc:
+                log.debug("could not write %s: %s", C.STATE_JSON, exc)
 
     # ---- overlay -----------------------------------------------------------
     def _overlay_open(self, label: str) -> None:
@@ -339,6 +395,7 @@ class Daemon:
             return {"ok": False, "state": self.state, "error": str(exc)}
         self.meeting = session
         C.MEETING_STATE_FILE.write_text(json.dumps({"title": title, "code": code, "started": session.recorder.started}), encoding="utf-8")
+        self._write_state(self.state)
         log.info("meeting recording started in %s", session.dir)
         self.feedback.play("start")
         self.feedback.notify("Recording meeting" + (f": {title}" if title else ""),
@@ -352,6 +409,7 @@ class Daemon:
             return {"ok": True, "state": self.state, "recording": False, "message": "no meeting is being recorded"}
         self.meeting = None
         C.MEETING_STATE_FILE.unlink(missing_ok=True)
+        self._write_state(self.state)
         secs = session.stop()
         log.info("meeting recording stopped after %.0fs", secs)
         self.feedback.play("stop")
