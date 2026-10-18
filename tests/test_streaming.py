@@ -150,3 +150,261 @@ def test_finish_without_any_pause_is_one_pass_over_everything():
     streamer = S.Streamer(source, lambda a: lengths.append(len(a)) or "all of it", THRESHOLD)
     assert streamer.finish(source.audio) == "all of it"
     assert lengths == [len(source.audio)]
+
+
+def wait_for(condition, timeout: float = 2.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not condition():
+        assert time.monotonic() < deadline, "timed out"
+        time.sleep(0.005)
+
+
+class Recognizer:
+    """A fake transcribe() that records the length (in chunks) of every pass, and
+    whether it ran inside finish()."""
+
+    def __init__(self, *texts: str):
+        self.texts = list(texts)
+        self.calls: list[int] = []
+        self.finishing = False
+        self.during_finish: list[int] = []
+        self.lock = threading.Lock()
+
+    def __call__(self, audio: np.ndarray) -> str:
+        with self.lock:
+            chunks = len(audio) // S.CHUNK_FRAMES
+            self.calls.append(chunks)
+            if self.finishing:
+                self.during_finish.append(chunks)
+            return self.texts.pop(0) if self.texts else f"w{chunks}"
+
+    def finish(self, streamer: S.Streamer, audio: np.ndarray) -> str:
+        self.finishing = True
+        return streamer.finish(audio)
+
+
+@pytest.mark.real_minimum
+def test_letting_go_in_a_pause_reuses_the_pass_from_that_pause(monkeypatch):
+    monkeypatch.setattr(S, "POLL", 0.005)
+    plan = levels(("speech", 1.5), ("pause", 0.5))
+    source = GrowingSource(plan)
+    source.feed(len(plan))
+    rec = Recognizer("send it on wednesday")
+    streamer = S.Streamer(source, rec, THRESHOLD).start()
+    wait_for(lambda: rec.calls)
+    time.sleep(0.05)
+    assert rec.finish(streamer, source.audio) == "send it on wednesday"
+    assert rec.calls == [len(plan)]          # one pass in total: the one in the pause
+    assert rec.during_finish == []           # nothing left to do after the release
+    assert streamer.tail_reused is True
+    assert streamer.segments == []
+
+
+@pytest.mark.real_minimum
+def test_speech_after_the_pause_pass_is_recognized_again_once(monkeypatch):
+    monkeypatch.setattr(S, "POLL", 0.005)
+    plan = levels(("speech", 1.0), ("pause", 0.4), ("speech", 0.8))
+    source = GrowingSource(plan)
+    rec = Recognizer("send it", "send it on wednesday")
+    streamer = S.Streamer(source, rec, THRESHOLD).start()
+    source.feed(70)                          # up to the end of the pause
+    wait_for(lambda: rec.calls)
+    source.feed(len(plan))
+    time.sleep(0.05)
+    assert rec.finish(streamer, source.audio) == "send it on wednesday"
+    assert rec.during_finish == [len(plan) - streamer.done]     # only audio[done:], once
+    assert streamer.tail_reused is False
+
+
+@pytest.mark.real_minimum
+def test_the_pause_pass_runs_with_captions_off_and_shows_with_captions_on(monkeypatch):
+    monkeypatch.setattr(S, "POLL", 0.005)
+    plan = levels(("speech", 1.0), ("pause", 0.4))
+    for captions in (None, []):
+        source = GrowingSource(plan)
+        source.feed(len(plan))
+        rec = Recognizer("hello there")
+        streamer = S.Streamer(source, rec, THRESHOLD,
+                              on_caption=captions.append if captions is not None else None).start()
+        wait_for(lambda s=streamer: s._partial is not None)
+        streamer.abort()
+        assert streamer._partial == (len(plan), "hello there")
+        if captions is not None:
+            assert captions == ["hello there"]
+
+
+def test_a_long_pause_runs_one_pause_pass_not_one_per_poll(monkeypatch):
+    monkeypatch.setattr(S, "POLL", 0.005)
+    monkeypatch.setattr(S, "MIN_SPEECH", 4.0)
+    plan = levels(("speech", 1.0), ("pause", 2.0))
+    source = GrowingSource(plan)
+    rec = Recognizer()
+    streamer = S.Streamer(source, rec, THRESHOLD).start()
+    while source.chunk_count < len(plan):
+        source.feed(5)
+        time.sleep(0.005)
+    time.sleep(0.05)
+    streamer.abort()
+    assert len(rec.calls) == 1
+
+
+def test_a_closed_segment_reuses_the_pause_pass_that_covers_it(monkeypatch):
+    monkeypatch.setattr(S, "POLL", 0.005)
+    plan = levels(("speech", 1.0), ("pause", 0.8))
+    source = GrowingSource(plan)
+    rec = Recognizer("first part.")
+    streamer = S.Streamer(source, rec, THRESHOLD).start()
+    source.feed(64)                          # 0.28 s into the pause: the pass runs, no cut yet
+    wait_for(lambda: rec.calls)
+    source.feed(len(plan))                   # now the pause is long enough to close the segment
+    wait_for(lambda: streamer.segments)
+    assert streamer.segments == ["first part."]
+    assert rec.calls == [64]
+    assert rec.finish(streamer, source.audio) == "first part."
+    assert rec.during_finish == []           # nothing was said after the segment closed
+    assert streamer.tail_reused is True
+
+
+def test_caption_passes_recognize_at_most_the_last_six_seconds(monkeypatch):
+    monkeypatch.setattr(S, "POLL", 0.005)
+    monkeypatch.setattr(S, "CAPTION_EVERY", 0.0)
+    plan = levels(("speech", 8.0))
+    source = GrowingSource(plan)
+    rec = Recognizer()
+    captions: list[str] = []
+    streamer = S.Streamer(source, rec, THRESHOLD, on_caption=captions.append).start()
+    while source.chunk_count < len(plan):
+        source.feed(10)
+        n = source.chunk_count
+        if n >= S.CAPTION_MIN * S.CHUNKS_PER_SECOND:          # let a caption pass see this much
+            wait_for(lambda n=n: rec.calls and rec.calls[-1] >= min(n, S.CAPTION_WINDOW_CHUNKS) - 10)
+    time.sleep(0.05)
+    streamer.abort()
+    assert streamer.segments == []
+    assert max(rec.calls) == S.CAPTION_WINDOW_CHUNKS     # it got that far, and no further
+    assert captions[-1] == f"w{S.CAPTION_WINDOW_CHUNKS}"
+
+
+def test_a_new_threshold_applies_on_the_next_poll(monkeypatch):
+    monkeypatch.setattr(S, "POLL", 0.005)
+    plan = levels(("speech", 1.0), ("pause", 0.6), ("speech", 1.0))
+    source = GrowingSource(plan)
+    source.feed(len(plan))
+    rec = Recognizer("first part.")
+    streamer = S.Streamer(source, rec, QUIET - 10).start()     # everything sounds like speech
+    time.sleep(0.05)
+    assert rec.calls == [] and streamer.segments == []
+    streamer.threshold_db = THRESHOLD
+    wait_for(lambda: streamer.segments)
+    streamer.abort()
+    assert streamer.segments == ["first part."]
+
+
+@pytest.mark.real_minimum
+def test_a_new_recording_does_not_leak_into_the_last_one(monkeypatch):
+    monkeypatch.setattr(S, "POLL", 0.005)
+    plan = levels(("speech", 1.0), ("pause", 0.4))
+    source = GrowingSource(plan)
+    source.feed(len(plan))
+    rec = Recognizer("the first one")
+    streamer = S.Streamer(source, rec, THRESHOLD).start()
+    wait_for(lambda: rec.calls)
+    audio = source.audio.copy()
+    source.levels_db = [LOUD] * 100          # the recorder starts the next recording
+    time.sleep(0.05)
+    assert rec.calls == [len(plan)]
+    assert rec.finish(streamer, audio) == "the first one"
+    assert streamer.tail_reused is True
+
+
+def test_finish_parts_returns_the_segments_and_the_tail(monkeypatch):
+    monkeypatch.setattr(S, "POLL", 0.005)
+    plan = levels(("speech", 1.0), ("pause", 0.6), ("speech", 0.8))
+    source = GrowingSource(plan)
+    source.feed(len(plan))
+    rec = Recognizer("first part.", "the tail.")
+    streamer = S.Streamer(source, rec, THRESHOLD).start()
+    wait_for(lambda: streamer.segments)
+    assert streamer.finish_parts(source.audio) == (["first part."], "the tail.")
+
+
+def test_finish_does_not_wait_forever_for_a_stuck_pass(monkeypatch):
+    monkeypatch.setattr(S, "POLL", 0.005)
+    plan = levels(("speech", 1.0), ("pause", 0.6), ("speech", 0.8))
+    source = GrowingSource(plan)
+    source.feed(len(plan))
+    stuck, release = threading.Event(), threading.Event()
+
+    def transcribe(audio: np.ndarray) -> str:
+        if not stuck.is_set():
+            stuck.set()
+            release.wait(2)
+            return "too late."
+        return "all of it"
+
+    streamer = S.Streamer(source, transcribe, THRESHOLD).start()
+    stuck.wait(1)
+    assert streamer.finish(source.audio, timeout=0.05) == "all of it"
+    release.set()
+    time.sleep(0.05)
+    assert streamer.segments == []           # the late pass did not sneak in afterwards
+
+
+def test_a_long_pause_with_captions_on_runs_no_passes_after_the_pause_pass(monkeypatch):
+    monkeypatch.setattr(S, "POLL", 0.005)
+    monkeypatch.setattr(S, "MIN_SPEECH", 4.0)
+    monkeypatch.setattr(S, "CAPTION_EVERY", 0.0)       # captions as often as they may run
+    plan = levels(("speech", 1.0), ("pause", 2.0))
+    source = GrowingSource(plan)
+    rec = Recognizer()
+    captions: list[str] = []
+    streamer = S.Streamer(source, rec, THRESHOLD, on_caption=captions.append).start()
+    while source.chunk_count < len(plan):
+        source.feed(5)
+        time.sleep(0.005)
+    time.sleep(0.05)
+    streamer.abort()
+    speech = 50
+    pause_pass = int(S.SPECULATE_PAUSE * S.CHUNKS_PER_SECOND)
+    after = [i for i, chunks in enumerate(rec.calls) if chunks >= speech + pause_pass]
+    assert len(after) == 1 and after[0] == len(rec.calls) - 1    # the pause pass, and nothing after it
+
+
+class StoppedSource(GrowingSource):
+    """The recorder let go of its chunks (the key was released) between the
+    streamer reading chunk_count and asking for the audio."""
+
+    def audio_range(self, start: int, end: int) -> np.ndarray:
+        return self.audio[:0]
+
+
+@pytest.mark.real_minimum
+def test_a_pass_over_a_recording_that_just_stopped_is_not_kept(monkeypatch):
+    monkeypatch.setattr(S, "POLL", 0.005)
+    plan = levels(("speech", 1.0), ("pause", 0.4))
+    source = StoppedSource(plan)
+    source.feed(len(plan))
+    rec = Recognizer("hello there")
+    streamer = S.Streamer(source, rec, THRESHOLD).start()
+    time.sleep(0.05)
+    assert rec.calls == [] and streamer._partial is None
+    assert rec.finish(streamer, source.audio) == "hello there"
+    assert rec.during_finish == [len(plan)]
+    assert streamer.tail_reused is False
+
+
+def test_no_pause_pass_over_an_open_segment_longer_than_the_limit(monkeypatch):
+    monkeypatch.setattr(S, "POLL", 0.005)
+    monkeypatch.setattr(S, "MIN_SPEECH", 4.0)
+    monkeypatch.setattr(S, "SPECULATE_MAX", 3.0)
+    plan = levels(("speech", 1.0), ("pause", 0.3), ("speech", 1.0), ("pause", 0.3), ("speech", 0.5), ("pause", 0.3))
+    source = GrowingSource(plan)
+    rec = Recognizer()
+    streamer = S.Streamer(source, rec, THRESHOLD).start()
+    for end, passes in ((65, 1), (130, 2)):      # the end of each short pause (too short to close a segment)
+        source.feed(end - source.chunk_count)
+        wait_for(lambda passes=passes: len(rec.calls) == passes)
+    source.feed(len(plan))                       # the third pause comes 3.4 s into the open segment
+    time.sleep(0.05)
+    streamer.abort()
+    assert rec.calls == [65, 130]
