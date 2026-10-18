@@ -161,3 +161,30 @@ def test_trim_false_skips_trimming_but_still_boosts():
     t.transcribe(audio, trim=False)
     assert len(t.engine.heard[0]) == len(audio)
     assert float(np.abs(t.engine.heard[0]).max()) > float(np.abs(audio).max()) * 5
+
+
+def spoken(rms_db: float, seconds: float = 2.0, pad: float = 0.15) -> np.ndarray:
+    """Speech-like audio: a tone at about `rms_db` that swells and fades four times a
+    second, in -70 dB room noise, with a push-to-talk's short lead-in either side."""
+    t = np.arange(int(seconds * SAMPLE_RATE)) / SAMPLE_RATE
+    voice = tone(seconds, amplitude=10 ** (rms_db / 20) * np.sqrt(2)) * (0.55 + 0.45 * np.sin(2 * np.pi * 4 * t))
+    return noise(pad + seconds + pad) + np.concatenate([silence(pad), voice.astype(np.float32), silence(pad)])
+
+
+@pytest.mark.parametrize("rms_db", [-40, -44, -50])
+def test_quiet_speech_with_little_lead_in_is_kept(rms_db):
+    # The clip is mostly speech, so its own floor estimate lands among the speech's
+    # quiet moments; the threshold must still sit under the speech.
+    t = fake_transcriber()
+    assert t.transcribe(spoken(rms_db)) == "something quiet"
+    assert len(t.engine.heard[0]) / SAMPLE_RATE >= 2.0
+
+
+def test_loud_speech_trims_the_breath_around_it():
+    # Someone talking at -20 dB in a quiet room: a -52 dB breath before and after is
+    # not speech, so the trim keeps the speech plus padding, not the breaths.
+    breath = noise(0.4, db=-52, seed=1)
+    audio = np.concatenate([noise(0.5), breath, spoken(-20, pad=0.0), breath, noise(0.5, seed=2)])
+    t = fake_transcriber()
+    t.transcribe(audio)
+    assert len(t.engine.heard[0]) / SAMPLE_RATE == pytest.approx(2.6, abs=0.05)

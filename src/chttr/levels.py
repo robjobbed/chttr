@@ -14,6 +14,7 @@ WINDOW_CHUNKS = 500     # 10 s of 20 ms chunks
 FLOOR_PERCENTILE = 15   # the quietest 15% of chunks are the room, not you
 EARLY_CHUNKS = 15       # under a second in, only the first 0.3 s (before you speak) count
 SETTLED_CHUNKS = 50
+SPEECH_GAP_DB = 20.0    # anything this far under your speech is not speech either
 SILENT = -90.0          # the floor before anything was measured
 
 
@@ -27,13 +28,28 @@ def noise_floor(levels_db: Sequence[float]) -> float:
     return float(np.percentile(np.asarray(levels_db, dtype=np.float64), FLOOR_PERCENTILE))
 
 
+def speech_level(levels_db: Sequence[float], floor: float | None = None) -> float:
+    """How loud you speak, in dBFS: the median of the chunks clearly above the noise
+    floor, so a short word in a long quiet recording still counts and a single cough
+    does not. The 90th percentile of everything when no chunk stands out."""
+    if len(levels_db) == 0:
+        return SILENT
+    db = np.asarray(levels_db, dtype=np.float64)
+    loud = db[db > (noise_floor(levels_db) if floor is None else floor) + MARGIN_DB]
+    return float(np.median(loud)) if len(loud) else float(np.percentile(db, 90))
+
+
 def effective_threshold(levels_db: Sequence[float], configured: float, margin: float = MARGIN_DB,
                         floor_min: float = FLOOR_MIN) -> float:
     """The speech threshold for these levels: `margin` dB above the noise floor, but
-    only ever lower than `configured` and never below `floor_min`."""
+    only as low as your speech needs (SPEECH_GAP_DB under it), only ever lower than
+    `configured` and never below `floor_min`. A loud mic in a quiet room keeps about
+    the configured threshold, so a TV or a keyboard still counts as a pause."""
     if len(levels_db) == 0:
         return configured
-    return max(floor_min, min(configured, noise_floor(levels_db) + margin))
+    floor = noise_floor(levels_db)
+    needed = max(floor + margin, speech_level(levels_db, floor) - SPEECH_GAP_DB)
+    return max(floor_min, min(configured, needed))
 
 
 class Tracker:
@@ -53,6 +69,10 @@ class Tracker:
     @property
     def floor(self) -> float:
         return noise_floor(list(self._levels))
+
+    @property
+    def speech(self) -> float:
+        return speech_level(list(self._levels))
 
     def threshold(self, configured: float) -> float:
         return effective_threshold(list(self._levels), configured)
