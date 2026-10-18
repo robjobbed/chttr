@@ -965,7 +965,10 @@ class Daemon:
             if enter_after and method in ("type", "paste"):
                 press_enter(0.2 if method == "paste" else 0.0)
                 if not text:            # it was only "run it"
-                    self.feedback.notify("Pressed Enter", "", timeout_ms=1500)
+                    self._overlay_text("Pressed Enter")
+                    self._overlay_state("done")
+                    if self.overlay is None:
+                        self.feedback.notify("Pressed Enter", "", timeout_ms=1500)
                     return
             label = "Replaced" if kind == COMMAND and selection else "Typed"
             if self.cfg.history.learn_from_edits and kind != COMMAND and method in ("type", "paste"):

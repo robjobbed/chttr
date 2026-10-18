@@ -1306,3 +1306,9 @@ def test_delete_that_waits_for_the_dictation_before_it(daemon, monkeypatch):
     daemon.handle("release")
     wait_idle(daemon)
     assert events == [("type", "First words"), ("delete", "")]      # tidied: no model in the fixture
+
+
+def test_saying_only_run_it_shows_on_the_overlay(pill):
+    pill_dictate(pill, "Run it.")
+    assert pill.overlay.commands()[-2:] == ["text Pressed Enter", "state done"]
+    assert "Pressed Enter" not in pill.feedback.notes

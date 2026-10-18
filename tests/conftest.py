@@ -59,3 +59,23 @@ def _no_real_key_presses(monkeypatch):
 
     monkeypatch.setattr(daemon, "press_enter", lambda delay=0.0: None)
     monkeypatch.setattr(daemon, "delete_selection", lambda: None)
+
+
+@pytest.fixture(autouse=True)
+def _no_timers_outliving_the_test(monkeypatch):
+    """The daemon checks your edits 8 s after typing (a threading.Timer). One left
+    running would fire during a later test, after the fakes are gone, and read the
+    real focused text field; cancel them when the test ends."""
+    import threading
+
+    timers: list[threading.Timer] = []
+
+    class Timer(threading.Timer):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            timers.append(self)
+
+    monkeypatch.setattr(threading, "Timer", Timer)
+    yield
+    for t in timers:
+        t.cancel()
