@@ -10,11 +10,30 @@
   "entryPoints": { "barWidget": "BarWidget.qml" },
   "barWidget": {
     "displayName": "chttr",
-    "description": "Dictation and meeting recording status. Left click: menu. Right click: start or stop recording a meeting.",
+    "description": "Dictation and meeting recording status, with a timer while a meeting is recorded. Left click: menu (or start chttr when it's off). Right click: start or stop recording a meeting.",
     "category": "Productivity",
     "allowMultiple": false,
     "defaultSection": "right",
-    "defaults": {},
-    "schema": []
+    "defaults": {
+      "showMeetingTimer": true,
+      "rightClick": "meeting"
+    },
+    "schema": [
+      {
+        "key": "showMeetingTimer",
+        "type": "boolean",
+        "label": "Show the meeting timer",
+        "description": "Show how long the meeting has been recording next to the icon.",
+        "defaultValue": true
+      },
+      {
+        "key": "rightClick",
+        "type": "enum",
+        "label": "Right click",
+        "options": ["meeting", "handsfree"],
+        "defaultValue": "meeting",
+        "description": "meeting: start or stop recording a meeting. handsfree: start or stop hands-free dictation."
+      }
+    ]
   }
 }

@@ -13,9 +13,10 @@ from pathlib import Path
 
 from . import __version__
 from . import config as C
-from .client import DaemonNotRunning, read_state, send
+from .client import DaemonNotRunning, daemon_alive, daemon_listening, read_state, read_state_json, send
 
-ICONS = {"idle": "", "recording": "󰍬", "transcribing": "󰔟", "meeting": "󰑊"}
+ICONS = {"idle": "", "recording": "󰍬", "transcribing": "󰔟", "meeting": "󰑊",
+         "off": "󰍭", "loading": "󰔟"}
 
 
 def _with_meeting(state: str) -> str:
@@ -23,11 +24,102 @@ def _with_meeting(state: str) -> str:
     return "meeting" if state == "idle" and C.MEETING_STATE_FILE.exists() else state
 
 
-def _status_json(state: str) -> str:
+def _status_json(state: str, info: dict | None = None) -> str:
+    """One line for the bar: Waybar's text/alt/class/tooltip, plus how long the meeting
+    has been recording, the cleanup backend and the dictation key. `info` is what the
+    daemon wrote to state.json; tooltips name the keys it has configured."""
+    info = info or {}
     state = _with_meeting(state)
-    tooltip = {"idle": "chttr: idle", "recording": "chttr: recording", "transcribing": "chttr: transcribing",
-               "meeting": "chttr: recording a meeting"}[state]
-    return json.dumps({"text": ICONS[state], "alt": state, "class": state, "tooltip": tooltip})
+    if state not in ICONS:
+        state = "idle"
+    keys = info.get("hotkeys")
+    if not isinstance(keys, dict):
+        keys = {k: v for k, v in vars(C.HotkeysCfg()).items() if k != "backend"}
+    dictate, command = str(keys.get("dictate") or ""), str(keys.get("command") or "")
+    cleanup = str(info.get("cleanup") or "")
+
+    # The meeting file is the daemon's own record of a recording in progress (it goes
+    # away the moment one stops or is discarded); state.json fills in if it's unreadable.
+    meeting, seconds = None, None
+    if state != "off" and C.MEETING_STATE_FILE.exists():
+        try:
+            meeting = json.loads(C.MEETING_STATE_FILE.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            meeting = None
+        if not isinstance(meeting, dict):
+            meeting = info.get("meeting") if isinstance(info.get("meeting"), dict) else {}
+        try:
+            started = float(meeting.get("started") or 0)
+        except (TypeError, ValueError):
+            started = 0.0
+        if started > 0:
+            seconds = max(0, int(time.time() - started))
+
+    def clock(secs: int) -> str:
+        h, rest = divmod(secs, 3600)
+        return f"{h}:{rest // 60:02}:{rest % 60:02}" if h else f"{rest // 60}:{rest % 60:02}"
+
+    during = [f"meeting {clock(seconds)}" if seconds is not None else "recording a meeting"] if meeting is not None else []
+    if state == "off":
+        bits = ["chttr is off", "click to start"]
+    elif state == "loading":
+        bits = ["chttr: loading the speech model"]
+    elif state == "recording":
+        kind = info.get("kind")
+        if kind == "command":
+            bits = ["chttr: listening for an instruction"] + ([f"let go of {command} to apply it"] if command else [])
+        elif kind == "hands-free":
+            bits = ["chttr: listening hands-free", "stops when you pause"]
+        else:
+            bits = ["chttr: listening"] + ([f"let go of {dictate} to type"] if dictate else [])
+        bits += during
+    elif state == "transcribing":
+        bits = ["chttr: transcribing"] + during
+    elif state == "meeting":
+        title = str((meeting or {}).get("title") or "").strip()
+        what = f"\u201c{title}\u201d" if title else "a meeting"
+        bits = [f"chttr: recording {what}" + (f" ({clock(seconds)})" if seconds is not None else ""),
+                "right click to stop"]
+    elif cleanup == "none":
+        bits = ["chttr: cleanup is off (local rules)"] + ([f"hold {dictate} to dictate"] if dictate else [])
+    else:
+        bits = [f"chttr: hold {dictate} to dictate" if dictate else "chttr: ready"]
+        bits += [f"{command}: command mode"] if command else []
+        bits += ["right click: record a meeting"]
+    text = ICONS[state] + (f" {clock(seconds)}" if state == "meeting" and seconds is not None else "")
+    return json.dumps({"text": text, "alt": state, "class": state, "tooltip": " \u00b7 ".join(bits),
+                       "meeting_seconds": seconds, "cleanup": cleanup, "hotkey": dictate})
+
+
+_listening: dict = {}       # the socket fallback's last answer, so --follow asks every 2 s at most
+
+
+def _current_state() -> tuple[str, dict]:
+    """The daemon's state (idle/recording/transcribing/loading, or "off" when no daemon
+    is running: no state.json, or the process that wrote it is gone) and what it wrote
+    with it. A meeting in progress is left to _status_json, so plain output keeps the
+    daemon's own state."""
+    def mtime(path: Path) -> int | None:
+        try:
+            return path.stat().st_mtime_ns
+        except OSError:
+            return None
+
+    info = read_state_json()
+    if info and daemon_alive(info):
+        state = str(info.get("state") or read_state())
+        return (state if state in ICONS and state not in ("off", "meeting") else "idle"), info
+    # A daemon from before 1.1 writes no state.json, and a second `chttr daemon` that
+    # gave up (one was already running) leaves its own pid behind: ask the socket. Each
+    # ask costs the daemon a request, so the answer stands for 2 s unless a new socket
+    # or a rewritten state.json says something changed.
+    key = tuple(mtime(p) for p in (C.SOCKET_PATH, C.STATE_JSON)) + (str(C.SOCKET_PATH),)
+    if _listening.get("key") != key or time.monotonic() - _listening.get("at", 0.0) > 2:
+        _listening.update(key=key, at=time.monotonic(), up=daemon_listening())
+    if _listening["up"]:
+        state = read_state()
+        return (state if state in ICONS and state not in ("off", "meeting") else "idle"), info
+    return "off", info
 
 
 def cmd_daemon(args: argparse.Namespace) -> int:
@@ -122,22 +214,29 @@ def cmd_keys(args: argparse.Namespace) -> int:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
-    if not args.follow:
-        state = read_state() if not C.SOCKET_PATH.exists() else send("status").get("state", "idle")
-        print(_status_json(state) if args.json else state)
-        return 0
-    last = None
+    def line(state: str, info: dict) -> str:
+        return _status_json(state, info) if args.json else state
+
     try:
+        if not args.follow:
+            print(line(*_current_state()))
+            return 0
+        # Poll rather than wait on the daemon: this keeps working while it restarts, and
+        # re-emits once a second during a meeting so the bar's timer ticks.
+        last = None
         while True:
-            state = read_state()
-            if state not in ICONS:
-                state = "idle"
-            state = _with_meeting(state) if args.json else state
-            if state != last:
-                print(_status_json(state) if args.json else state, flush=True)
-                last = state
+            current = line(*_current_state())
+            if current != last:
+                print(current, flush=True)
+                last = current
             time.sleep(0.15)
     except KeyboardInterrupt:
+        return 0
+    except BrokenPipeError:                 # the bar went away
+        sys.stdout = open("/dev/null", "w")  # noqa: SIM115 - keeps Python's flush at exit quiet
+        return 0
+    except DaemonNotRunning:
+        print(line("off", {}))
         return 0
 
 

@@ -1644,3 +1644,127 @@ def test_brief_loop_survives_an_offline_calendar(briefing, monkeypatch):
     briefing._stop = Minutes(2)
     BRIEF_LOOP(briefing)                                   # logged, not raised, and still going
     assert len(briefing.sent) == 1 and briefing._stop.n < 0
+
+
+def _state_json(wait_for=None, timeout=2.0) -> dict:
+    """state.json once `wait_for(info)` holds (the cleanup probe rewrites it off-thread)."""
+    import json
+
+    end = time.monotonic() + timeout
+    while True:
+        info = json.loads(C.STATE_JSON.read_text(encoding="utf-8"))
+        if wait_for is None or wait_for(info) or time.monotonic() > end:
+            return info
+        time.sleep(0.01)
+
+
+def test_state_json_tells_the_bar_who_is_recording(daemon):
+    import os
+
+    daemon.cfg.hotkeys.dictate = "F9"
+    daemon.handle("start")
+    info = _state_json()
+    assert info["state"] == Dm.RECORDING and info["kind"] == Dm.PTT
+    assert info["pid"] == os.getpid()
+    assert info["hotkeys"]["dictate"] == "F9" and info["hotkeys"]["command"] == "Alt+Insert"
+    assert "backend" not in info["hotkeys"]
+    assert info["cleanup"] == "none" and info["model"] == "ready" and info["meeting"] is None
+    daemon.handle("cancel")
+    info = _state_json()
+    assert info["state"] == Dm.IDLE and info["kind"] == ""
+
+
+def test_state_json_carries_the_meeting(daemon, monkeypatch, tmp_path):
+    class FakeSession:
+        def __init__(self, cfg, code="", title="", source="manual"):
+            self.code, self.title, self.source = code, title or "Planning", source
+            self.dir = tmp_path
+            self.recorder = type("R", (), {"started": 1234.5})()
+            self.elapsed = 0.0
+
+        def start(self):
+            pass
+
+        def stop(self):
+            return 2.0
+
+        def discard(self):
+            pass
+
+    monkeypatch.setattr(Dm, "Session", FakeSession)
+    assert daemon.handle("meeting start")["recording"]
+    assert _state_json()["meeting"] == {"title": "Planning", "code": "", "started": 1234.5}
+    daemon.handle("meeting stop")                     # 2 s: too short, discarded
+    assert _state_json()["meeting"] is None
+
+
+def test_cleanup_backend_is_probed_off_thread_and_cached(daemon, monkeypatch):
+    calls = []
+    gate = threading.Event()
+
+    def slow_backend(cfg):
+        calls.append(cfg)
+        gate.wait(2)
+        return "ollama"
+
+    monkeypatch.setattr(Dm.P, "backend", slow_backend)
+    daemon.cfg.polish.backend = "auto"
+    started = time.monotonic()
+    daemon._write_state(Dm.IDLE)                       # must not wait for the probe
+    daemon._write_state(Dm.IDLE)                       # one probe at a time
+    assert time.monotonic() - started < 0.5
+    assert _state_json()["cleanup"] == "none"          # what was known before
+    gate.set()
+    assert _state_json(lambda i: i["cleanup"] == "ollama")["cleanup"] == "ollama"
+    daemon._write_state(Dm.IDLE)                       # fresh for a minute: no new probe
+    time.sleep(0.05)
+    assert len(calls) == 1
+    daemon._stop.set()                                 # no refresh probing for real later
+
+
+def test_state_json_stays_true_while_idle(daemon, monkeypatch):
+    """Once a minute the daemon refreshes state.json: a reload's new keys, Ollama coming
+    up, a meeting gone, all without a key press."""
+    real_stop, done = daemon._stop, threading.Event()
+    ticks: list[threading.Event] = []
+
+    class Minute:                                      # the refresh loop's wait: one tick per event set
+        def wait(self, timeout):
+            tick = threading.Event()
+            ticks.append(tick)
+            tick.wait(2)
+            return done.is_set() or not tick.is_set()
+
+    def minute_passes():
+        n = len(ticks)
+        ticks[-1].set()
+        end = time.monotonic() + 2
+        while len(ticks) == n and time.monotonic() < end:  # back in wait: that minute's work is done
+            time.sleep(0.005)
+
+    daemon._stop = Minute()
+    daemon._cleanup_cache["refreshing"] = False
+    daemon._write_state(Dm.IDLE)
+    try:
+        end = time.monotonic() + 2
+        while not ticks and time.monotonic() < end:
+            time.sleep(0.005)
+        daemon.cfg.hotkeys.dictate = "F7"              # what a reload does
+        minute_passes()
+        assert _state_json()["hotkeys"]["dictate"] == "F7"
+
+        monkeypatch.setattr(Dm.P, "backend", lambda cfg: "ollama")
+        daemon.cfg.polish.backend = "auto"
+        daemon._cleanup_cache["at"] = time.monotonic() - 120
+        minute_passes()
+        assert _state_json(lambda i: i["cleanup"] == "ollama")["cleanup"] == "ollama"
+
+        C.STATE_JSON.unlink()
+        minute_passes()                                # nothing changed: nothing written
+        assert not C.STATE_JSON.exists()
+    finally:
+        daemon._stop = real_stop
+        real_stop.set()
+        done.set()
+        for tick in ticks:
+            tick.set()
