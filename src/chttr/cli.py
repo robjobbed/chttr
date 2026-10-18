@@ -86,6 +86,7 @@ def cmd_transcribe(args: argparse.Namespace) -> int:
     cfg = C.load_config()
     if args.engine:
         cfg.engine.name = args.engine
+    from . import tidy
     from .dictionary import Dictionary
     from .polish import backend, polish
     from .transcriber import Transcriber
@@ -96,8 +97,15 @@ def cmd_transcribe(args: argparse.Namespace) -> int:
     if args.verbose:
         print(f"[{cfg.engine.name} {time.monotonic() - t0:.2f}s incl. load]", file=sys.stderr)
     text = d.apply(raw)
-    if raw and not args.raw and backend(cfg.polish) != "none":
-        text = polish(text, cfg.polish, vocabulary=d.vocabulary, keep=list(d.snippets))
+    if raw and not args.raw:
+        if backend(cfg.polish) == "none":
+            text = tidy.tidy(text, cfg.polish.level)
+        else:
+            try:
+                text = polish(text, cfg.polish, vocabulary=d.vocabulary, keep=list(d.snippets))
+            except Exception as exc:  # noqa: BLE001 - local rules beat a traceback
+                print(f"cleanup failed ({exc}); cleaned locally", file=sys.stderr)
+                text = tidy.tidy(text, cfg.polish.level)
     print(d.expand_snippets(text))
     return 0
 
@@ -258,9 +266,19 @@ def cmd_polish(args: argparse.Namespace) -> int:
     text = sys.stdin.read().strip()
     if not text:
         return 0
-    from .polish import polish
+    from . import tidy
+    from .polish import PolishUnavailable, polish
 
-    print(polish(text, cfg.polish, args.app or "", ""))
+    if args.local:
+        print(tidy.tidy(text, cfg.polish.level))
+        return 0
+    try:
+        print(polish(text, cfg.polish, args.app or "", ""))
+    except Exception as exc:  # noqa: BLE001 - local rules beat a traceback
+        print(tidy.tidy(text, cfg.polish.level))
+        none = isinstance(exc, PolishUnavailable) and str(exc).startswith("no cleanup backend")
+        print("no cleanup backend; cleaned locally (add a key: chttr connect claude)" if none
+              else f"cleanup failed ({exc}); cleaned locally", file=sys.stderr)
     return 0
 
 
@@ -932,8 +950,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="stop once the page has been closed this long (default 900; 0 = run until Ctrl+C)")
     li.set_defaults(func=cmd_lingo)
 
-    po = sub.add_parser("polish", help="clean up dictated text from stdin with Claude")
+    po = sub.add_parser("polish", help="clean up dictated text from stdin (Claude, Ollama or local rules)")
     po.add_argument("--app", help="name of the focused app, for tone/formatting")
+    po.add_argument("--local", action="store_true", help="local rules only (no model)")
     po.set_defaults(func=cmd_polish)
 
     le = sub.add_parser("learn", help="teach chttr a word: chttr learn Sohrab --heard sorob --heard 'so rob'")
