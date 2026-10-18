@@ -6,6 +6,7 @@
   <meta name="color-scheme" content="light dark">
   <title>chttr</title>
   <link rel="stylesheet" href="static/app.css">
+  <link rel="stylesheet" href="static/home.css">
 </head>
 <body>
   <header class="top">
@@ -15,7 +16,9 @@
       <kbd class="key-hint" aria-hidden="true">/</kbd>
     </form>
     <nav class="tabs" role="tablist" aria-label="Views">
+      <button class="tab" data-view="home" role="tab" id="tab-home">Home</button>
       <button class="tab" data-view="meetings" role="tab" id="tab-meetings">Meetings</button>
+      <button class="tab" data-view="dictations" role="tab" id="tab-dictations">Dictations</button>
       <button class="tab" data-view="actions" role="tab" id="tab-actions">Action items</button>
       <button class="tab" data-view="lingo" role="tab" id="tab-lingo" title="Fix how chttr spells your words">Lingo</button>
     </nav>
@@ -33,5 +36,7 @@
   <div id="status" role="status" aria-live="polite" class="sr-only"></div>
   <script src="static/lib.js"></script>
   <script src="static/app.js"></script>
+  <script src="static/home.js"></script>
+  <script src="static/dictations.js"></script>
 </body>
 </html>

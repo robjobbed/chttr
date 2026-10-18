@@ -32,7 +32,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
-from . import client
+from . import client, ui_api
 from . import config as C
 from . import library as L
 from . import theme as T
@@ -316,6 +316,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json([{"id": s.id, "name": s.name, "description": s.description}
                                    for s in load_styles().values()])
             # other packages: extra API routes dispatch here
+            r = ui_api.route(path, q, self.cfg)
+            if r is not None:
+                return self._send(r[0], r[1], r[2])
             m = re.match(r"^/api/meeting/([^/]+)(/audio|/export)?$", path)
             if m and _ID.match(unquote(m.group(1))):
                 mid = unquote(m.group(1))
