@@ -100,6 +100,7 @@ class Daemon:
         self.pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="chttr-context")
         self.offered: set[tuple[str, str]] = set()   # corrections already offered this session
         self.briefed: set = set()                    # (title, start) of events already briefed
+        self._brief_events: tuple | None = None      # (read at, (urls, minutes), events) for the brief
         self._stop = threading.Event()
         C.MEETING_STATE_FILE.unlink(missing_ok=True)
         self._write_state(IDLE)
@@ -401,11 +402,10 @@ class Daemon:
         return {"ok": True, "recording": bool(self.meeting and self.meeting.code == code)}
 
     def _brief_loop(self) -> None:
-        """A notification [meeting] brief_minutes before each calendar meeting."""
-        from . import gcal
-
-        if self.cfg.meeting.brief_minutes <= 0 or not gcal.read_urls(self.cfg.meeting.calendar_file):
-            return
+        """A notification [meeting] brief_minutes before each calendar meeting. Runs even
+        without a calendar: one added later (chttr meeting calendar URL), or brief_minutes
+        turned back on with chttr reload, works without a restart. Without one a tick is a
+        file read."""
         failing = False
         while True:
             try:
@@ -429,7 +429,7 @@ class Daemon:
         if minutes <= 0 or not urls:
             return 0
         now = datetime.now(UTC).astimezone()
-        due = [e for e in gcal.upcoming(urls, hours=max(0.5, (minutes + 2) / 60))
+        due = [e for e in self._brief_calendar(urls, minutes, now)
                if -60 < (e.start - now).total_seconds() <= minutes * 60 + 30
                and (e.title, e.start.isoformat()) not in self.briefed and B.worth_a_brief(e)]
         if not due:
@@ -442,14 +442,44 @@ class Daemon:
             if not brief.attendees and not brief.last:
                 continue                # a focus block or a reminder: nothing to brief
             title, body = B.render(brief)
-            if self.meeting or self.call:
+            if self._in_a_call():
                 # you may be sharing your screen in this call: no notes on it
-                body = "chttr brief shows what you agreed last time."
+                body = "Run chttr brief to see what you agreed last time."
             self.feedback.notify(title, body, urgency="normal", timeout_ms=20000)
             log.info("pre-meeting brief for %r in %d min (%s, %d open items)", event.title, brief.starts_in_min,
                      "met before" if brief.last else "first meeting", len(brief.open_items))
             sent += 1
         return sent
+
+    def _brief_calendar(self, urls: list[str], minutes: int, now: datetime) -> list:
+        """The events a brief may be due for in the next few minutes. Feeds can be several MB:
+        they are downloaded at most every 10 min (gcal's file cache) and parsed at most every
+        5, not every minute; a new calendar or brief_minutes is read at once."""
+        from datetime import timedelta
+
+        from . import gcal
+
+        key = (tuple(urls), minutes)
+        if self._brief_events and self._brief_events[1] == key and time.monotonic() - self._brief_events[0] < 300:
+            return self._brief_events[2]
+        # from just before now to past the next refresh, plus brief_minutes
+        half = timedelta(seconds=(minutes * 60 + 300 + 240) / 2)
+        around = now - timedelta(minutes=2) + half
+        events = [e for url in urls for e in gcal._events(gcal._fetch(url), around, half)[0]]
+        self._brief_events = (time.monotonic(), key, events)
+        return events
+
+    def _in_a_call(self) -> bool:
+        """In a Meet call, or a Zoom/Teams/Slack one (PipeWire), right now."""
+        if self.meeting or self.call:
+            return True
+        try:
+            from . import calls as K
+
+            return bool(K.current_call(K.snapshot(), meet_call_active=False))
+        except Exception:
+            log.debug("call detection failed", exc_info=True)
+            return False
 
     # ---- calls in other apps (PipeWire) ------------------------------------
     def _watch_calls(self) -> None:

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import time
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -8,6 +10,20 @@ import pytest
 from chttr import brief as B
 from chttr import cli, gcal
 from chttr import config as C
+
+
+@pytest.fixture(autouse=True)
+def utc():
+    """The fixture meetings are at 21:00 UTC, the next day east of UTC+3: dates are local."""
+    before = os.environ.get("TZ")
+    os.environ["TZ"] = "UTC"
+    time.tzset()
+    yield
+    if before is None:
+        os.environ.pop("TZ", None)
+    else:
+        os.environ["TZ"] = before
+    time.tzset()
 
 
 def make_meeting(root, mid, started, title, *, attendees=(), speakers=None, sections=(), actions=(), me="Rob"):
@@ -75,6 +91,22 @@ def test_past_meetings_newest_first_with_what_the_brief_needs(meetings):
     assert pricing["me"] == ["Rob"]
 
 
+def test_filler_is_no_summary():
+    for filler in ["Not discussed.", "Not discussed in this meeting.", "No decisions were made.",
+                   "None discussed.", "Nothing else came up.", "No action items were identified.", "N/A"]:
+        assert B._summary({"sections": [{"items": [filler]}]}) == "", filler
+    for real in ["None of the vendors mentioned price, so we go with Acme.", "No blockers: ship Friday."]:
+        assert B._summary({"sections": [{"items": [real]}]}) == real
+
+
+def test_a_broken_result_json_is_skipped(meetings):
+    d = meetings / "2026-10-08-100000"
+    d.mkdir()
+    (d / "result.json").write_text(json.dumps({"meta": {"started": "soon"}, "speakers": {"Rob": "me"}}),
+                                   encoding="utf-8")
+    assert [m["id"] for m in B.past_meetings()] == ["2026-10-09-150000", "2026-10-04-210000"]
+
+
 def test_summary_is_cut_at_a_word():
     long = "word " * 60
     s = B._summary({"sections": [{"items": []}, {"items": [long]}]})
@@ -92,6 +124,43 @@ def test_previous_meeting_by_title_beats_overlap(meetings, weekly):
                  sections=[("Summary", ["Roadmap first."])])
     last = B.previous_meeting(weekly, B.past_meetings())
     assert last is not None and last["id"] == "2026-09-27-210000"
+
+
+def test_same_title_with_someone_else_is_not_last_time(meetings, weekly):
+    # "Interview" with Cara: last week's "interview" with Zed must not show up
+    weekly.title = "Interview"
+    weekly.attendees = [gcal.Attendee("Cara", "cara@x.com"), gcal.Attendee("", "rob@example.com", is_me=True)]
+    make_meeting(meetings, "2026-10-08-100000", datetime(2026, 10, 8, 10, 0, tzinfo=UTC), "interview",
+                 attendees=[("Zed", "zed@y.com")], sections=[("Summary", ["Zed struggled with system design."])],
+                 actions=[("Rob", "Reject Zed and tell the recruiter", "")])
+    assert B.previous_meeting(weekly, B.past_meetings()) is None
+    brief = B.brief_for(weekly, B.past_meetings(), B.me_names("Rob", weekly), now=NOW)
+    assert brief.last is None and brief.open_items == []
+    # with Cara there too, it was hers as well
+    make_meeting(meetings, "2026-10-01-100000", datetime(2026, 10, 1, 10, 0, tzinfo=UTC), "Interview",
+                 attendees=[("Cara", "cara@x.com"), ("Zed", "zed@y.com")])
+    assert B.previous_meeting(weekly, B.past_meetings())["id"] == "2026-10-01-100000"
+    # and one with nobody's email on it still counts by title
+    make_meeting(meetings, "2026-10-05-100000", datetime(2026, 10, 5, 10, 0, tzinfo=UTC), "Interview")
+    assert B.previous_meeting(weekly, B.past_meetings())["id"] == "2026-10-05-100000"
+
+
+def test_someone_with_your_first_name_is_not_you(meetings, weekly):
+    weekly.title = "1:1"
+    weekly.attendees = [gcal.Attendee("Rob Smith", "rsmith@x.com"),
+                        gcal.Attendee("Rob Behbahani", "rob@example.com", is_me=True)]
+    names = B.me_names("Rob", weekly)
+    assert [a.name for a in B.others(weekly, names)] == ["Rob Smith"]
+    make_meeting(meetings, "2026-10-08-100000", datetime(2026, 10, 8, 10, 0, tzinfo=UTC), "1:1",
+                 attendees=[("Rob Smith", "rsmith@x.com")],
+                 actions=[("Rob Smith", "Draft the hiring plan", ""), ("Rob", "Review the plan", ""),
+                          ("Rob Behbahani", "Book the offsite", "")])
+    items = B.brief_for(weekly, B.past_meetings(), names, now=NOW).open_items
+    assert [(a["task"], a["yours"]) for a in items] == [
+        ("Draft the hiring plan", False), ("Review the plan", True), ("Book the offsite", True)]
+    # without your address in the feed, a Rob on the invite is taken to be you
+    weekly.attendees[1].is_me = False
+    assert B.others(weekly, names) == []
 
 
 def test_no_previous_meeting_the_first_time(meetings, weekly):
@@ -125,6 +194,9 @@ def test_open_items_tags_yours_and_theirs(meetings):
         ("Send Dana the pricing sheet", True),
         ("Share the Q4 roadmap draft", False),
     ]   # not Sam's venue, not your intro from the coffee with Sam
+    # a different Dana is not the Dana Lee you're meeting
+    other = B.open_items(B.past_meetings(), {"dana@example.com"}, {"Dana Smith"}, me={"rob"}, now=NOW)
+    assert [a["task"] for a in other] == ["Send Dana the pricing sheet"]
 
 
 def test_open_items_window_and_carried_over_tasks(meetings):

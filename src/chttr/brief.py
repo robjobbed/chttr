@@ -8,6 +8,7 @@ the daemon shows it as a notification [meeting] brief_minutes before the event.
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -15,11 +16,18 @@ from pathlib import Path
 
 from .meeting.store import meeting_dirs, read_json
 
+log = logging.getLogger(__name__)
+
 SUMMARY_CHARS = 160
 TASK_CHARS = 90
 MAX_ITEMS = 6
-# Sections the notes had nothing for say so ("Not discussed."); that is no summary.
-FILLER = re.compile(r"^\W*(not discussed|nothing (else )?(came up|discussed)|none|n/?a)\W*$", re.I)
+# Sections the notes had nothing for say so ("Not discussed.", "No decisions were made."):
+# that is no summary.
+FILLER = re.compile(
+    r"^\W*(?:(?:not|nothing(?: else)?|no(?:ne)?(?: \w+){0,3}(?: was| were)?)"
+    r" (?:discussed|covered|mentioned|came up|made|raised|identified|agreed|to report)"
+    r"(?: (?:in|during|at|on|for|this|that|the|today|meeting|call|session|yet))*"
+    r"|none|nothing|n/?a)\W*$", re.I)
 
 _cache: dict[Path, tuple[float, dict]] = {}     # result.json -> (mtime, what we need of it)
 
@@ -39,6 +47,11 @@ def _first(name: str) -> str:
     """'Dana Lee' -> 'dana', 'dana.lee@x.com' -> 'dana'."""
     words = re.findall(r"[^\W\d_]+", name.split("@")[0].lower())
     return words[0] if words else ""
+
+
+def _full(name: str) -> str:
+    """'Dana Lee' -> 'dana lee', 'dana.lee@x.com' -> 'dana lee'."""
+    return " ".join(re.findall(r"[^\W\d_]+", name.split("@")[0].lower()))
 
 
 def _norm_title(title: str) -> str:
@@ -105,15 +118,22 @@ def past_meetings() -> list[dict]:
             result = read_json(path)
             if not isinstance(result, dict):
                 continue
-            cached = _cache[path] = (mtime, _meeting(d, result))
+            try:
+                cached = _cache[path] = (mtime, _meeting(d, result))
+            except (AttributeError, TypeError, ValueError, KeyError):
+                log.debug("brief: skipping %s", path, exc_info=True)     # hand-edited or from an old version
+                continue
         out.append(cached[1])
     return sorted(out, key=lambda m: m["started"], reverse=True)
 
 
 # ---- matching them to the next event ---------------------------------------
 def others(event, me_names: set[str] | frozenset[str] = frozenset()) -> list:
-    """The event's attendees other than you."""
-    return [a for a in event.attendees if not a.is_me and not (a.name and _first(a.name) in me_names)]
+    """The event's attendees other than you. Your first name only tells you apart when the
+    feed doesn't say which attendee you are: a Rob Smith in your 1:1 is someone else."""
+    known = any(a.is_me for a in event.attendees)
+    return [a for a in event.attendees
+            if not a.is_me and (known or not (a.name and _first(a.name) in me_names))]
 
 
 def me_names(me_setting: str, event=None) -> set[str]:
@@ -143,18 +163,24 @@ def _their_emails(event, meetings: list[dict], me_names: set[str] | frozenset[st
     return {a.email.lower() for a in others(event, me_names) if a.email} - yours
 
 
+def _same_people(want: set[str], m: dict) -> bool:
+    """A meeting with the same title is the same meeting unless the emails say otherwise."""
+    return not want or not _people(m) or bool(want & _people(m))
+
+
 def previous_meeting(event, meetings: list[dict], me_names: set[str] | frozenset[str] = frozenset()) -> dict | None:
-    """The newest meeting with the same title (ignoring case), else the newest one that had
-    at least half of the event's other invitees in it. Never this very meeting."""
+    """The newest meeting with the same title (ignoring case) and nobody to say it was with
+    other people, else the newest one that had at least half of the event's other invitees
+    in it. Never this very meeting. An "Interview" or "1:1" with Zed is not last time with Cara."""
     start = event.start.timestamp()
     # a recording that began just before the event is this very meeting
     earlier = sorted((m for m in meetings if m["started"] < start - 300), key=lambda m: m["started"], reverse=True)
+    want = _their_emails(event, meetings, me_names)
     title = _norm_title(event.title)
     if title and title != "(untitled)":
-        same = next((m for m in earlier if _norm_title(m["title"]) == title), None)
+        same = next((m for m in earlier if _norm_title(m["title"]) == title and _same_people(want, m)), None)
         if same:
             return same
-    want = _their_emails(event, meetings, me_names)
     if not want:
         return None
     return next((m for m in earlier if _people(m) and len(want & _people(m)) >= 0.5 * len(want)), None)
@@ -164,23 +190,41 @@ def open_items(meetings: list[dict], emails: set[str], names: set[str], since_da
                me: set[str] | frozenset[str] = frozenset(), title: str = "",
                now: datetime | None = None) -> list[dict]:
     """Action items from the last `since_days` days that are theirs (owner's first name in
-    `names`) or yours from a meeting with them (an email in `emails`, or the same title).
-    Newest first, at most MAX_ITEMS, each with yours: bool."""
+    `names`, which may be full names) or yours from a meeting with them (an email in `emails`,
+    or the same title with nobody else's emails on it). Newest first, at most MAX_ITEMS,
+    each with yours: bool. When they share your first name, full names tell you apart."""
     cutoff = (now or datetime.now(UTC)).timestamp() - since_days * 86400
     title = _norm_title(title)
+    firsts = {_first(n) for n in names} - {""}
+    fulls = {f for n in names if " " in (f := _full(n))}
+
+    def theirs(full: str, first: str) -> bool:
+        if full in fulls:
+            return True
+        # "Dana Smith" is not the Dana Lee you're meeting
+        return first in firsts and not (" " in full and any(f.split()[0] == first for f in fulls))
+
     seen: set[str] = set()
     out: list[dict] = []
     for m in sorted(meetings, key=lambda m: m["started"], reverse=True):
         if m["started"] < cutoff:
             break
-        with_them = bool(emails & _people(m)) or bool(title and _norm_title(m["title"]) == title)
+        same_title = bool(title and _norm_title(m["title"]) == title)
+        with_them = bool(emails & _people(m)) or (same_title and (not emails or not _people(m)))
         mine = {_first(n) for n in m["me"]} | set(me)
+        mine_full = {_full(n) for n in m["me"]}
         for a in m["action_items"]:
-            owner = _first(a["owner"])
+            full = _full(a["owner"])
+            owner = full.split()[0] if full else ""
             if not owner:
                 continue
-            yours = owner in mine
-            if not (with_them if yours else owner in names):
+            if full in mine_full:
+                yours = True
+            elif full in fulls:
+                yours = False
+            else:
+                yours = owner in mine
+            if not (with_them if yours else theirs(full, owner)):
                 continue
             key = " ".join(re.findall(r"\w+", a["task"].lower()))
             if key in seen:
@@ -196,7 +240,7 @@ def brief_for(event, meetings: list[dict], me_names: set[str], now: datetime | N
     now = now or datetime.now(UTC).astimezone()
     people = others(event, me_names)
     emails = _their_emails(event, meetings, me_names)
-    names = {_first(a.name or a.email) for a in people} - set(me_names) - {""}
+    names = {a.name or a.email for a in people} - {""}
     last = previous_meeting(event, meetings, me_names)
     return Brief(
         event_title=event.title,
