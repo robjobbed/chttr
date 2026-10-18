@@ -456,7 +456,7 @@ class Daemon:
             return self._press({"start": PTT, "command": COMMAND, "toggle": HANDSFREE}[cmd])
         with self.lock:
             if cmd == "meeting":
-                return self._meeting_command(arg.strip().lower())
+                return self._meeting_command(arg.strip())
             if cmd == "meet":
                 return self._meet_event(json.loads(arg))
             if cmd == "status":
@@ -498,10 +498,28 @@ class Daemon:
                 "call": {k: self.call[k] for k in ("code", "title")} if self.call else None}
 
     def _meeting_command(self, arg: str) -> dict:
+        verb, _, extra = arg.partition(" ")
+        arg = verb.lower()
         if arg in ("", "status"):
             return self._meeting_status()
         if arg == "start":
-            return self._meeting_start("manual")
+            # `meeting start {"title": ..., "source": "app", "call": CODE}` from a "Record?" click
+            try:
+                opts = json.loads(extra) if extra.strip() else {}
+            except ValueError:
+                opts = None
+            if not isinstance(opts, dict):
+                return {"ok": False, "state": self.state, "error": f"bad meeting start options {extra!r}"}
+            call = str(opts.get("call") or "")
+            if call and not self.meeting and not (self.call and self.call["code"] == call):
+                self.feedback.notify("That call has ended", "Nothing was recorded.", timeout_ms=3000)
+                return {"ok": False, "state": self.state, "error": "that Meet call has ended"}
+            source = opts.get("source") if opts.get("source") in ("manual", "app") else "manual"
+            if source == "app" and not self.meeting and not self._app_call_live():
+                # an old toast clicked from history: nothing would ever stop this recording
+                self.feedback.notify("That call has ended", "Nothing was recorded.", timeout_ms=3000)
+                return {"ok": False, "state": self.state, "error": "that call has ended"}
+            return self._meeting_start(source, str(opts.get("title") or ""))
         if arg == "stop":
             return self._meeting_stop()
         if arg == "toggle":
@@ -634,6 +652,22 @@ class Daemon:
         except Exception:  # noqa: BLE001
             return ""
 
+    def _app_call_live(self) -> bool:
+        """Does a call app still hold the mic? (A failed check counts as no.)"""
+        from . import calls as K
+
+        try:
+            return K.current_call(K.snapshot(), meet_call_active=self.call is not None) is not None
+        except Exception:
+            log.debug("call check failed", exc_info=True)
+            return False
+
+    @staticmethod
+    def _chttr_argv() -> list[str]:
+        """How a notification click calls chttr back (the service's PATH may lack ~/.local/bin)."""
+        exe = shutil.which("chttr")
+        return [exe] if exe else [sys.executable, "-m", "chttr"]
+
     def _ask_to_record_app(self, app: str) -> None:
         from . import gcal
 
@@ -646,17 +680,11 @@ class Daemon:
         except Exception:  # noqa: BLE001
             pass
         label = title or f"this {app} call"
-        try:
-            out = subprocess.run(["notify-send", "-a", "chttr", "-u", "normal", "-t", "120000",
-                                  "-A", "record=Record", "-A", "skip=Not now", "--wait",
-                                  f"Record \u201c{label}\u201d?", body],
-                                 capture_output=True, text=True, timeout=180).stdout.strip()
-        except (OSError, subprocess.TimeoutExpired):
-            return
-        if out == "record":
-            with self.lock:
-                if not self.meeting:
-                    self._meeting_start("app", title or f"{app} call")
+        # The click runs `chttr meeting start`, which comes back here through the socket.
+        self.feedback.offer(f"Record \u201c{label}\u201d?", body,
+                            ("Record", [*self._chttr_argv(), "meeting", "start", "--title", title or f"{app} call",
+                                        "--source", "app"]),
+                            [("Not now", [])], glyph="󰑊")
 
     def _ask_to_record(self, code: str, title: str) -> None:
         from . import gcal
@@ -674,17 +702,10 @@ class Daemon:
                         self.call["title"] = event.title
         except Exception as exc:  # noqa: BLE001
             log.warning("calendar lookup failed: %s", exc)
-        try:
-            out = subprocess.run(["notify-send", "-a", "chttr", "-u", "normal", "-t", "120000",
-                                  "-A", "record=Record", "-A", "skip=Not now", "--wait",
-                                  f"Record \u201c{label}\u201d?", body],
-                                 capture_output=True, text=True, timeout=180).stdout.strip()
-        except (OSError, subprocess.TimeoutExpired):
-            return
-        if out == "record":
-            with self.lock:
-                if self.call and self.call["code"] == code and not self.meeting:
-                    self._meeting_start("extension")
+        # --call: a click after you've left the call records nothing (the toast outlives it).
+        self.feedback.offer(f"Record \u201c{label}\u201d?", body,
+                            ("Record", [*self._chttr_argv(), "meeting", "start", "--call", code]),
+                            [("Not now", [])], glyph="󰑊")
 
     def _reload(self) -> dict:
         """Re-read config.toml and apply it now: audio levels, sounds, hotkeys and
@@ -1029,19 +1050,12 @@ class Daemon:
                 continue
             self.offered.add((c.heard, c.right))
             log.info("you changed %r to %r", c.heard, c.right)
-            try:
-                out = subprocess.run(["notify-send", "-a", "chttr", "-t", "15000", "-A", "learn=Learn it",
-                                      "--wait", f"Learn \u201c{c.right}\u201d?",
-                                      f"You changed \u201c{c.heard}\u201d to \u201c{c.right}\u201d. "
-                                      "chttr can spell it that way from now on."],
-                                     capture_output=True, text=True, timeout=30).stdout.strip()
-            except (OSError, subprocess.TimeoutExpired):
-                return
-            if out == "learn":
-                d = Dictionary.load()
-                d.learn(c.right, [c.heard])
-                d.save()
-                self.feedback.notify(f"Learned \u201c{c.right}\u201d", timeout_ms=2500)
+            # The click runs `chttr learn`, which saves the word and says so.
+            self.feedback.offer(f"Learn \u201c{c.right}\u201d?",
+                                f"You changed \u201c{c.heard}\u201d to \u201c{c.right}\u201d. "
+                                "chttr can spell it that way from now on.",
+                                ("Learn it", [*self._chttr_argv(), "learn", c.right, "--heard", c.heard, "--notify"]),
+                                glyph="󰗊", timeout_ms=15000)
 
     @staticmethod
     def _save_audio(audio: np.ndarray, when: datetime) -> str:

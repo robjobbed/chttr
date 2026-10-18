@@ -302,6 +302,15 @@ def cmd_learn(args: argparse.Namespace) -> int:
     d.save()
     heard = ", ".join(f"{h!r}" for h in (args.heard or []))
     print(f"learned {args.word!r}" + (f" (heard as {heard})" if heard else "") + f" -> {DICTIONARY_FILE}")
+    if args.notify:            # clicked "Learn it?" in a notification: nobody sees this terminal
+        import subprocess
+
+        try:
+            subprocess.run(["notify-send", "-a", "chttr", "-t", "2500", f"Learned \u201c{args.word}\u201d",
+                            "chttr spells it that way from now on."],
+                           timeout=5, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError):
+            pass
     return 0
 
 
@@ -553,7 +562,12 @@ def _send_or_exit(command: str) -> dict:
 
 
 def cmd_meeting_control(args: argparse.Namespace) -> int:
-    reply = _send_or_exit(f"meeting {args.action}")
+    command = f"meeting {args.action}"
+    # hidden flags, set by the daemon's "Record this call?" notification
+    opts = {k: v for k in ("title", "source", "call") if (v := getattr(args, k, None))}
+    if args.action == "start" and opts:
+        command += " " + json.dumps(opts)
+    reply = _send_or_exit(command)
     if args.json:
         print(json.dumps(reply))
         return 0 if reply.get("ok") else 1
@@ -814,6 +828,18 @@ def cmd_setup(args: argparse.Namespace) -> int:
                do_bindings=not args.no_keybindings, do_meet=not args.no_meet)
 
 
+def _ollama_script(polish) -> str:
+    """Start Ollama so it outlives the terminal, then pull the cleanup model (a 404 otherwise)."""
+    import shlex
+
+    model = shlex.quote(polish.ollama_model)
+    return ("setsid -f ollama serve >/dev/null 2>&1; "
+            "for _ in $(seq 40); do ollama list >/dev/null 2>&1 && break; sleep 0.25; done; "
+            f"ollama pull {model} && echo && "
+            "echo 'Ollama is running: chttr cleans up your dictation offline now.' && "
+            "echo 'It stops when you log out. To start it at boot: sudo systemctl enable --now ollama'")
+
+
 def _terminal(command: str) -> None:
     from .desktop import open_terminal
 
@@ -853,9 +879,11 @@ def _pick_style(directory: Path) -> None:
 
 def cmd_menu(args: argparse.Namespace) -> int:
     """The bar widget's menu (Omarchy's menu picker, or fuzzel / wofi / rofi elsewhere)."""
+    import shutil
     import subprocess
 
     from . import desktop as DT
+    from . import polish as P
     from .meeting import meeting_dirs, read_json
     try:
         status = send("meeting status")
@@ -865,6 +893,12 @@ def cmd_menu(args: argparse.Namespace) -> int:
     notes = [Path(m["markdown"]) for d in reversed(meeting_dirs())
              if (m := read_json(d / "meta.json", {}) or {}).get("markdown") and Path(m["markdown"]).exists()]
     items: list[tuple[str, Callable[[], object]]] = []
+    no_key = cfg.polish.backend == "claude" and not P._claude_configured(cfg.polish)
+    if cfg.polish.backend != "none" and cfg.polish.level != "none" and (P.backend(cfg.polish) == "none" or no_key):
+        # cleanup is on but has nothing to run on: `chttr connect claude` is the guided key entry
+        items.append(("󰚩  Turn on Claude cleanup…", lambda: _terminal("chttr connect claude")))
+        if shutil.which("ollama") and cfg.polish.backend == "auto":
+            items.append(("󰚩  Use Ollama for cleanup (offline)", lambda: _terminal(_ollama_script(cfg.polish))))
     if status is None:
         items.append(("󰑓  Start the chttr daemon", lambda: subprocess.run(["systemctl", "--user", "restart", "chttr"])))
     elif status.get("recording"):
@@ -999,6 +1033,7 @@ def build_parser() -> argparse.ArgumentParser:
     le = sub.add_parser("learn", help="teach chttr a word: chttr learn Sohrab --heard sorob --heard 'so rob'")
     le.add_argument("word", help="the correct spelling")
     le.add_argument("--heard", action="append", metavar="TEXT", help="what the recognizer produced instead (repeatable)")
+    le.add_argument("--notify", action="store_true", help=argparse.SUPPRESS)
     le.set_defaults(func=cmd_learn)
 
     fo = sub.add_parser("forget", help="remove a word and its replacements from the dictionary")
@@ -1045,6 +1080,10 @@ def build_parser() -> argparse.ArgumentParser:
         s = msub.add_parser(name, help=help_)
         s.add_argument("--json", action="store_true")
         s.set_defaults(func=cmd_meeting_control, action=name)
+        if name == "start":                 # from the "Record this call?" notification
+            s.add_argument("--title", help=argparse.SUPPRESS)
+            s.add_argument("--source", choices=["manual", "app"], help=argparse.SUPPRESS)
+            s.add_argument("--call", help=argparse.SUPPRESS)
     mp = msub.add_parser("process", help="(re)write the notes for a recorded meeting")
     mp.add_argument("meeting", nargs="?", help="meeting id or directory (default: the latest)")
     mp.add_argument("--no-summary", action="store_true", help="transcript only, no Claude notes")
