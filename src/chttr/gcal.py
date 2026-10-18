@@ -105,13 +105,16 @@ def _email(value) -> str:
     return str(value).removeprefix("mailto:").removeprefix("MAILTO:").strip().lower()
 
 
-def _events(data: bytes, around: datetime, window: timedelta) -> tuple[list[Event], str]:
+def _events(data: bytes, around: datetime, window: timedelta, me_email: str = "") -> tuple[list[Event], str]:
+    """Events within `window` of `around`, and whose calendar it is. You are the attendee
+    with `me_email` ([meeting] email), else the feed's name when it is an address (a
+    primary Google calendar is named after its owner; a secondary one is not)."""
     import icalendar
     import recurring_ical_events
 
     cal = icalendar.Calendar.from_ical(data)
     owner = str(cal.get("X-WR-CALNAME", "")).strip().lower()
-    owner = owner if "@" in owner else ""
+    owner = me_email.strip().lower() or (owner if "@" in owner else "")
     events = []
     for comp in recurring_ical_events.of(cal).between(around - window, around + window):
         if str(comp.get("STATUS", "")).upper() == "CANCELLED":
@@ -143,14 +146,14 @@ def _events(data: bytes, around: datetime, window: timedelta) -> tuple[list[Even
     return events, owner
 
 
-def find_event(urls: list[str], code: str = "", when: datetime | None = None) -> Event | None:
+def find_event(urls: list[str], code: str = "", when: datetime | None = None, me_email: str = "") -> Event | None:
     """The calendar event for a meeting: same Meet code within 12 hours if we know it,
     else the event with a Meet link (or attendees) that overlaps `when`."""
     when = when or datetime.now(UTC).astimezone()
     candidates: list[Event] = []
     for url in urls:
         try:
-            events, _owner = _events(_fetch(url), when, timedelta(hours=12))
+            events, _owner = _events(_fetch(url), when, timedelta(hours=12), me_email)
         except Exception as exc:  # noqa: BLE001 - a broken feed must not break the meeting
             log.warning("calendar %s…: %s", url[:40], exc)
             continue
@@ -167,11 +170,12 @@ def find_event(urls: list[str], code: str = "", when: datetime | None = None) ->
     return None
 
 
-def upcoming(urls: list[str], hours: float = 24) -> list[Event]:
+def upcoming(urls: list[str], hours: float = 24, me_email: str = "") -> list[Event]:
     """Events from now on (for `chttr meeting calendar` to show that the feed works)."""
     now = datetime.now(UTC).astimezone()
     out: list[Event] = []
     for url in urls:
-        events, _ = _events(_fetch(url, max_age=0), now + timedelta(hours=hours / 2), timedelta(hours=hours / 2))
+        events, _ = _events(_fetch(url, max_age=0), now + timedelta(hours=hours / 2), timedelta(hours=hours / 2),
+                            me_email)
         out += [e for e in events if e.end >= now]
     return sorted(out, key=lambda e: e.start)

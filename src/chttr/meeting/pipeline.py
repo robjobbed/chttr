@@ -119,7 +119,8 @@ def process(directory: Path, cfg: Config, summary: bool | None = None) -> Path:
     from .. import gcal
 
     urls = gcal.read_urls(cfg.meeting.calendar_file)
-    event = gcal.find_event(urls, meta.get("code", ""), datetime.fromtimestamp(started).astimezone()) if urls else None
+    event = gcal.find_event(urls, meta.get("code", ""), datetime.fromtimestamp(started).astimezone(),
+                            me_email=cfg.meeting.email) if urls else None
     names = sorted({part for full in [*(a.name for a in (event.attendees if event else [])),
                                       *(str(e.get("name", "")) for e in events if e.get("type") == "speaking")]
                     for part in full.split() if len(part) >= 3 and part.lower() not in SELF_CAPTION_NAMES})
