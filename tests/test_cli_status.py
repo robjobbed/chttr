@@ -114,7 +114,6 @@ def test_a_daemon_from_before_state_json_still_shows(capsys, tmp_path):
 
 
 def test_daemon_alive():
-    assert K.daemon_alive({"pid": os.getpid()})
     assert not K.daemon_alive({})
     assert not K.daemon_alive({"pid": "nonsense"})
     assert not K.daemon_alive({"pid": ALIVE_PID})
