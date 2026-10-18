@@ -39,7 +39,7 @@ def _run(argv: list[str], timeout: float | None = 10, env: dict | None = None,
     """subprocess.run that never raises: a missing program is exit status 127.
     Uncaptured output (chttr setup's progress) goes to stderr, so it never mixes
     with `chttr doctor --json` on stdout."""
-    out = {"capture_output": True} if capture else {"stdout": _stderr()}
+    out: dict = {"capture_output": True} if capture else {"stdout": _stderr()}
     try:
         return subprocess.run(argv, text=True, timeout=timeout, env=env, check=False, **out)
     except FileNotFoundError as exc:

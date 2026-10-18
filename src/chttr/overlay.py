@@ -31,6 +31,7 @@ def _load_lines():
     daemon. Loaded by path so chttr's other modules never shadow anything here."""
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "overlay_lines.py")
     spec = importlib.util.spec_from_file_location("chttr_overlay_lines", path)
+    assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

@@ -8,6 +8,8 @@ from collections.abc import Sequence
 
 import numpy as np
 
+Levels = Sequence[float] | np.ndarray     # chunk levels in dBFS: a list, a deque or an array
+
 FLOOR_MIN = -62.0       # never treat anything quieter than this as speech
 MARGIN_DB = 10.0        # speech is at least this far above the noise floor
 WINDOW_CHUNKS = 500     # 10 s of 20 ms chunks
@@ -18,7 +20,7 @@ SPEECH_GAP_DB = 20.0    # anything this far under your speech is not speech eith
 SILENT = -90.0          # the floor before anything was measured
 
 
-def noise_floor(levels_db: Sequence[float]) -> float:
+def noise_floor(levels_db: Levels) -> float:
     """The room's level in dBFS: the 15th percentile of the chunk levels (of the
     first 15 chunks while fewer than 50 are in). SILENT when there is nothing yet."""
     if len(levels_db) == 0:
@@ -28,7 +30,7 @@ def noise_floor(levels_db: Sequence[float]) -> float:
     return float(np.percentile(np.asarray(levels_db, dtype=np.float64), FLOOR_PERCENTILE))
 
 
-def speech_level(levels_db: Sequence[float], floor: float | None = None) -> float:
+def speech_level(levels_db: Levels, floor: float | None = None) -> float:
     """How loud you speak, in dBFS: the median of the chunks clearly above the noise
     floor, so a short word in a long quiet recording still counts and a single cough
     does not. The 90th percentile of everything when no chunk stands out."""
@@ -39,7 +41,7 @@ def speech_level(levels_db: Sequence[float], floor: float | None = None) -> floa
     return float(np.median(loud)) if len(loud) else float(np.percentile(db, 90))
 
 
-def effective_threshold(levels_db: Sequence[float], configured: float, margin: float = MARGIN_DB,
+def effective_threshold(levels_db: Levels, configured: float, margin: float = MARGIN_DB,
                         floor_min: float = FLOOR_MIN) -> float:
     """The speech threshold for these levels: `margin` dB above the noise floor, but
     only as low as your speech needs (SPEECH_GAP_DB under it), only ever lower than

@@ -596,7 +596,7 @@ class Daemon:
             if call and not self.meeting and not (self.call and self.call["code"] == call):
                 self.feedback.notify("That call has ended", "Nothing was recorded.", timeout_ms=3000)
                 return {"ok": False, "state": self.state, "error": "that Meet call has ended"}
-            source = opts.get("source") if opts.get("source") in ("manual", "app") else "manual"
+            source = "app" if opts.get("source") == "app" else "manual"
             if source == "app" and not self.meeting and not self._app_call_live():
                 # an old toast clicked from history: nothing would ever stop this recording
                 self.feedback.notify("That call has ended", "Nothing was recorded.", timeout_ms=3000)

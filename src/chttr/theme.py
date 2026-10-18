@@ -53,8 +53,8 @@ def _mix(a: str, b: str, amount: float) -> str:
 def luminance(color: str) -> float:
     """WCAG relative luminance, 0 (black) .. 1 (white)."""
     def channel(c: int) -> float:
-        c = c / 255
-        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+        x = c / 255
+        return x / 12.92 if x <= 0.03928 else ((x + 0.055) / 1.055) ** 2.4
 
     r, g, b = (channel(c) for c in _rgb(color))
     return 0.2126 * r + 0.7152 * g + 0.0722 * b
