@@ -81,10 +81,28 @@ def _tilde(path: Path) -> str:
         return str(path)
 
 
+def _ours(path: str) -> bool:
+    return path == str(EXTENSION_DIR) or _is_chttr_extension(Path(path))
+
+
+def _extension_lists(text: str) -> list[list[str]]:
+    """Each --load-extension line's paths."""
+    return [[x for x in line.strip().split("=", 1)[1].split(",") if x]
+            for line in text.splitlines() if line.strip().startswith("--load-extension=")]
+
+
+def _chttr_wrote(text: str) -> bool:
+    """True when every line is chttr's own --load-extension line: a file chttr
+    created, so there is no original of the user's to keep."""
+    lines = [line for line in text.splitlines() if line.strip()]
+    lists = _extension_lists(text)
+    return bool(lines) and len(lists) == len(lines) and all(_ours(x) for paths in lists for x in paths)
+
+
 def _backup(flags: Path) -> None:
     """Keep the flags file as it was before chttr first changed it (uninstall puts it back)."""
     backup = flags.with_name(flags.name + ".bak-chttr")
-    if flags.exists() and not backup.exists():
+    if flags.exists() and not backup.exists() and not _chttr_wrote(flags.read_text(encoding="utf-8")):
         shutil.copy2(flags, backup)
 
 
@@ -144,6 +162,9 @@ def _remove_extension(flags: Path) -> str | None:
         return None
     backup = flags.with_name(flags.name + ".bak-chttr")
     result = "\n".join(lines) + "\n" if lines else ""
+    if backup.exists() and any(_ours(x) for paths in _extension_lists(backup.read_text(encoding="utf-8"))
+                               for x in paths):
+        backup.unlink()                 # taken after chttr's own first edit: not the user's original
     if backup.exists() and backup.read_text(encoding="utf-8").rstrip("\n") == result.rstrip("\n"):
         shutil.copy2(backup, flags)
         backup.unlink()

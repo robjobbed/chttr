@@ -365,6 +365,34 @@ def _home(path: Path) -> str:
         return str(path)
 
 
+def _inside(path: Path, folder: Path) -> bool:
+    return path == folder or folder in path.parents
+
+
+def _delete_root(root: Path, notes: Path) -> str:
+    """Delete one of chttr's folders, sparing the meeting notes when they live in it.
+    Paths are compared resolved, so a notes folder reached through a symlink into
+    chttr's data counts as inside it, and a data folder moved to another disk and
+    linked back is deleted where it really is (then the link)."""
+    target, notes_r, link = root.resolve(), notes.resolve(), root.is_symlink()
+    try:
+        if _inside(notes_r, target):
+            for child in target.iterdir():
+                if _inside(notes_r, child.resolve()):
+                    continue
+                shutil.rmtree(child) if child.is_dir() and not child.is_symlink() else child.unlink()
+            return f"data: deleted {_home(root)} except your meeting notes in {_home(notes)}"
+        if target.is_dir():
+            shutil.rmtree(target)
+        if link:
+            root.unlink()
+    except OSError as exc:
+        return f"data: couldn't delete {_home(root)}: {exc.strerror or exc}"
+    if link:
+        return f"data: deleted {_home(root)} and {_home(target)}, the folder it linked to"
+    return f"data: deleted {_home(root)}"
+
+
 def _purge(yes: bool, ask) -> list[str]:
     from . import integrations as I
     from . import vault
@@ -383,24 +411,15 @@ def _purge(yes: bool, ask) -> list[str]:
         if not answer.strip().lower().startswith("y"):
             return ["data: kept (nothing deleted)"]
     done = []
-    for d in I.DESTINATIONS:
+    for d in I.connected():                 # only what is stored: `secret-tool clear` succeeds on nothing too
         try:
             if vault.remove(d):
                 done.append(f"secrets: forgot the {I.label(d)} connection")
         except (OSError, subprocess.SubprocessError):
             pass
     for root in (C.CONFIG_DIR, C.DATA_DIR):
-        if not root.exists():
-            continue
-        if notes == root or root in notes.parents:      # meeting notes kept inside chttr's own folder
-            for child in root.iterdir():
-                if child == notes or child in notes.parents:
-                    continue
-                shutil.rmtree(child) if child.is_dir() and not child.is_symlink() else child.unlink()
-            done.append(f"data: deleted {_home(root)} except your meeting notes in {_home(notes)}")
-        else:
-            shutil.rmtree(root)
-            done.append(f"data: deleted {_home(root)}")
+        if root.exists() or root.is_symlink():
+            done.append(_delete_root(root, notes))
     done.append(f"meeting notes: left alone in {_home(notes)} ([meeting] dir); they're yours")
     return done
 

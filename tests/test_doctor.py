@@ -187,11 +187,46 @@ def test_a_stopped_service_shows_its_log_and_the_fix(cfg):
     m = Machine(state=None, files=[I.UNIT, "/home/u/.local/bin/chttr"],
                 runs={"systemctl --user is-active chttr.service": (3, "failed\n", ""),
                       "systemctl --user is-enabled chttr.service": (0, "enabled\n", ""),
-                      "journalctl --user -u chttr -n 5 --no-pager -o cat": (0, "Traceback\nOSError: boom\n", "")})
+                      JOURNAL: (0, "Traceback\nOSError: boom\n", "")})
     m.texts[str(I.UNIT)] = "[Service]\nExecStart=/home/u/.local/bin/chttr daemon\n"
     c = D.service(cfg, m.env)
     assert not c.ok and c.auto and c.fix == "systemctl --user enable --now chttr"
     assert c.detail.splitlines() == ["not running: chttr.service is failed", "log: Traceback", "log: OSError: boom"]
+
+
+JOURNAL = "journalctl --user -u chttr -n 50 --no-pager -o cat"
+
+
+def test_the_log_shows_failures_and_never_what_you_dictated():
+    log = """\
+INFO heard: 'meet me at the clinic at noon'
+INFO you changed 'Pryanka' to 'Priyanka'
+Traceback (most recent call last):
+  File "/x/daemon.py", line 3, in _process
+    text = polish(raw)
+RuntimeError: polish failed on 'meet me at the clinic'
+chttr.service: Main process exited, code=exited, status=1/FAILURE
+INFO listening on /run/user/1000/chttr.sock
+"""
+    m = Machine(runs={JOURNAL: (0, log, "")})
+    assert D._journal(m.env, keep=10) == [
+        "Traceback (most recent call last):",
+        '  File "/x/daemon.py", line 3, in _process',
+        "    text = polish(raw)",
+        "RuntimeError: polish failed on '…'",
+        "chttr.service: Main process exited, code=exited, status=1/FAILURE"]
+
+
+def test_a_crash_looping_service_is_a_problem_even_while_systemd_calls_it_active(cfg):
+    m = Machine(state=None, files=[I.UNIT],
+                runs={"systemctl --user is-active chttr.service": (0, "activating\n", ""),
+                      "systemctl --user is-enabled chttr.service": (0, "enabled\n", ""),
+                      "systemctl --user show chttr.service -p NRestarts --value": (0, "4\n", ""),
+                      JOURNAL: (0, "OSError: no input device\n", "")})
+    c = D.service(cfg, m.env)
+    assert not c.ok and not c.auto
+    assert c.detail.splitlines() == ["chttr.service keeps restarting (4 times) and the daemon isn't answering",
+                                     "log: OSError: no input device"]
 
 
 def test_service_states(cfg):
@@ -241,7 +276,9 @@ def test_screen_context_ok_missing_pygobject_and_off(cfg):
     assert D.screen_context(cfg, m.env) == D.Check("screen_context", True, "AT-SPI bus reachable, 4 apps")
     no_gi = D.screen_context(cfg, Machine("fedora", probe={"gi": False, "bus": False, "apps": 0}).env)
     assert not no_gi.ok and no_gi.fix == "sudo dnf install python3-gobject at-spi2-core"
-    assert not D.screen_context(cfg, Machine(probe={}).env).ok           # the helper didn't run at all
+    silent = D.screen_context(cfg, Machine(probe={}).env)            # the helper didn't answer at all
+    assert not silent.ok and "didn't answer" in silent.detail and "pacman" not in silent.fix
+    assert silent.fix.startswith(f"run it to see why: {SYSTEM_PYTHON} -I ") and silent.fix.endswith(" --probe")
     cfg.polish.screen_context, cfg.history.learn_from_edits = "off", False
     assert D.screen_context(cfg, Machine(probe={}).env).ok
 
@@ -363,6 +400,81 @@ def test_apply_fixes_runs_chttr_through_this_python_when_it_isnt_on_path(cfg):
     assert kw == {"timeout": None, "capture": False}                     # progress shows, no time limit
 
 
+def test_uncaptured_output_goes_to_stderr_so_json_stays_clean(monkeypatch):
+    seen = {}
+
+    def fake_run(argv, **kw):
+        seen.update(kw)
+        return subprocess.CompletedProcess(argv, 0, None, None)
+
+    monkeypatch.setattr(D.subprocess, "run", fake_run)
+    monkeypatch.setattr(D, "_stderr", lambda: sys.__stderr__)
+    D._run(["chttr", "setup"], timeout=None, capture=False)
+    assert seen["stdout"] is sys.__stderr__ and "capture_output" not in seen
+    D._run(["true"])
+    assert seen["capture_output"] is True
+
+
+class Clock:
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+START = "systemctl --user enable --now chttr"
+
+
+def _service_machine(**kw):
+    m = Machine(files=[I.UNIT], state=None,
+                runs={START: (0, "", ""), "systemctl --user is-active chttr.service": (0, "active\n", ""),
+                      "systemctl --user is-enabled chttr.service": (0, "enabled\n", "")}, **kw)
+    m.env.clock = clock = Clock()
+    m.env.sleep = clock.sleep
+    return m, clock
+
+
+def test_a_started_service_counts_as_fixed_once_the_daemon_answers(cfg):
+    m, clock = _service_machine()
+    check = D.Check("service", False, "not running", START, auto=True)
+    answers = iter([None, None, None, "idle"])
+
+    def send(command):
+        state = next(answers, "idle")
+        if state is None:
+            raise cli.DaemonNotRunning("not yet")
+        return {"state": state}
+
+    m.env.send = send
+    assert D.apply_fixes([check], m.env, cfg) == [f"daemon:      ran {START}: fixed"]
+    assert 0 < clock.now <= D.SETTLE
+
+
+def test_a_service_that_crashes_right_after_starting_is_not_fixed(cfg):
+    m, clock = _service_machine()
+    check = D.Check("service", False, "not running", START, auto=True)
+
+    def sleep(seconds):                 # it dies a moment later and systemd gives up
+        clock.now += seconds
+        m.runs["systemctl --user is-active chttr.service"] = (3, "failed\n", "")
+
+    m.env.sleep = sleep
+    lines = D.apply_fixes([check], m.env, cfg)
+    assert lines == [f"daemon:      ran {START}: still a problem: not running: chttr.service is failed"]
+    assert clock.now >= D.SETTLE
+
+
+def test_a_started_service_that_never_answers_says_so(cfg):
+    m, _ = _service_machine()
+    check = D.Check("service", False, "not running", START, auto=True)
+    assert D.apply_fixes([check], m.env, cfg) == [
+        f"daemon:      ran {START}: started, but it isn't answering yet: journalctl --user -u chttr"]
+
+
 def test_apply_fixes_turns_on_screen_context(cfg, tmp_path):
     flags = tmp_path / "chromium-flags.conf"
     gsettings = "gsettings get org.gnome.desktop.interface toolkit-accessibility"
@@ -401,6 +513,17 @@ def test_doctor_fix_applies_then_shows_the_new_state(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "fixing 1 problem…" in out and "daemon:      ran it: fixed" in out
     assert out.rstrip().endswith("daemon:      idle (chttr.service)")
+
+
+@pytest.mark.parametrize(("checks", "message"), [
+    ([SAMPLE[0]], "nothing to fix"),
+    ([SAMPLE[0], D.Check("hotkeys", False, "none", "sudo usermod -aG input $USER")],
+     "nothing --fix can do on its own; see the fix: lines below")])
+def test_doctor_fix_with_nothing_to_run(monkeypatch, capsys, checks, message):
+    monkeypatch.setattr(D, "run_all", lambda cfg, env=None: checks)
+    monkeypatch.setattr(D, "apply_fixes", lambda checks, env=None, cfg=None: [])
+    cli.cmd_doctor(_args(fix=True))
+    assert capsys.readouterr().out.splitlines()[0] == message
 
 
 def test_doctor_text(monkeypatch, capsys):

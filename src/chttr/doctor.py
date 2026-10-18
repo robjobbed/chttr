@@ -12,10 +12,12 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
 import shlex
 import shutil
 import subprocess
 import sys
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -34,13 +36,24 @@ class Check:
 
 def _run(argv: list[str], timeout: float | None = 10, env: dict | None = None,
          capture: bool = True) -> subprocess.CompletedProcess:
-    """subprocess.run that never raises: a missing program is exit status 127."""
+    """subprocess.run that never raises: a missing program is exit status 127.
+    Uncaptured output (chttr setup's progress) goes to stderr, so it never mixes
+    with `chttr doctor --json` on stdout."""
+    out = {"capture_output": True} if capture else {"stdout": _stderr()}
     try:
-        return subprocess.run(argv, capture_output=capture, text=True, timeout=timeout, env=env, check=False)
+        return subprocess.run(argv, text=True, timeout=timeout, env=env, check=False, **out)
     except FileNotFoundError as exc:
         return subprocess.CompletedProcess(argv, 127, "", str(exc))
     except (OSError, subprocess.TimeoutExpired) as exc:
         return subprocess.CompletedProcess(argv, 1, "", str(exc))
+
+
+def _stderr():
+    try:
+        sys.stderr.fileno()
+        return sys.stderr
+    except (AttributeError, OSError, ValueError):
+        return None
 
 
 def _read_text(path: Path) -> str:
@@ -132,6 +145,8 @@ class Env:
     free_bytes: Callable[[Path], int] = _free_bytes
     missing_flags: Callable[[], list[Path]] = _missing_flags
     ensure_flags: Callable[[], list[str]] = _ensure_flags
+    sleep: Callable[[float], None] = time.sleep
+    clock: Callable[[], float] = time.monotonic
     cache: dict = field(default_factory=dict, repr=False)
 
 
@@ -261,9 +276,35 @@ def _daemon_state(env: Env) -> str | None:
         return None
 
 
-def _journal(env: Env) -> list[str]:
-    out = env.run(["journalctl", "--user", "-u", "chttr", "-n", "5", "--no-pager", "-o", "cat"])
-    return [line for line in (out.stdout or "").splitlines() if line.strip() and not line.startswith("-- ")]
+FAILURE = re.compile(r"Traceback|Error|Exception|exited|[Ff]ailed|Killed|core dump|[Ss]egmentation")
+QUOTED = re.compile(r"""(['"])[^'"\n]*\s[^'"\n]*\1""")
+
+
+def _journal(env: Env, keep: int = 5) -> list[str]:
+    """The last few lines of chttr's log that say why it stopped. Only failures
+    and their tracebacks, with quoted text masked: the daemon logs what you
+    dictate, and doctor output ends up in bug reports."""
+    out = env.run(["journalctl", "--user", "-u", "chttr", "-n", "50", "--no-pager", "-o", "cat"])
+    lines, in_traceback = [], False
+    for line in (out.stdout or "").splitlines():
+        if not line.strip() or line.startswith("-- "):
+            continue
+        if line.startswith("Traceback"):
+            in_traceback = True
+        elif not (in_traceback and line[:1].isspace()):
+            in_traceback = False
+            if not FAILURE.search(line):
+                continue
+        lines.append(QUOTED.sub(lambda m: m.group(1) + "…" + m.group(1), line))
+    return lines[-keep:]
+
+
+def _restarts(env: Env) -> int:
+    out = env.run(["systemctl", "--user", "show", "chttr.service", "-p", "NRestarts", "--value"])
+    try:
+        return int((out.stdout or "").strip() or 0) if out.returncode == 0 else 0
+    except ValueError:
+        return 0
 
 
 def service(cfg, env: Env) -> Check:
@@ -288,6 +329,12 @@ def service(cfg, env: Env) -> Check:
     active = (env.run(["systemctl", "--user", "is-active", "chttr.service"]).stdout or "").strip() or "unknown"
     enabled = (env.run(["systemctl", "--user", "is-enabled", "chttr.service"]).stdout or "").strip()
     if active in ("active", "activating", "reloading"):
+        if not state and (n := _restarts(env)):
+            log = _journal(env)
+            return Check("service", False, "\n".join([f"chttr.service keeps restarting ({n} time{'' if n == 1 else 's'}) "
+                                                     "and the daemon isn't answering",
+                                                     *(f"log: {line}" for line in log)]),
+                         "journalctl --user -u chttr -e   (the reason is near the end)")
         if enabled != "enabled":
             return Check("service", False, f"{state or 'starting'}, but chttr.service isn't enabled: "
                                            "it won't start when you log in",
@@ -435,7 +482,13 @@ def screen_context(cfg, env: Env) -> Check:
     if cfg.polish.screen_context == "off" and not cfg.history.learn_from_edits:
         return Check("screen_context", True, "off ([polish] screen_context, [history] learn_from_edits)")
     p = env.probe()
-    if not p or not p.get("gi"):
+    if not p:
+        from .context import HELPER
+        from .daemon import SYSTEM_PYTHON
+
+        return Check("screen_context", False, "the AT-SPI check didn't answer (it timed out or crashed)",
+                     f"run it to see why: {SYSTEM_PYTHON} -I {shlex.quote(str(HELPER))} --probe")
+    if not p.get("gi"):
         return Check("screen_context", False, "the system Python has no AT-SPI (PyGObject's Atspi): "
                                               "names on screen can't help spelling", install_command(env, "atspi"))
     toolkit = _toolkit_accessibility(env)
@@ -579,6 +632,21 @@ def _fix(check: Check, env: Env) -> list[str]:
     return []
 
 
+SETTLE = 10.0       # seconds a started daemon gets to answer (it loads the speech model first)
+
+
+def _wait_for_daemon(env: Env) -> bool:
+    """After starting the service: does the daemon answer within SETTLE seconds?
+    systemd calls a crash-looping unit active between crashes, so only an answer counts."""
+    end = env.clock() + SETTLE
+    while True:
+        if _daemon_state(env):
+            return True
+        if env.clock() >= end:
+            return False
+        env.sleep(0.5)
+
+
 def apply_fixes(checks: list[Check], env: Env | None = None, cfg=None) -> list[str]:
     """Run the `auto` fixes of the checks that failed, then check again.
     Returns one line per fix: what ran and whether it helped."""
@@ -596,8 +664,14 @@ def apply_fixes(checks: list[Check], env: Env | None = None, cfg=None) -> list[s
             lines.append(f"{label + ':':<13}{c.fix.splitlines()[0]}: failed ({exc})")
             continue
         env.cache.clear()
+        answers = _wait_for_daemon(env) if c.name == "service" else True
         again = _safe(by_name[c.name], cfg, env) if c.name in by_name else None
-        verdict = "fixed" if again is None or again.ok else "still a problem: " + again.detail.splitlines()[0]
+        if again is not None and not again.ok:
+            verdict = "still a problem: " + again.detail.splitlines()[0]
+        elif not answers:
+            verdict = "started, but it isn't answering yet: journalctl --user -u chttr"
+        else:
+            verdict = "fixed"
         ran = [line for line in c.fix.splitlines() if not line.startswith("add ")]
         lines.append(f"{label + ':':<13}" + (f"ran {' && '.join(ran)}: " if ran else "") + verdict)
         lines += [f"{INDENT}{note}" for note in notes]

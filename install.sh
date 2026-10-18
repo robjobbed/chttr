@@ -63,8 +63,10 @@ if ((${#need[@]})); then
 fi
 
 # The waveform overlay is optional (without it chttr shows notifications instead).
+# GNOME and X11 have no layer-shell, so the packages would do nothing there.
 py=/usr/bin/python3; [[ -x $py ]] || py=python3
-if [[ $session != x11 ]] && ! "$py" -c "import gi; gi.require_version('Gtk','4.0'); gi.require_version('Gtk4LayerShell','1.0')" 2>/dev/null; then
+desk="${XDG_CURRENT_DESKTOP:-}"
+if [[ $session != x11 && ${desk,,} != *gnome* ]] && ! "$py" -c "import gi; gi.require_version('Gtk','4.0'); gi.require_version('Gtk4LayerShell','1.0')" 2>/dev/null; then
   echo "recommended for the waveform overlay: python-gobject gtk4-layer-shell (Debian: python3-gi gir1.2-gtk-4.0 gir1.2-gtk4layershell-1.0)"
 fi
 

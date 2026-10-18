@@ -221,3 +221,55 @@ def test_purge_asks_after_the_rest_is_done(home, ran):
     I.UNIT.write_text("x")
     I.uninstall(purge=True, ask=lambda q: order.append("ask") or "n", say=lambda line: order.append(line.split(":")[0]))
     assert order[:2] == ["service", "ask"]
+
+
+def test_purge_spares_notes_reached_through_a_link_into_the_data_dir(home, ran):
+    real = C.DATA_DIR / "meetings"
+    real.mkdir(parents=True)
+    (real / "standup.md").write_text("# Standup\n")
+    (C.DATA_DIR / "history.jsonl").write_text("{}\n")
+    (home / "Meetings").symlink_to(real)
+    C.CONFIG_DIR.mkdir(parents=True)
+    C.CONFIG_FILE.write_text(f'[meeting]\ndir = "{home / "Meetings"}"\n')
+    done = I.uninstall(purge=True, yes=True)
+    assert (home / "Meetings/standup.md").read_text() == "# Standup\n"
+    assert not (C.DATA_DIR / "history.jsonl").exists()
+    assert "data: deleted ~/.local/share/chttr except your meeting notes in ~/Meetings" in done
+
+
+def test_purge_follows_a_data_dir_moved_elsewhere_and_linked_back(home, ran):
+    elsewhere = home / "disk2/chttr"
+    (elsewhere / "models").mkdir(parents=True)
+    C.DATA_DIR.parent.mkdir(parents=True)
+    C.DATA_DIR.symlink_to(elsewhere)
+    done = I.uninstall(purge=True, yes=True)
+    assert not elsewhere.exists() and not C.DATA_DIR.is_symlink()
+    assert "data: deleted ~/.local/share/chttr and ~/disk2/chttr, the folder it linked to" in done
+    assert done[-1].startswith("finish with: ")                         # the last steps still show
+
+
+def test_purge_reports_what_it_couldnt_delete_and_carries_on(home, ran, monkeypatch):
+    C.CONFIG_DIR.mkdir(parents=True)
+    C.DATA_DIR.mkdir(parents=True)
+
+    def refuse(path, *a, **kw):
+        if path == C.CONFIG_DIR:
+            raise PermissionError(13, "Permission denied")
+        return real_rmtree(path, *a, **kw)
+
+    real_rmtree = I.shutil.rmtree
+    monkeypatch.setattr(I.shutil, "rmtree", refuse)
+    done = I.uninstall(purge=True, yes=True)
+    assert "data: couldn't delete ~/.config/chttr: Permission denied" in done
+    assert "data: deleted ~/.local/share/chttr" in done and not C.DATA_DIR.exists()
+
+
+def test_purge_forgets_only_the_connections_that_are_stored(home, ran, monkeypatch):
+    from chttr import integrations, vault
+
+    removed = []
+    monkeypatch.setattr(integrations, "connected", lambda: ["slack"])
+    monkeypatch.setattr(vault, "remove", lambda name: removed.append(name) or True)
+    done = I.uninstall(purge=True, yes=True)
+    assert removed == ["slack"]
+    assert [line for line in done if line.startswith("secrets:")] == ["secrets: forgot the Slack connection"]

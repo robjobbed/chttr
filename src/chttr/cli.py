@@ -400,8 +400,13 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     if args.fix:
         fixable = [c for c in checks if not c.ok and c.auto and c.fix]
         out = sys.stderr if args.json else sys.stdout
-        print(f"fixing {len(fixable)} problem{'' if len(fixable) == 1 else 's'}…" if fixable
-              else "nothing --fix can do on its own; see the fix: lines below", file=out, flush=True)
+        if fixable:
+            message = f"fixing {len(fixable)} problem{'' if len(fixable) == 1 else 's'}…"
+        elif any(not c.ok for c in checks):
+            message = "nothing --fix can do on its own; see the fix: lines below"
+        else:
+            message = "nothing to fix"
+        print(message, file=out, flush=True)
         for line in doctor.apply_fixes(checks, env, cfg):
             print(line, file=out, flush=True)
         print(file=out)

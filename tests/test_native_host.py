@@ -136,3 +136,18 @@ def test_uninstall_keeps_flags_added_since(tmp_path, monkeypatch):
     monkeypatch.setattr(NH, "BROWSERS", [(("chromium",), profile, flags)])
     NH.uninstall()
     assert flags.read_text() == "--load-extension=/opt/other\n--enable-features=X\n"
+
+
+def test_no_backup_of_a_flags_file_chttr_wrote_and_a_stale_one_is_dropped(tmp_path, monkeypatch):
+    profile, flags = tmp_path / "chromium", tmp_path / "chromium-flags.conf"
+    backup = tmp_path / "chromium-flags.conf.bak-chttr"
+    profile.mkdir()
+    monkeypatch.setattr(NH, "BROWSERS", [(("chromium",), profile, flags)])
+    monkeypatch.setattr(NH, "BROWSER_DIRS", [(profile, flags)])
+    monkeypatch.setattr(NH.C, "DATA_DIR", tmp_path / "data")
+    NH.install()                                        # setup creates the file
+    NH.ensure_accessibility_flag()                      # then doctor --fix adds to it
+    assert not backup.exists()                          # chttr's own line is no original
+    backup.write_text(f"--load-extension={NH.EXTENSION_DIR}\n")      # left by an earlier version
+    NH.uninstall()
+    assert flags.read_text() == "--force-renderer-accessibility\n" and not backup.exists()
