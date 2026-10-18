@@ -200,6 +200,7 @@ def setup_steps(monkeypatch):
     monkeypatch.setattr(install, "models", lambda: True)
     monkeypatch.setattr(install, "keybindings", lambda exe: None)
     monkeypatch.setattr(install, "meet", lambda: None)
+    monkeypatch.setattr(install, "accessibility", lambda: [])
     monkeypatch.setattr(install, "service", lambda exe: True)
     monkeypatch.setattr(install, "offer_claude", lambda cfg: None)
     monkeypatch.setattr(install, "notify", lambda *a, **k: sent.append((a, k)))
@@ -250,6 +251,23 @@ def test_run_without_the_service_does_not_claim_ready(setup_steps, capsys):
     out = capsys.readouterr().out
     assert "Ready." not in out and "systemctl --user start chttr" in out
     assert setup_steps == []
+
+
+def test_run_turns_on_what_screen_context_needs(setup_steps, monkeypatch, capsys):
+    monkeypatch.setattr(install, "accessibility", lambda: ["toolkit-accessibility on (apps started from now on "
+                                                           "expose their text)"])
+    assert install.run() == 0
+    assert "  screen context: toolkit-accessibility on" in capsys.readouterr().out
+
+
+def test_run_leaves_accessibility_alone_when_screen_context_is_off(setup_steps, monkeypatch):
+    called = []
+    monkeypatch.setattr(install, "accessibility", lambda: called.append(1) or [])
+    cfg = C.Config(modes=C._default_modes())
+    cfg.polish.screen_context = "off"
+    monkeypatch.setattr(C, "load_config", lambda *a, **k: cfg)
+    assert install.run() == 0
+    assert called == []
 
 
 def test_offer_claude_only_at_a_terminal_with_no_backend(monkeypatch):

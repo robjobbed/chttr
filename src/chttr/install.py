@@ -381,6 +381,9 @@ def run(do_models: bool = True, do_service: bool = True, do_bindings: bool = Tru
         ok.append(keybindings(exe) is not False)
     if do_meet:
         ok.append(meet() is not False)
+    if cfg.polish.screen_context != "off":
+        for line in accessibility():         # so screen context can read Chromium, Electron and Qt apps
+            _say(f"screen context: {line}")
     offer_claude(cfg)
     if do_service:
         ok.append(service(exe))
