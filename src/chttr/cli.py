@@ -301,22 +301,40 @@ def cmd_send_notes(args: argparse.Namespace) -> int:
 
 
 def cmd_ask(args: argparse.Namespace) -> int:
-    """Answer a question from your meetings with Claude."""
-    from .ask import ask
+    """Answer a question from your meetings with Claude (or Ollama); without either, search them."""
+    from . import ask as A
     from .notes import available
+    from .polish import backend
 
     cfg = C.load_config()
-    if not available(cfg.polish):
-        print("chttr ask needs Claude: put an Anthropic API key in ~/.config/chttr/anthropic-api-key", file=sys.stderr)
-        return 1
     question = " ".join(args.question)
+
+    def local(hint: str = "") -> int:
+        lines = [A.citation(h, highlight=sys.stdout.isatty()) for h in A.search_hits(question)]
+        for line in lines:
+            print(line)
+        if not lines:
+            print("Nothing in your meetings or dictations matches that.", file=sys.stderr)
+        if hint:
+            print(hint, file=sys.stderr)
+        return 0 if lines else 1
+
+    if args.local or not available(cfg.polish):
+        return local("" if args.local else
+                     "Local search only; add a Claude key (chttr connect claude) or run Ollama for answers.")
 
     def show(name: str, kw: dict) -> None:
         if args.verbose:
             shown = ", ".join(f"{k}={v!r}" for k, v in kw.items() if v)
             print(f"  · {name}({shown})", file=sys.stderr, flush=True)
 
-    print(ask(question, cfg, on_search=show))
+    if backend(cfg.polish) == "ollama":
+        try:
+            print(A.ask_ollama(question, cfg, on_search=show))
+        except RuntimeError as exc:
+            return local(f"{exc}; these are the search results.")
+        return 0
+    print(A.ask(question, cfg, on_search=show))
     return 0
 
 
@@ -1046,6 +1064,7 @@ def build_parser() -> argparse.ArgumentParser:
     ak = sub.add_parser("ask", help='ask your meetings: chttr ask "what did Dana commit to last week?"')
     ak.add_argument("question", nargs="+")
     ak.add_argument("-v", "--verbose", action="store_true", help="show the searches Claude runs")
+    ak.add_argument("--local", action="store_true", help="only search, with citations; nothing leaves your machine")
     ak.set_defaults(func=cmd_ask)
 
     cn = sub.add_parser("connect", help="connect Claude (an API key), or Slack, Notion, HubSpot or a webhook for "

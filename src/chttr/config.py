@@ -239,6 +239,8 @@ style_rules = [
 ]
 # Your name in transcripts; "" = from your calendar, else "Me"
 me = ""
+# Your email address, so you are recognised in calendar invites when the feed is not named after it
+email = ""
 # File with secret iCal addresses, one per line (Google Calendar > Settings >
 # your calendar > "Secret address in iCal format"). Add one with: chttr meeting calendar URL
 calendar_file = "~/.config/chttr/calendar-urls"
@@ -434,6 +436,7 @@ class MeetingCfg:
         {"match": r"\binterview\b", "style": "interview"},
     ])
     me: str = ""
+    email: str = ""
     calendar_file: str = "~/.config/chttr/calendar-urls"
     max_hours: float = 4
 

@@ -1472,3 +1472,20 @@ def test_learn_from_edits_waits_while_screen_context_is_paused(daemon, monkeypat
     daemon.atspi_misses = 0
     _dictate(daemon)
     assert timers == [("second dictation",)]
+
+
+def test_meet_join_adopts_only_a_hand_started_meeting(daemon):
+    from types import SimpleNamespace
+
+    saved = []
+    app = SimpleNamespace(code="", title="Zoom call", source="app", save_meta=lambda **kw: saved.append(kw))
+    daemon.meeting = app
+    reply = daemon.handle('meet {"type":"joined","code":"abc-defg-hij","title":"Standup"}')
+    assert app.code == "" and app.title == "Zoom call" and not saved     # the Zoom recording stays a Zoom recording
+    assert reply["recording"] is False
+
+    manual = SimpleNamespace(code="", title="", source="manual", save_meta=lambda **kw: saved.append(kw))
+    daemon.meeting, daemon.call = manual, None
+    daemon.handle('meet {"type":"joined","code":"abc-defg-hij","title":"Standup"}')
+    assert manual.code == "abc-defg-hij" and manual.title == "Standup" and saved
+    daemon.meeting = None

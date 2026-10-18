@@ -183,8 +183,8 @@ echo 'sk-ant-...' > ~/.config/chttr/anthropic-api-key
 
 Fully offline: install [Ollama](https://ollama.com), `ollama pull llama3.2`, and
 leave `polish.backend = "auto"`; chttr uses Claude when a key is present, else
-Ollama when it is running, else no cleanup. Command mode needs one of the two;
-meeting summaries need Claude.
+Ollama when it is running, else no cleanup. Command mode needs one of the two.
+Meeting notes use the same choice; with neither, you get on-device notes.
 
 System tools used: `pw-record`/`pw-play` (PipeWire) and `notify-send` everywhere;
 `wl-copy`/`wl-paste` on Wayland or `xclip`/`xsel` on X11; a typing tool from the
@@ -307,7 +307,9 @@ chttr ask -v "when did we last talk about the Acme pricing?"   # -v shows the se
 Claude searches the index with tools (several phrasings, then reads the
 transcript around the hits) and answers with citations like
 `[Pricing review, 2026-10-01, 00:12:40]`. Only the snippets it asks for are
-sent, only when you ask.
+sent, only when you ask. With Ollama, the local model answers from the best
+search results; without either (or with `--local`), `chttr ask` is a ranked
+search that prints those citations.
 
 **In Claude Code or Claude Desktop**, the same tools are an MCP server:
 
@@ -416,8 +418,11 @@ sections = [
 ]
 ```
 
-Note styles need Claude (an API key); without one you get the transcript with
-speaker names.
+Note styles need Claude (an API key) or Ollama; long calls on Ollama are
+summarized in 15-minute parts first. With neither, you get on-device notes: a
+summary, the questions asked, numbers and dates, commitments and action items,
+found on your machine. Every meeting also shows each speaker's share of the
+talk.
 
 The extension lives in `src/chttr/extension/` and is loaded through Omarchy's
 `--load-extension` line in `~/.config/chromium-flags.conf`. Meet's page
@@ -494,7 +499,7 @@ flowchart LR
   subgraph meeting[After a call]
     R[mic.raw + them.raw] --> V[Silero VAD] --> PA[Parakeet] --> E[echo removal]
     E --> W[WeSpeaker embeddings + clustering] --> N[naming: captions, voices, calendar]
-    N --> O[notes: Claude, 18 styles] --> F[Markdown + library index]
+    N --> O[notes: Claude or Ollama, 18 styles, else on-device] --> F[Markdown + library index]
   end
   F --> A[chttr ask / mcp / ui]
   F --> I[Slack, Notion, HubSpot, webhook]
@@ -522,9 +527,10 @@ picker and stats. The state file at `$XDG_RUNTIME_DIR/chttr/state` is what
 The `meeting/` package is everything after the call: `recorder.py` captures
 the two channels, `pipeline.py` runs VAD, transcription, echo removal and
 clustering as its own niced process, `naming.py` decides who is who,
-`styles.py` and `render.py` write the notes and the Markdown, and `edit.py`
-handles renames. `diarize.py` holds the VAD, embeddings, clustering and voice
-memory, `gcal.py` the calendar, `notes.py` the Claude notes prompt, `models.py`
+`styles.py` and `render.py` write the notes and the Markdown, `lite.py` the
+on-device notes, and `edit.py` handles renames. `diarize.py` holds the VAD,
+embeddings, clustering and voice memory, `gcal.py` the calendar, `notes.py`
+the notes prompt (Claude or Ollama), `models.py`
 the pinned model downloads, and `native_host.py` plus `extension/` the Meet
 side. `BarWidget.qml` and `manifest.json` make the repo an Omarchy plugin.
 
@@ -552,7 +558,7 @@ when you turn it on:
 | Selected text in command mode | Same | You use command mode | Don't use command mode |
 | Names near the cursor | Same, as spellings to keep | `[polish] screen_context = "names"` or `"full"` (default `"local"`: used on this machine only) | `"local"` or `"off"` |
 | Up to 600 characters before the cursor | Same, as context | `[polish] screen_context = "full"` | Any other value |
-| Meeting transcript, invitees' names and emails, calendar title and description | Anthropic | You added an API key | `[meeting] summary = false` |
+| Meeting transcript, invitees' names and emails, calendar title and description | Anthropic, or your local Ollama | You added an API key / run Ollama | `[meeting] summary = false` |
 | Snippets of your meetings that Claude searches for | Anthropic | You run `chttr ask` (or an MCP client asks) | Don't use them |
 | A meeting's notes, action items and attendees' emails | Slack / Notion / HubSpot / your webhook | You click "Send to …" (or set `send = "always"`) | Don't connect them |
 | Calendar feed request | Google | You added a secret iCal address | Remove it from `calendar-urls` |

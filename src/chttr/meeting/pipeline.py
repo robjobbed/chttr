@@ -17,6 +17,7 @@ import numpy as np
 
 from .. import diarize as D
 from ..config import Config
+from . import lite
 from .analysis import SELF_CAPTION_NAMES, _intervals, _is_echo, _overlap
 from .naming import ROOM_OFFSET, assign_speakers, room_clusters
 from .render import render
@@ -119,7 +120,8 @@ def process(directory: Path, cfg: Config, summary: bool | None = None) -> Path:
     from .. import gcal
 
     urls = gcal.read_urls(cfg.meeting.calendar_file)
-    event = gcal.find_event(urls, meta.get("code", ""), datetime.fromtimestamp(started).astimezone()) if urls else None
+    event = gcal.find_event(urls, meta.get("code", ""), datetime.fromtimestamp(started).astimezone(),
+                            me_email=cfg.meeting.email) if urls else None
     names = sorted({part for full in [*(a.name for a in (event.attendees if event else [])),
                                       *(str(e.get("name", "")) for e in events if e.get("type") == "speaking")]
                     for part in full.split() if len(part) >= 3 and part.lower() not in SELF_CAPTION_NAMES})
@@ -160,13 +162,18 @@ def process(directory: Path, cfg: Config, summary: bool | None = None) -> Path:
 
     # ---- notes -------------------------------------------------------------
     want_summary = cfg.meeting.summary if summary is None else summary
-    if want_summary and all_utts and N.available(cfg.polish):
+    if want_summary and all_utts and not N.available(cfg.polish):
+        log.info("notes: on-device (no Claude key or Ollama)")
+        result["notes"] = lite.notes_lite(result)
+    elif want_summary and all_utts:
+        style_id = ""
         try:
+            style_id = choose_style(result, cfg)
             with D.timed("notes"):
-                write_notes(result, cfg, choose_style(result, cfg), meta.get("style_extra", ""))
+                write_notes(result, cfg, style_id, meta.get("style_extra", ""))
         except Exception as exc:  # noqa: BLE001 - the transcript is still worth saving
-            log.warning("notes failed: %s", exc)
-            result["notes"] = {"error": f"{type(exc).__name__}: {exc}"}
+            log.warning("notes failed: %s; writing on-device notes instead", exc)
+            result["notes"] = {**lite.notes_lite(result), "error": f"{type(exc).__name__}: {exc}", "wanted": style_id}
 
     # ---- remember voices we are sure of ------------------------------------
     for sp in speakers.values():

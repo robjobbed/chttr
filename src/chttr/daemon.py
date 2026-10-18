@@ -584,7 +584,7 @@ class Daemon:
         if kind == "joined" and code:
             fresh = not self.call or self.call["code"] != code
             self.call = {"code": code, "title": msg.get("title", ""), "seen": now}
-            if self.meeting and not self.meeting.code:
+            if self.meeting and self.meeting.source == "manual" and not self.meeting.code:
                 self.meeting.code, self.meeting.title = code, msg.get("title", "")    # started by hand, now we know the call
                 self.meeting.save_meta(status="recording")
             elif fresh and not self.meeting:

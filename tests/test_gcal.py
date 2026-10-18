@@ -39,3 +39,27 @@ def test_add_url_is_private_and_deduplicated(tmp_path):
     assert gcal.read_urls(str(path)) == ["https://a/basic.ics"]
     if os.name == "posix":
         assert path.stat().st_mode & 0o077 == 0      # anyone with the URL can read the calendar
+
+
+def test_you_are_recognised_by_meeting_email_in_a_feed_not_named_after_you(fixtures, monkeypatch):
+    data = (fixtures / "calendar.ics").read_bytes().replace(b"X-WR-CALNAME:rob@example.com", b"X-WR-CALNAME:Work")
+    monkeypatch.setattr(gcal, "_fetch", lambda url, max_age=gcal.CACHE_SECONDS: data)
+    when = datetime(2026, 10, 11, 21, 5, tzinfo=UTC)
+    e = gcal.find_event(["https://x/basic.ics"], "abc-defg-hij", when)
+    assert e is not None and not any(a.is_me for a in e.attendees)
+    e = gcal.find_event(["https://x/basic.ics"], "abc-defg-hij", when, me_email="Rob@Example.com")
+    assert e is not None and [a.email for a in e.attendees if a.is_me] == ["rob@example.com"]
+
+
+def test_the_feed_address_and_meeting_email_both_count_as_you(fixtures, monkeypatch):
+    # A personal feed named after one address, while [meeting] email is a work address:
+    # you are still yourself on the personal feed.
+    data = (fixtures / "calendar.ics").read_bytes().replace(
+        b"ATTENDEE;CN=Ali Khan;PARTSTAT=DECLINED:mailto:ali@example.com",
+        b"ATTENDEE;CN=Rob;PARTSTAT=ACCEPTED:mailto:rob@company.com")
+    monkeypatch.setattr(gcal, "_fetch", lambda url, max_age=gcal.CACHE_SECONDS: data)
+    when = datetime(2026, 10, 11, 21, 5, tzinfo=UTC)
+    e = gcal.find_event(["https://x/basic.ics"], "abc-defg-hij", when, me_email="rob@company.com")
+    assert e is not None
+    assert sorted(a.email for a in e.attendees if a.is_me) == ["rob@company.com", "rob@example.com"]
+    assert not any(a.is_me for a in e.attendees if a.email == "dana@example.com")
