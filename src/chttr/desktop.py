@@ -30,7 +30,10 @@ from pathlib import Path
 log = logging.getLogger("chttr.desktop")
 
 # Linux input event codes, for ydotool
-KEYCODES = {"ctrl": 29, "shift": 42, "alt": 56, "super": 125, "c": 46, "v": 47, "insert": 110}
+KEYCODES = {"ctrl": 29, "shift": 42, "alt": 56, "super": 125, "c": 46, "v": 47, "insert": 110,
+            "return": 28, "enter": 28, "backspace": 14}
+# Key names for wtype and xdotool (XKB keysyms are case-sensitive)
+KEYSYMS = {"return": "Return", "enter": "Return", "backspace": "BackSpace"}
 
 
 @dataclass(frozen=True)
@@ -205,20 +208,22 @@ def _ydotool_combo(combo: str) -> list[str]:
 
 
 def shortcut_command(desk: Desktop, combo: str) -> list[str] | None:
-    """The command that presses `combo` ("ctrl+v", "ctrl+shift+v") in the focused window."""
+    """The command that presses `combo` ("ctrl+v", "ctrl+shift+v", "shift+return",
+    "return") in the focused window."""
     mods, key = combo.lower().split("+")[:-1], combo.lower().split("+")[-1]
+    keysym = KEYSYMS.get(key, key)
     if desk.compositor == "hyprland" and have("hyprctl"):
         return ["hyprctl", "dispatch", "sendshortcut", f"{' '.join(m.upper() for m in mods)}, {key.upper()},"]
     if desk.wlroots_like and have("wtype"):
         cmd = ["wtype"]
         for m in mods:
             cmd += ["-M", m]
-        cmd += ["-k", key]
+        cmd += ["-k", keysym]
         for m in reversed(mods):
             cmd += ["-m", m]
         return cmd
     if desk.session == "x11" and have("xdotool"):
-        return ["xdotool", "key", "--clearmodifiers", combo.lower()]
+        return ["xdotool", "key", "--clearmodifiers", "+".join([*mods, keysym])]
     if have("ydotool"):
         return ["ydotool", "key", *_ydotool_combo(combo)]
     return None
@@ -256,19 +261,57 @@ def typer_command(desk: Desktop, text: str, preferred: str = "auto") -> list[str
     return None
 
 
-def type_text(text: str, desk: Desktop | None = None, preferred: str = "auto") -> str:
-    """Type `text`; returns the tool used. Raises if no tool can type here."""
+def typer_commands(desk: Desktop, text: str, preferred: str = "auto",
+                   newline: str = "enter") -> list[list[str]] | None:
+    """The commands that type `text`, run in order, or None if something can't be done.
+
+    newline = "enter": line breaks are typed as Enter, like any other character.
+    newline = "shift+enter": each line break is pressed as Shift+Enter instead, so a
+    chat app inserts a new line rather than sending the message. dotool types
+    everything from one script on stdin, so it is a single ["dotool"] either way.
+    """
+    first = typer_command(desk, text, preferred)
+    if first is None or first == ["dotool"] or newline == "enter" or "\n" not in text:
+        return None if first is None else [first]
+    shift_enter = shortcut_command(desk, "shift+return")
+    if shift_enter is None:
+        return None
+    cmds: list[list[str]] = []
+    for i, line in enumerate(text.split("\n")):
+        if i:
+            cmds.append(shift_enter)
+        if line:
+            cmd = typer_command(desk, line, preferred)
+            if cmd is None:
+                return None
+            cmds.append(cmd)
+    return cmds
+
+
+def _dotool_script(text: str, newline: str) -> str:
+    key = "key shift+enter" if newline == "shift+enter" else "key enter"
+    return "".join((f"{key}\n" if i else "") + (f"type {line}\n" if line else "")
+                   for i, line in enumerate(text.split("\n")))
+
+
+def type_text(text: str, desk: Desktop | None = None, preferred: str = "auto", newline: str = "enter") -> str:
+    """Type `text`; returns the tool used. Raises if no tool can type here.
+    `newline` is how line breaks are pressed: "enter" or "shift+enter"."""
     desk = desk or detect()
-    cmd = typer_command(desk, text, preferred)
-    if cmd is None:
+    typer = typer_command(desk, text, preferred)
+    if typer is None:
         raise FileNotFoundError(f"no typing tool for {desk.describe()} (install "
                                 f"{'xdotool' if desk.session == 'x11' else 'wtype or ydotool'})")
-    if cmd == ["dotool"]:
-        subprocess.run(cmd, input="".join(f"type {line}\n" for line in text.split("\n")).encode(),
+    if typer == ["dotool"]:
+        subprocess.run(typer, input=_dotool_script(text, newline).encode(),
                        check=True, capture_output=True, timeout=60)
-    else:
+        return "dotool"
+    cmds = typer_commands(desk, text, preferred, newline)
+    if cmds is None:
+        raise FileNotFoundError(f"no tool to press Shift+Enter on {desk.describe()} (install ydotool)")
+    for cmd in cmds:
         subprocess.run(cmd, check=True, capture_output=True, timeout=60)
-    return cmd[0]
+    return typer[0]
 
 
 # ---- menus, prompts, terminals ----------------------------------------------------
