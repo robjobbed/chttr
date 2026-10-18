@@ -104,3 +104,65 @@ def test_ask_runs_the_tool_runner(lib, monkeypatch):  # noqa: F811
     assert seen["model"] == "claude-opus-5-5" and seen["fallbacks"] == "default"
     assert "Pricing review" in str(seen["tool_result"])
     assert calls == ["search_meetings"]
+
+
+def run_ask(argv: list[str]) -> int:
+    from chttr import cli
+
+    args = cli.build_parser().parse_args(["ask", *argv])
+    return args.func(args)
+
+
+def test_ask_without_a_key_is_a_local_search_with_citations(lib, monkeypatch, capsys):  # noqa: F811
+    from chttr import notes
+
+    monkeypatch.setattr(notes, "available", lambda cfg: False)
+    assert run_ask(["what", "was", "said", "about", "the", "contract?"]) == 0
+    out, err = capsys.readouterr()
+    lines = out.splitlines()
+    assert "[Pricing review, 2026-10-01, 00:00:40] Ali: I will send the revised contract by Friday." in lines
+    assert "[dictation, 2026-10-09] ping the vendor about the contract" in lines
+    assert "**" not in out                                       # no highlight markers outside a terminal
+    assert "Local search only; add a Claude key (chttr connect claude) or run Ollama for answers." in err
+
+    assert run_ask(["unicorns"]) == 1
+    assert "Nothing in your meetings or dictations matches that." in capsys.readouterr().err
+
+
+def test_ask_local_never_calls_a_model(lib, monkeypatch, capsys):  # noqa: F811
+    from chttr import notes
+
+    monkeypatch.setattr(notes, "available", lambda cfg: True)
+    monkeypatch.setattr(A, "ask", lambda *a, **k: (_ for _ in ()).throw(AssertionError("asked Claude")))
+    assert run_ask(["--local", "budget"]) == 0
+    out, err = capsys.readouterr()
+    assert "[Launch sync, 2026-10-08, 00:00:20] Rob: Then the budget needs a second look." in out
+    assert err == ""
+
+
+def test_ask_with_ollama_answers_from_the_search_hits(lib, monkeypatch, capsys):  # noqa: F811
+    from chttr import notes, polish
+
+    monkeypatch.setattr(notes, "available", lambda cfg: True)
+    monkeypatch.setattr(polish, "backend", lambda cfg: "ollama")
+    sent = []
+
+    def urlopen(req, timeout=None):
+        sent.append(json.loads(req.data))
+        return io.BytesIO(json.dumps({"message": {"content": "By Friday [Pricing review, 2026-10-01, 00:00:40]."}})
+                          .encode())
+
+    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+    assert run_ask(["when", "will", "Ali", "send", "the", "contract?"]) == 0
+    assert capsys.readouterr().out.strip() == "By Friday [Pricing review, 2026-10-01, 00:00:40]."
+    user = sent[0]["messages"][1]["content"]
+    assert "[Pricing review, 2026-10-01, 00:00:40] Ali: I will send the revised contract by Friday." in user
+    assert user.endswith("<question>when will Ali send the contract?</question>")
+
+    def down(req, timeout=None):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr("urllib.request.urlopen", down)
+    assert run_ask(["contract"]) == 0                           # falls back to the search results
+    out, err = capsys.readouterr()
+    assert "Ali: I will send the revised contract" in out and "did not answer" in err
