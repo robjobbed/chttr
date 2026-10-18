@@ -644,6 +644,42 @@ def cmd_meeting_calendar(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_brief(args: argparse.Namespace) -> int:
+    """What you agreed last time with the people in your next (or a named) meeting."""
+    from datetime import UTC, datetime, timedelta
+
+    from . import brief as B
+    from . import gcal
+
+    cfg = C.load_config()
+    urls = gcal.read_urls(cfg.meeting.calendar_file)
+    if not urls:
+        print("no calendar yet (chttr meeting calendar URL)", file=sys.stderr)
+        return 1
+    query = " ".join(args.title).strip()
+    try:
+        events = gcal.upcoming(urls, hours=24 * 7 if query else 24)
+    except Exception as exc:  # noqa: BLE001
+        print(f"can't read your calendar: {exc}", file=sys.stderr)
+        return 1
+    if query:
+        event = next((e for e in events if query.lower() in e.title.lower()), None)
+        missing = f"no meeting matching {query!r} in the next 7 days"
+    else:
+        soon = datetime.now(UTC) - timedelta(minutes=10)      # one that just started still counts
+        event = next((e for e in events if e.start >= soon and B.worth_a_brief(e)
+                      and B.others(e, B.me_names(cfg.meeting.me, e))), None)
+        missing = "no meetings with other people in the next 24 hours"
+    if event is None:
+        print(missing, file=sys.stderr)
+        return 1
+    brief = B.brief_for(event, B.past_meetings(), B.me_names(cfg.meeting.me, event))
+    title, body = B.render(brief, cli=True)
+    print(title)
+    print(body)
+    return 0
+
+
 def cmd_meeting_voices(args: argparse.Namespace) -> int:
     from .diarize import load_voices, save_voices
 
@@ -916,6 +952,13 @@ def build_parser() -> argparse.ArgumentParser:
                     help="only this destination (repeatable)")
     sd.add_argument("-y", "--yes", action="store_true", help="don't ask for confirmation")
     sd.set_defaults(func=cmd_send_notes)
+
+    br = sub.add_parser("brief", help="what you agreed last time with the people in your next meeting")
+    which = br.add_mutually_exclusive_group()
+    which.add_argument("--next", action="store_true", help="the next meeting with other people (the default)")
+    which.add_argument("title", nargs="*", default=[], metavar="MEETING_TITLE",
+                       help="an upcoming meeting whose title contains this")
+    br.set_defaults(func=cmd_brief)
 
     mc = sub.add_parser("mcp", help="serve your meetings to Claude Code / Claude Desktop (MCP, stdio)")
     mc.set_defaults(func=cmd_mcp)
