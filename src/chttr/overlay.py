@@ -1,51 +1,104 @@
 #!/usr/bin/python3
-"""Floating mic level overlay (GTK4 + wlr-layer-shell).
+"""Floating dictation pill (GTK4 + wlr-layer-shell).
 
-Runs under the *system* python (needs PyGObject and gtk4-layer-shell). Reads
-lines on stdin: "<rms 0..1> <peak_db>" for levels, "caption <text>" for the live
-transcript. Exits when stdin closes.
+Runs under the *system* python (needs PyGObject and gtk4-layer-shell) and stays
+resident: the daemon starts it hidden when it starts and drives it over stdin,
+one line per message (see overlay_proto.py). The pill shows the whole dictation:
+the waveform while you speak, a shimmer while it's recognized, the first words
+with a check once they're typed, or "nothing heard" / "error". Exits when stdin
+closes.
 
-    overlay.py [--label TEXT] [--captions]
+    overlay.py [--label TEXT] [--captions] [--palette JSON]
+
+To try it by hand: printf 'show\\n0.05 -20\\nstate transcribing\\n' | overlay.py
 """
 
 import argparse
+import importlib.util
+import json
 import math
 import os
 import signal
 import sys
+import time
+from collections import deque
+
+
+def _load_lines():
+    """overlay_lines.py from this directory: the protocol parser, shared with the
+    daemon. Loaded by path so chttr's other modules never shadow anything here."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "overlay_lines.py")
+    spec = importlib.util.spec_from_file_location("chttr_overlay_lines", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+lines = _load_lines()
 
 import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gtk4LayerShell", "1.0")
-from gi.repository import GLib, Gtk
+import cairo
+from gi.repository import Gio, GLib, Gtk
 from gi.repository import Gtk4LayerShell as LayerShell
 
 BARS = 28
 W, H = 320, 72
 W_CAP, H_CAP = 460, 112     # with live captions
-BG = (0.08, 0.08, 0.10, 0.92)
-ACCENT = (0.69, 0.60, 0.93)        # lavender, matches the user's theme
-ACCENT_HOT = (0.98, 0.55, 0.55)    # near clipping
-DIM = (0.45, 0.45, 0.50)
+TICK_MS = 33
+DECAY = 0.82                # per tick: how fast a bar falls back
+GAIN_WINDOW = 3.0           # seconds of levels the display gain follows
+GAIN_MIN_DB = -45.0         # a mic quieter than this isn't amplified further: silence stays flat
+DONE_HOLD, FADE = 0.9, 0.2  # "done": seconds shown, then seconds fading out
+NOTICE_HOLD = 1.5           # "nothing heard" / "error"
+SHIMMER_PERIOD = 1.1        # seconds per sweep across the bars
+LISTENING = ("listening", "command", "handsfree")
+# Used when the daemon sends no theme: lavender on near-black.
+DEFAULT_PALETTE = {"bg": "#141419", "fg": "#ebebf2", "accent": "#b099ed", "hot": "#f24d4d",
+                   "dim": "#737380", "dark": True}
 
 
 class Overlay:
-    def __init__(self, label: str = "", captions: bool = False) -> None:
-        self.levels = [0.0] * BARS      # recent rms history, 0..1 (log-scaled)
-        self.peak_db = -90.0
+    def __init__(self, label: str = "", captions: bool = False, palette: dict | None = None) -> None:
         self.label = label
         self.captions = captions
-        self.caption = ""
         self.w, self.h = (W_CAP, H_CAP) if captions else (W, H)
+        self.set_palette(palette or {})
+        self.reset()
+        self.mode, self.mode_t0 = "listening", time.monotonic()
+        self.visible = self.ticking = False
+        self.buf = b""
         self.phase = 0.0
-        self.closing = False
 
-        self.app = Gtk.Application(application_id="dev.rab.chttr.overlay")
+        self.app = Gtk.Application(application_id="dev.rab.chttr.overlay", flags=Gio.ApplicationFlags.NON_UNIQUE)
         self.app.connect("activate", self.on_activate)
 
+    def reset(self) -> None:
+        self.levels = [-90.0] * BARS    # recent rms history in dB, newest last
+        self.hot = [False] * BARS       # that reading was close to clipping
+        self.shown = [0.0] * BARS       # what each bar shows, 0..1, smoothed
+        self.recent: deque[tuple[float, float]] = deque()   # (time, dB) for the display gain
+        self.peak_db = -90.0
+        self.caption = self.text = ""
+        self.alpha = 1.0
+
+    def set_palette(self, palette: dict) -> None:
+        merged = {**DEFAULT_PALETTE, **palette}
+        colours = {}
+        for key in ("bg", "fg", "accent", "hot", "dim"):
+            try:
+                colours[key] = lines.hex_to_rgb(str(merged[key]))
+            except ValueError:
+                colours[key] = lines.hex_to_rgb(DEFAULT_PALETTE[key])
+        self.bg, self.fg, self.accent = colours["bg"], colours["fg"], colours["accent"]
+        self.hot_c, self.dim = colours["hot"], colours["dim"]
+        self.dark = bool(merged.get("dark", True))
+
     def on_activate(self, app: Gtk.Application) -> None:
-        win = Gtk.ApplicationWindow(application=app)
+        app.hold()                      # stay alive while hidden
+        win = self.win = Gtk.ApplicationWindow(application=app)
         win.set_default_size(self.w, self.h)
         win.set_decorated(False)
         LayerShell.init_for_window(win)
@@ -65,40 +118,134 @@ class Overlay:
         css = Gtk.CssProvider()
         css.load_from_string("window { background: transparent; }")
         Gtk.StyleContext.add_provider_for_display(win.get_display(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
-        win.present()
+        # Not presented: the window is mapped on "show" and unmapped on "hide".
 
-        GLib.io_add_watch(sys.stdin, GLib.PRIORITY_DEFAULT, GLib.IO_IN | GLib.IO_HUP, self.on_stdin)
-        GLib.timeout_add(33, self.tick)
+        self.fd = sys.stdin.fileno()
+        GLib.io_add_watch(self.fd, GLib.PRIORITY_DEFAULT, GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR, self.on_stdin)
 
     # ---- input ----------------------------------------------------------
-    def on_stdin(self, source, condition) -> bool:
-        line = sys.stdin.readline()
-        if not line:  # EOF: the daemon stopped recording
+    def on_stdin(self, *_args) -> bool:
+        # Raw reads, not readline(): a buffered reader would sit on the last lines of
+        # a burst ("text ...", "state done") until the next write arrived.
+        try:
+            chunk = os.read(self.fd, 65536)
+        except BlockingIOError:
+            return True
+        except OSError:
+            chunk = b""
+        if not chunk:                   # EOF: the daemon is gone
             self.app.quit()
             return False
-        if line.startswith("caption "):
-            self.caption = line[8:].strip()
-            return True
-        try:
-            rms, peak_db = line.split()
-            rms, peak_db = float(rms), float(peak_db)
-        except ValueError:
-            return True
-        # Log scale so quiet speech is visible: -60 dB -> 0, 0 dB -> 1.
-        db = 20 * math.log10(max(rms, 1e-6))
-        v = min(1.0, max(0.0, (db + 60) / 60))
-        self.levels.append(v)
-        del self.levels[:-BARS]
-        self.peak_db = peak_db
+        *complete, self.buf = (self.buf + chunk).split(b"\n")
+        for raw in complete:
+            self.handle(raw.decode(errors="replace"))
         return True
 
+    def handle(self, line: str) -> None:
+        msg = lines.parse(line)
+        if msg is None:
+            return
+        if msg[0] == "level":
+            self.on_level(msg[1], msg[2])
+            return
+        cmd, arg = msg
+        if cmd == "show":
+            self.show(arg)
+        elif cmd == "hide":
+            self.hide()
+        elif cmd == "state" and arg in lines.STATES:
+            self.mode, self.mode_t0, self.alpha = arg, time.monotonic(), 1.0
+            if not self.visible:
+                self.map()
+        elif cmd == "text":
+            self.text = arg
+        elif cmd == "caption":
+            self.caption = arg
+        elif cmd == "palette":
+            try:
+                palette = json.loads(arg) if arg else {}
+            except ValueError:
+                return
+            if isinstance(palette, dict):
+                self.set_palette(palette)
+                self.queue_draw()
+
+    def on_level(self, rms: float, peak_db: float) -> None:
+        if self.mode not in LISTENING:  # bars stay frozen once you let go
+            return
+        db = 20 * math.log10(min(max(rms, 1e-6), 1.0))
+        self.recent.append((time.monotonic(), db))
+        self.levels.append(db)
+        self.hot.append(peak_db > -1.0)
+        self.shown.append(self.gain(db, *self.gain_range()))
+        del self.levels[:-BARS], self.hot[:-BARS], self.shown[:-BARS]
+        self.peak_db = peak_db
+
+    def gain_range(self) -> tuple[float, float]:
+        """(floor, top) in dB over the last few seconds. The top never drops below
+        GAIN_MIN_DB, so a quiet mic still fills the bars while plain silence stays flat."""
+        dbs = [d for _, d in self.recent] or [-90.0]
+        return min(max(min(dbs), -70.0), -55.0), max(max(dbs), GAIN_MIN_DB) + 1.5
+
+    @staticmethod
+    def gain(db: float, floor: float, top: float) -> float:
+        """A reading as a bar height, 0..1."""
+        return min(1.0, max(0.0, (db - floor) / (top - floor)))
+
+    def show(self, label: str) -> None:
+        self.label = label
+        self.reset()
+        self.mode, self.mode_t0 = "listening", time.monotonic()
+        self.map()
+
+    def map(self) -> None:
+        self.visible = True
+        self.win.present()
+        if not self.ticking:
+            self.ticking = True
+            GLib.timeout_add(TICK_MS, self.tick)
+
+    def hide(self) -> None:
+        self.visible = False
+        self.win.set_visible(False)
+
+    def queue_draw(self) -> None:
+        if self.visible:
+            self.area.queue_draw()
+
     def tick(self) -> bool:
+        if not self.visible:
+            self.ticking = False
+            return False
+        now = time.monotonic()
         self.phase += 0.15
+        since = now - self.mode_t0
+        if self.mode in LISTENING:
+            while self.recent and now - self.recent[0][0] > GAIN_WINDOW:
+                self.recent.popleft()
+            floor, top = self.gain_range()
+            self.shown = [max(self.gain(db, floor, top), s * DECAY)
+                          for db, s in zip(self.levels, self.shown, strict=True)]
+        elif self.mode == "transcribing":
+            # The waveform you just spoke settles into a low ridge for the shimmer to run along.
+            self.shown = [s + (0.22 - s) * 0.08 for s in self.shown]
+        elif self.mode == "done":
+            if since >= DONE_HOLD + FADE:
+                self.hide()
+                return self.tick()
+            self.alpha = 1.0 if since < DONE_HOLD else 1.0 - (since - DONE_HOLD) / FADE
+        elif self.mode in ("error", "nospeech"):
+            if since >= NOTICE_HOLD:
+                self.hide()
+                return self.tick()
+            self.alpha = 1.0 if since < NOTICE_HOLD - FADE else (NOTICE_HOLD - since) / FADE
         self.area.queue_draw()
         return True
 
     # ---- drawing --------------------------------------------------------
     def draw(self, area, cr, width, height) -> None:
+        cr.push_group()
+        notice = self.mode in ("error", "nospeech")
         r = 18
         cr.new_sub_path()
         cr.arc(width - r, r, r, -math.pi / 2, 0)
@@ -106,53 +253,118 @@ class Overlay:
         cr.arc(r, height - r, r, math.pi / 2, math.pi)
         cr.arc(r, r, r, math.pi, 3 * math.pi / 2)
         cr.close_path()
-        cr.set_source_rgba(*BG)
+        if notice:
+            cr.set_source_rgba(*self.hot_c, 0.96)
+        else:
+            cr.set_source_rgba(*self.bg, 0.92 if self.dark else 0.96)
         cr.fill()
 
         band = H                    # the meter row; captions go below it
         mid = band / 2
-
-        # Pulsing dot = recording (lavender in command mode)
-        pulse = 0.65 + 0.35 * math.sin(self.phase)
-        if self.label == "command":
-            cr.set_source_rgba(*ACCENT, pulse)
+        if notice:
+            self.draw_notice(cr, width, height)
+        elif self.mode == "done":
+            self.draw_done(cr, width, mid)
         else:
-            cr.set_source_rgba(0.95, 0.3, 0.3, pulse)
+            self.draw_meter(cr, width, band, mid)
+            if self.captions:
+                self.draw_caption(cr, width, band, height)
+        cr.pop_group_to_source()
+        cr.paint_with_alpha(max(0.0, min(1.0, self.alpha)))
+
+    def draw_meter(self, cr, width, band, mid) -> None:
+        thinking = self.mode == "transcribing"
+        # Pulsing dot = recording: red when dictating, the accent in command and hands-free mode.
+        # While transcribing it breathes slowly in the accent.
+        if thinking:
+            cr.set_source_rgba(*self.accent, 0.55 + 0.25 * math.sin(self.phase * 0.5))
+        else:
+            dot = self.hot_c if self.mode == "listening" else self.accent
+            cr.set_source_rgba(*dot, 0.65 + 0.35 * math.sin(self.phase))
         cr.arc(24, mid, 6, 0, 2 * math.pi)
         cr.fill()
 
         # Mode label above the dot
-        if self.label:
-            cr.set_source_rgb(*DIM)
+        label = "transcribing…" if thinking else self.label
+        if label:
+            cr.set_source_rgb(*self.dim)
             cr.select_font_face("sans-serif")
             cr.set_font_size(9)
             cr.move_to(12, 15)
-            cr.show_text(self.label)
+            cr.show_text(label)
 
-        # Waveform bars (newest on the right)
-        x0, x1 = 44, width - 70
+        # Waveform bars (newest on the right); while transcribing, a shimmer sweeps left to right.
+        x0, x1 = 44, width - (24 if thinking else 70)
         gap = (x1 - x0) / BARS
         bw = gap * 0.6
-        for i, v in enumerate(self.levels):
-            h = max(3.0, v * (band - 22))
-            hot = v > 0.95
-            c = ACCENT_HOT if hot else ACCENT
+        sweep = ((time.monotonic() - self.mode_t0) % SHIMMER_PERIOD) / SHIMMER_PERIOD * (BARS + 8) - 4
+        for i, v in enumerate(self.shown):
+            c = self.hot_c if self.hot[i] and not thinking else self.accent
             alpha = 0.35 + 0.65 * (i + 1) / BARS
+            if thinking:
+                glow = math.exp(-(((i - sweep) / 2.5) ** 2))
+                v = v + 0.35 * glow
+                c = tuple(a + (b - a) * glow * 0.6 for a, b in zip(self.accent, self.fg, strict=True))
+                alpha = 0.45 + 0.55 * glow
+            h = max(3.0, min(1.0, v) * (band - 22))
             cr.set_source_rgba(c[0], c[1], c[2], alpha)
             x = x0 + i * gap + (gap - bw) / 2
             cr.rectangle(x, mid - h / 2, bw, h)
             cr.fill()
 
         # Peak dB readout
-        cr.set_source_rgb(*DIM)
-        cr.select_font_face("monospace")
-        cr.set_font_size(12)
-        label = f"{self.peak_db:5.0f} dB" if self.peak_db > -89 else "  -- dB"
-        cr.move_to(width - 66, mid + 4)
-        cr.show_text(label)
+        if not thinking:
+            cr.set_source_rgb(*self.dim)
+            cr.select_font_face("monospace")
+            cr.set_font_size(12)
+            text = f"{self.peak_db:5.0f} dB" if self.peak_db > -89 else "  -- dB"
+            cr.move_to(width - 66, mid + 4)
+            cr.show_text(text)
 
-        if self.captions:
-            self.draw_caption(cr, width, band, height)
+    def draw_done(self, cr, width, mid) -> None:
+        """A check and the first words that were typed."""
+        cr.set_source_rgb(*self.accent)
+        cr.set_line_width(2.6)
+        cr.set_line_cap(cairo.LINE_CAP_ROUND)
+        cr.set_line_join(cairo.LINE_JOIN_ROUND)
+        cr.move_to(17, mid + 0.5)
+        cr.line_to(22, mid + 5.5)
+        cr.line_to(31, mid - 5.5)
+        cr.stroke()
+        cr.set_source_rgb(*self.fg)
+        cr.select_font_face("sans-serif")
+        cr.set_font_size(14)
+        text = self.fit(cr, " ".join(self.text.split()), width - 44 - 20) or "typed"
+        cr.move_to(44, mid + 5)
+        cr.show_text(text)
+
+    def draw_notice(self, cr, width, height) -> None:
+        """'nothing heard' or 'error', centred on the red pill."""
+        r, g, b = self.hot_c
+        light = 0.2126 * r + 0.7152 * g + 0.0722 * b > 0.6
+        cr.set_source_rgb(*((0.1, 0.1, 0.12) if light else (1.0, 1.0, 1.0)))
+        cr.select_font_face("sans-serif")
+        cr.set_font_size(14)
+        text = "nothing heard" if self.mode == "nospeech" else "error"
+        ext = cr.text_extents(text)
+        mid = (H if not self.captions else height) / 2
+        cr.move_to((width - ext.x_advance) / 2, mid + ext.height / 2 - 1)
+        cr.show_text(text)
+
+    @staticmethod
+    def fit(cr, text: str, maxw: float) -> str:
+        """`text`, cut at a word with an ellipsis if it doesn't fit in `maxw`."""
+        if cr.text_extents(text).x_advance <= maxw:
+            return text
+        words = text.split()
+        while words:
+            words.pop()
+            trial = " ".join(words) + "…"
+            if cr.text_extents(trial).x_advance <= maxw:
+                return trial
+        while text and cr.text_extents(text + "…").x_advance > maxw:
+            text = text[:-1]
+        return text + "…" if text else ""
 
     def draw_caption(self, cr, width, top, height) -> None:
         """The tail of the live transcript, two lines at most, newest words kept."""
@@ -160,28 +372,28 @@ class Overlay:
         cr.set_font_size(13)
         maxw = width - 36
         words = self.caption.split() if self.caption else []
-        lines: list[str] = []
+        rows: list[str] = []
         line = ""
         for word in reversed(words):           # fill from the end
             trial = f"{word} {line}".strip()
             if cr.text_extents(trial).x_advance > maxw and line:
-                lines.insert(0, line)
-                if len(lines) == 2:
+                rows.insert(0, line)
+                if len(rows) == 2:
                     break
                 line = word
             else:
                 line = trial
         else:
             if line:
-                lines.insert(0, line)
-        lines = lines[-2:]
-        if not lines:
-            cr.set_source_rgb(*DIM)
-            lines = ["listening…"]
+                rows.insert(0, line)
+        rows = rows[-2:]
+        if not rows:
+            cr.set_source_rgb(*self.dim)
+            rows = ["transcribing…" if self.mode == "transcribing" else "listening…"]
         else:
-            cr.set_source_rgb(0.92, 0.92, 0.95)
+            cr.set_source_rgb(*self.fg)
         y = top + 6
-        for text in lines:
+        for text in rows:
             cr.move_to(18, y)
             cr.show_text(text)
             y += 18
@@ -196,5 +408,10 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--label", default="")
     ap.add_argument("--captions", action="store_true")
+    ap.add_argument("--palette", default="", help="theme colours as JSON (see overlay_proto.py)")
     a = ap.parse_args()
-    Overlay(a.label, a.captions).run()
+    try:
+        theme = json.loads(a.palette) if a.palette else {}
+    except ValueError:
+        theme = {}
+    Overlay(a.label, a.captions, theme if isinstance(theme, dict) else {}).run()
