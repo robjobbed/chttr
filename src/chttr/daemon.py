@@ -22,6 +22,7 @@ import numpy as np
 from . import config as C
 from . import context as CX
 from . import devmode
+from . import overlay_proto as OP
 from . import polish as P
 from .config import Config, Mode
 from .dictionary import Dictionary
@@ -53,6 +54,7 @@ CAPTION_WINDOW = 8.0                    # only the last this-many seconds are re
 DOUBLE_TAP = 0.45                       # a second press this soon after a short tap: hands-free
 ATSPI_GIVE_UP = 5                       # unreadable fields in a row before screen context stops
 TAP = 0.35                              # recordings shorter than this are taps, not dictations
+OVERLAY_RESPAWN = 30.0                  # seconds between attempts to restart an overlay that died
 CALL_TIMEOUT = 90                       # no word from the Meet tab for this long: the call is over
 
 
@@ -104,6 +106,7 @@ class Daemon:
         self._write_state(IDLE)
         self._tighten_permissions()
         self._prune_audio()
+        self._overlay_warm()
 
     def _tighten_permissions(self) -> None:
         """Files written by versions before 0.3 were created with the default umask."""
@@ -132,34 +135,138 @@ class Daemon:
         os.replace(tmp, C.STATE_FILE)
 
     # ---- overlay -----------------------------------------------------------
-    def _overlay_open(self, label: str) -> None:
-        if not self.cfg.feedback.overlay or self.overlay is not None:
-            return
+    # The overlay stays resident: started hidden with the daemon (or at the first key
+    # press), shown on press, moved through transcribing -> done, hidden in between.
+    overlay_spawned_at = 0.0            # monotonic time of the last spawn
+    overlay_losses = 0                  # overlay processes that died in a row
+    overlay_unsupported = ""            # the desktop, when it has no layer-shell
+    overlay_captions = False            # the running overlay was started with --captions
+    overlay_palette: dict | None = None  # the theme it was last given
+    overlay_mode = ""                   # the last state sent; "hidden" after a hide
+
+    def _overlay_warm(self) -> None:
+        """Start the overlay hidden, so the first key press doesn't wait for GTK to load."""
+        try:
+            if self.cfg.feedback.overlay and self.overlay is None:
+                self._overlay_spawn()
+        except Exception:                   # the overlay is cosmetic; never stop the daemon over it
+            log.debug("could not start the overlay", exc_info=True)
+
+    def _overlay_spawn(self) -> bool:
+        if self.overlay_unsupported:
+            return False
+        if self.overlay_spawned_at and time.monotonic() - self.overlay_spawned_at < OVERLAY_RESPAWN:
+            return False                    # it died moments ago; notifications until it can be retried
         desk = current_desktop()
         if desk.compositor == "gnome" or not desk.wayland:
             # GNOME (Mutter) and X11 have no layer-shell: a regular window would steal focus.
+            self.overlay_unsupported = desk.describe()
             self._overlay_fail(f"no layer-shell on {desk.describe()}; notifications only")
-            return
+            return False
         env = dict(os.environ)
         for lib in LAYER_SHELL_LIBS:
             if lib.exists():
                 env["LD_PRELOAD"] = str(lib)
                 break
-        cmd = [SYSTEM_PYTHON, "-I", str(OVERLAY_SCRIPT), "--label", label]
-        if self.cfg.feedback.live_captions:
+        palette, captions = OP.omarchy_palette(), self.cfg.feedback.live_captions
+        cmd = [SYSTEM_PYTHON, "-I", str(OVERLAY_SCRIPT)]
+        if palette:
+            cmd += ["--palette", json.dumps(palette)]
+        if captions:
             cmd.append("--captions")
+        self.overlay_spawned_at = time.monotonic()
         try:
-            self.overlay = subprocess.Popen(
-                cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=env,
-            )
+            # stderr to a file: a resident process could fill a pipe nobody reads.
+            with open(self.runtime / "overlay.log", "wb") as err:
+                self.overlay = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                                stderr=err, env=env)
         except OSError as exc:
             self._overlay_fail(str(exc))
+            return False
+        self.overlay_palette, self.overlay_captions, self.overlay_mode = palette, captions, "hidden"
+        return True
+
+    def _overlay_open(self, label: str) -> None:
+        """Show the pill for a new recording ("", "command" or "hands-free" above the dot)."""
+        if not self.cfg.feedback.overlay:
+            self._overlay_quit()            # switched off in config.toml since it started
+            return
+        proc = self.overlay
+        if proc is not None and proc.poll() is not None:
+            self._overlay_lost(proc)
+        elif proc is not None and self.overlay_captions != self.cfg.feedback.live_captions:
+            self._overlay_quit()            # live captions need a taller window
+            self.overlay_spawned_at = 0.0
+        elif proc is not None and time.monotonic() - self.overlay_spawned_at > 10:
+            self.overlay_losses = 0         # this one has stayed up
+        if self.overlay is None and not self._overlay_spawn():
+            return
+        palette = OP.omarchy_palette()      # a few hundred bytes; follows theme switches
+        if palette != self.overlay_palette:
+            self.overlay_palette = palette
+            self._overlay_send(OP.format("palette", json.dumps(palette or {})))
+        self._overlay_send(OP.format("show", label))
+        self._overlay_state({COMMAND: "command", HANDSFREE: "handsfree"}.get(label, "listening"))
+
+    def _overlay_state(self, state: str) -> None:
+        """Move the pill on: listening, transcribing, then done / nospeech / error, or
+        "hide". A dictation that finishes while a newer one is recording, or while
+        another is still being transcribed, leaves the pill to that one."""
+        if state in ("done", "nospeech", "error", "hide") and self._overlay_busy():
+            return
+        self._overlay_send(OP.format("hide") if state == "hide" else OP.format("state", state))
+        self.overlay_mode = "hidden" if state == "hide" else state
+
+    def _overlay_busy(self) -> bool:
+        """Is the pill showing a newer recording, or another dictation still in progress?"""
+        return self.recorder.active or self.starting or self.jobs > 1
+
+    def _overlay_text(self, text: str) -> None:
+        """The words the "done" pill shows next to its check."""
+        if not self._overlay_busy():
+            self._overlay_send(OP.format("text", text[:60]))
+
+    def _overlay_settle(self) -> None:
+        """A dictation that ended without saying how (command mode with no model, say):
+        don't leave the pill shimmering."""
+        if self.overlay_mode == "transcribing":
+            self._overlay_state("hide")
 
     def _overlay_fail(self, detail: str) -> None:
-        self.overlay = None
+        """The overlay can't run: say so once (in the log, and on desktops that could show it)."""
         if not self.overlay_warned:
             self.overlay_warned = True
             log.warning("level overlay unavailable: %s", detail)
+            if not self.overlay_unsupported:
+                self.feedback.notify("Waveform overlay off", f"{detail[:160]}. See: chttr doctor",
+                                     urgency="normal", timeout_ms=8000)
+
+    def _overlay_lost(self, proc: subprocess.Popen) -> None:
+        """The overlay exited or stopped reading. It's started again at the next press
+        (at most every OVERLAY_RESPAWN seconds); dying twice in a row is reported."""
+        if self.overlay is not proc:
+            return                          # already dealt with
+        self.overlay = None
+        try:
+            proc.kill()
+            proc.wait(timeout=1)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        detail = self._overlay_error()
+        self.overlay_losses += 1
+        if self.overlay_losses >= 2:
+            self._overlay_fail(detail)
+        else:
+            log.info("overlay exited (%s); starting it again at the next key press", detail)
+
+    def _overlay_error(self) -> str:
+        """The last line the overlay wrote to stderr."""
+        try:
+            text = (self.runtime / "overlay.log").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            text = ""
+        rows = [r.strip() for r in text.splitlines() if r.strip()]
+        return rows[-1] if rows else "overlay exited"
 
     def _overlay_send(self, line: str) -> None:
         proc = self.overlay
@@ -170,8 +277,7 @@ class Daemon:
                 proc.stdin.write((line.replace("\n", " ") + "\n").encode())
                 proc.stdin.flush()
         except (BrokenPipeError, OSError, ValueError):
-            err = (proc.stderr.read() if proc.stderr else b"").decode(errors="replace").strip()
-            self._overlay_fail(err.splitlines()[-1] if err else "overlay exited")
+            self._overlay_lost(proc)
 
     def _on_level(self, rms: float, peak_db: float) -> None:
         rms_db = 20 * np.log10(max(rms, 1e-6))
@@ -181,6 +287,13 @@ class Daemon:
         self._overlay_send(f"{rms:.5f} {peak_db:.1f}")
 
     def _overlay_close(self) -> None:
+        """Hide the pill; the process stays for the next press."""
+        if self.overlay is not None:
+            self._overlay_send(OP.format("hide"))
+            self.overlay_mode = "hidden"
+
+    def _overlay_quit(self) -> None:
+        """Stop the overlay process (daemon shutdown, or the overlay switched off)."""
         proc, self.overlay = self.overlay, None
         if proc is None:
             return
@@ -608,10 +721,11 @@ class Daemon:
         seq, self.job_seq = self.job_seq, self.job_seq + 1
         self._write_state(TRANSCRIBING)
         captions = self._captions_detach()
-        self._overlay_close()
+        self._overlay_state("transcribing")
         self._restore_mute_state()
         self.feedback.play("stop")
-        self.feedback.notify("Transcribing…", f"{secs:.1f}s of audio, peak {peak_db:.0f} dB", timeout_ms=0)
+        if self.overlay is None and secs >= TAP:     # the overlay shows this itself; a tap shows nothing
+            self.feedback.notify("Transcribing…", f"{secs:.1f}s of audio, peak {peak_db:.0f} dB", timeout_ms=10000)
         job = (seq, audio, secs, peak_db, self.kind, self.app, self.title, self.selection, captions, self.field)
         self.field = None
         threading.Thread(target=self._process, args=job, daemon=True).start()
@@ -665,6 +779,7 @@ class Daemon:
             log.info("%s %.1fs audio (peak %.0f dB) -> %.2fs after release: %r",
                      self.transcriber.engine.name, secs, peak_db, time.monotonic() - t0, raw)
             if not raw:
+                self._overlay_state("nospeech" if secs >= TAP else "hide")
                 if secs >= TAP:                     # a tap (maybe half of a double tap) is not a dictation
                     self._no_speech(secs, peak_db)
                 return
@@ -697,14 +812,20 @@ class Daemon:
                 timer.daemon = True
                 timer.start()
             if method == "clipboard":
+                self._overlay_state("hide")
                 self.feedback.notify("Copied to clipboard", text[:200], timeout_ms=4000)
             else:
-                self.feedback.notify(label, text[:200], timeout_ms=2500)
+                self._overlay_text(text)
+                self._overlay_state("done")
+                if self.overlay is None:            # no overlay to show the check
+                    self.feedback.notify(label, text[:200], timeout_ms=2500)
         except Exception as exc:
             log.exception("dictation failed")
+            self._overlay_state("error")
             self.feedback.play("error")
             self.feedback.notify("chttr error", f"{type(exc).__name__}: {exc}", urgency="critical", timeout_ms=8000)
         finally:
+            self._overlay_settle()
             self._done_turn(seq)
             with self.lock:
                 self.jobs -= 1
@@ -954,7 +1075,7 @@ class Daemon:
                     self._meeting_stop()
                 if self.recorder.active:
                     self.recorder.cancel()
-                self._overlay_close()
+                self._overlay_quit()
                 self._restore_mute_state()
                 self._write_state(IDLE)
             server.close()

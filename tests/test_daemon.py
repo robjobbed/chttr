@@ -256,3 +256,244 @@ def test_screen_context_backs_off_when_atspi_never_answers(daemon, monkeypatch):
         daemon.handle("release")
         wait_idle(daemon)
     assert len(calls) == Dm.ATSPI_GIVE_UP
+
+
+# ---- the resident overlay pill ----------------------------------------------
+
+class FakeOverlayProc:
+    """Stands in for overlay.py: records what the daemon writes to it."""
+
+    spawned = []                # noqa: RUF012 - every spawn, reset by the fixture
+
+    def __init__(self, cmd, **kw):
+        assert str(Dm.OVERLAY_SCRIPT) in cmd
+        FakeOverlayProc.spawned.append(cmd)
+        self.cmd = cmd
+        self.written = bytearray()
+        self.returncode = None
+        proc = self
+
+        class Stdin:
+            closed = False
+
+            def write(self, data):
+                if proc.returncode is not None:
+                    raise BrokenPipeError
+                proc.written += data
+
+            def flush(self):
+                pass
+
+            def close(self):
+                self.closed = True
+                proc.returncode = 0
+
+        self.stdin = Stdin()
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+    def kill(self):
+        self.returncode = -9
+
+    def commands(self):
+        """What it was told, level lines left out."""
+        lines = self.written.decode().splitlines()
+        return [line for line in lines if not line[:1].isdigit()]
+
+
+@pytest.fixture
+def pill(daemon, monkeypatch):
+    """The daemon on Hyprland with the overlay switched on (and a fake overlay process)."""
+    FakeOverlayProc.spawned = []
+    monkeypatch.setattr(Dm.subprocess, "Popen", FakeOverlayProc)
+    monkeypatch.setattr(Dm, "current_desktop", lambda: _desk("hyprland"))
+    monkeypatch.setattr(Dm.OP, "omarchy_palette", lambda path=None: None)
+    daemon.cfg.feedback.overlay = True
+    return daemon
+
+
+def _desk(compositor, session="wayland"):
+    from chttr.desktop import Desktop
+
+    return Desktop(session, compositor)
+
+
+def dictate(d, text, secs=1.0, verb="start"):
+    d.transcriber.texts = [text]
+    d.recorder.secs = secs
+    d.handle(verb)
+    d.handle("release")
+    wait_idle(d)
+
+
+def test_overlay_shows_the_whole_dictation(pill):
+    dictate(pill, "hello world")
+    assert pill.overlay.commands() == ["show ", "state listening", "state transcribing", "text hello world",
+                                       "state done"]
+    assert pill.typed == ["hello world"]
+    assert "Transcribing…" not in pill.feedback.notes and "Typed" not in pill.feedback.notes
+
+
+def test_overlay_process_is_reused_across_dictations(pill):
+    for words in ("one", "two", "three"):
+        dictate(pill, words)
+    assert len(FakeOverlayProc.spawned) == 1
+    assert pill.overlay.commands().count("state done") == 3
+
+
+def test_overlay_is_started_hidden_with_the_daemon(pill):
+    pill._overlay_warm()
+    assert len(FakeOverlayProc.spawned) == 1 and pill.overlay.commands() == []
+    dictate(pill, "warm")
+    assert len(FakeOverlayProc.spawned) == 1
+    assert pill.overlay.commands()[0] == "show "
+
+
+def test_a_tap_hides_the_pill_and_leaves_no_notification(pill):
+    dictate(pill, "", secs=0.2)
+    assert pill.overlay.commands()[-1] == "hide"
+    assert "Transcribing…" not in pill.feedback.notes
+    assert not any("No speech" in n for n in pill.feedback.notes)
+
+
+def test_nothing_heard(pill):
+    dictate(pill, "", secs=1.0)
+    assert pill.overlay.commands()[-1] == "state nospeech"
+
+
+def test_command_mode_pill(pill):
+    dictate(pill, "make it shorter", verb="command")
+    commands = pill.overlay.commands()
+    assert commands[:2] == ["show command", "state command"]
+    assert commands[-1] == "hide"                       # no model: the notification explains, the pill goes
+
+
+def test_hands_free_pill(pill):
+    pill.transcriber.texts = ["hands free"]
+    pill.handle("toggle")
+    pill.handle("toggle")
+    wait_idle(pill)
+    assert pill.overlay.commands()[:2] == ["show hands-free", "state handsfree"]
+    assert pill.overlay.commands()[-1] == "state done"
+
+
+def test_a_failing_transcriber_shows_the_error_pill(pill):
+    def boom(*a, **k):
+        raise RuntimeError("model fell over")
+
+    pill.transcriber.transcribe = boom
+    dictate(pill, "")
+    assert pill.overlay.commands()[-1] == "state error"
+    assert "chttr error" in pill.feedback.notes
+
+
+def test_cancel_hides_the_pill(pill):
+    pill.handle("start")
+    pill.handle("cancel")
+    assert pill.overlay.commands()[-1] == "hide"
+    assert len(FakeOverlayProc.spawned) == 1
+
+
+def test_clipboard_fallback_still_notifies(pill, monkeypatch):
+    monkeypatch.setattr(Dm, "deliver", lambda text, cfg, **kw: "clipboard")
+    dictate(pill, "copied words")
+    assert pill.overlay.commands()[-1] == "hide"
+    assert "Copied to clipboard" in pill.feedback.notes
+
+
+def test_a_dictation_finishing_during_the_next_recording_leaves_the_pill_alone(pill):
+    pill.transcriber.texts = ["first"]
+    pill.transcriber.delays = [0.3]
+    pill.handle("start")
+    pill.handle("release")
+    pill.handle("start")                                 # recording again while "first" is transcribed
+    time.sleep(0.5)
+    assert pill.overlay.commands()[-1] == "state listening"
+    pill.transcriber.texts = ["second"]
+    pill.handle("release")
+    wait_idle(pill)
+    assert pill.typed == ["first", "second"]
+    assert pill.overlay.commands()[-2:] == ["text second", "state done"]
+
+
+def test_theme_colours_are_passed_and_follow_theme_switches(pill, monkeypatch):
+    theme = {"bg": "#f3eefa", "fg": "#221c33", "accent": "#5b2bb5", "hot": "#b42318", "dim": "#6b6480", "dark": False}
+    monkeypatch.setattr(Dm.OP, "omarchy_palette", lambda path=None: dict(theme))
+    dictate(pill, "one")
+    cmd = FakeOverlayProc.spawned[0]
+    assert Dm.json.loads(cmd[cmd.index("--palette") + 1]) == theme
+    assert not any(c.startswith("palette") for c in pill.overlay.commands())   # unchanged: not resent
+    theme["accent"] = "#ff0000"
+    dictate(pill, "two")
+    assert '"accent": "#ff0000"' in next(c for c in pill.overlay.commands() if c.startswith("palette"))
+
+
+def test_a_dead_overlay_is_restarted_at_the_next_press(pill):
+    dictate(pill, "one")
+    pill.overlay.returncode = 1                          # e.g. the compositor restarted
+    pill.overlay_spawned_at -= Dm.OVERLAY_RESPAWN
+    dictate(pill, "two")
+    assert len(FakeOverlayProc.spawned) == 2
+    assert pill.overlay.commands()[-2:] == ["text two", "state done"]
+    assert "Waveform overlay off" not in pill.feedback.notes
+
+
+def test_an_overlay_that_keeps_dying_falls_back_to_notifications(pill, monkeypatch):
+    class Doomed(FakeOverlayProc):
+        def __init__(self, cmd, **kw):
+            super().__init__(cmd, **kw)
+            self.returncode = 1                          # dies before reading anything
+
+    monkeypatch.setattr(Dm.subprocess, "Popen", Doomed)
+    (pill.runtime / "overlay.log").write_text("ValueError: Namespace Gtk4LayerShell not available\n")
+    dictate(pill, "one")
+    assert "Waveform overlay off" not in pill.feedback.notes     # once could be a fluke
+    pill.overlay_spawned_at -= Dm.OVERLAY_RESPAWN
+    dictate(pill, "two")
+    assert "Waveform overlay off" in pill.feedback.notes
+    dictate(pill, "three")                               # within 30 s: no new process, notifications instead
+    assert len(Doomed.spawned) == 2
+    assert pill.overlay is None
+    assert pill.feedback.notes.count("Typed") == 3
+    assert pill.typed == ["one", "two", "three"]
+
+
+def test_overlay_switched_off_by_a_reload_stops_the_process(pill):
+    dictate(pill, "one")
+    proc = pill.overlay
+    pill.cfg.feedback.overlay = False
+    dictate(pill, "two")
+    assert pill.overlay is None and proc.returncode == 0
+
+
+def test_live_captions_switched_on_restarts_the_overlay(pill):
+    dictate(pill, "one")
+    pill.cfg.feedback.live_captions = True
+    pill.cfg.engine.streaming = False
+    dictate(pill, "two")
+    assert len(FakeOverlayProc.spawned) == 2 and "--captions" in FakeOverlayProc.spawned[1]
+
+
+def test_no_overlay_on_gnome_uses_notifications(pill, monkeypatch):
+    monkeypatch.setattr(Dm, "current_desktop", lambda: _desk("gnome"))
+    dictate(pill, "hello")
+    assert pill.overlay is None and FakeOverlayProc.spawned == []
+    assert "Transcribing…" in pill.feedback.notes and "Typed" in pill.feedback.notes
+    assert "Waveform overlay off" not in pill.feedback.notes     # expected there, not a fault
+    dictate(pill, "", secs=0.2)
+    assert pill.feedback.notes.count("Transcribing…") == 1       # not for the tap
+
+
+def test_without_an_overlay_notifications_still_appear(daemon):
+    notes = []
+    daemon.feedback.notify = lambda title, body="", **kw: notes.append((title, kw.get("timeout_ms")))
+    dictate(daemon, "hello")
+    assert ("Transcribing…", 10000) in notes                     # finite: never stuck on screen
+    assert any(title == "Typed" for title, _ in notes)
+    notes.clear()
+    dictate(daemon, "", secs=0.2)
+    assert not any(title == "Transcribing…" for title, _ in notes)
