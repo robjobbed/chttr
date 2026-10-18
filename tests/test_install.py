@@ -256,3 +256,90 @@ def test_notify_prefers_omarchy(monkeypatch):
          "chttr is ready", "Hold Insert"],
         ["notify-send", "-a", "chttr", "-u", "normal", "-t", "12000", "chttr is ready", "Hold Insert"],
     ]
+
+
+# ---- bin/setup and install.sh -------------------------------------------------------------
+
+ROOT = install.Path(__file__).resolve().parents[1]
+PY_SNIPPET = [
+    """py="${CHTTR_PYTHON:-$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null)}\"""",
+    "[[ $py =~ ^3\\.([0-9]+)(\\.[0-9]+)?$ ]] && ((BASH_REMATCH[1] >= 12)) || py=3.13",
+]
+
+
+def _stubs(tmp_path, version: str | None):
+    """A PATH directory with fake python3/uv that log their arguments, and a fake HOME."""
+    import os
+
+    bin_ = tmp_path / "stubs"
+    bin_.mkdir()
+    log = tmp_path / "log"
+    if version is not None:
+        (bin_ / "python3").write_text(
+            "#!/bin/bash\n"
+            f'if [[ $* == *print* ]]; then echo {version}; exit 0; fi\n'
+            f'[[ $1 == -I ]] && echo "python3 $*" >> {log}\n'
+            "exit 0\n")
+    (bin_ / "uv").write_text(f'#!/bin/bash\necho "uv $*" >> {log}\n')
+    home = tmp_path / "home"
+    (home / ".local/bin").mkdir(parents=True)
+    (home / ".local/bin/chttr").write_text(f'#!/bin/bash\necho "chttr $*" >> {log}\n')
+    for f in [*bin_.iterdir(), home / ".local/bin/chttr"]:
+        f.chmod(0o755)
+    path = f"{bin_}:/usr/bin:/bin" if version is not None else str(bin_)     # None: no python3 at all
+    env = {"PATH": path, "HOME": str(home), "XDG_DATA_HOME": str(home / "data"),
+           "XDG_CONFIG_HOME": str(home / "config"), "LANG": os.environ.get("LANG", "C.UTF-8")}
+    return env, log
+
+
+@pytest.mark.parametrize("script", ["bin/setup", "install.sh"])
+def test_installer_scripts_parse_and_share_the_python_choice(script):
+    subprocess.run(["bash", "-n", str(ROOT / script)], check=True)
+    text = (ROOT / script).read_text()
+    for line in PY_SNIPPET:
+        assert line in text
+    assert "CHTTR_PYTHON=3.13" not in text and "3.14}" not in text
+
+
+@pytest.mark.parametrize(("system", "override", "expected"), [
+    ("3.14", "", "3.14"), ("3.12", "", "3.12"), ("3.11", "", "3.13"), (None, "", "3.13"),
+    ("3.14", "3.13", "3.13"), ("3.14", "3.10", "3.13"),
+])
+def test_python_choice(tmp_path, system, override, expected):
+    env, _ = _stubs(tmp_path, system)
+    if override:
+        env["CHTTR_PYTHON"] = override
+    out = subprocess.run(["/bin/bash", "-c", "\n".join([*PY_SNIPPET, 'echo "$py"'])], env=env, capture_output=True,
+                         text=True, check=True).stdout.strip()
+    assert out == expected
+
+
+def test_bin_setup_downloads_the_model_while_uv_installs(tmp_path):
+    env, log = _stubs(tmp_path, "3.14")
+    subprocess.run(["bash", str(ROOT / "bin/setup"), "--no-meet"], env=env, check=True, capture_output=True)
+    lines = log.read_text().splitlines()
+    data = env["XDG_DATA_HOME"]
+    assert f"python3 -I {ROOT}/src/chttr/models.py {data}/chttr/models/parakeet-tdt-0.6b-v3-int8 " \
+           f"{data}/chttr/models" in lines
+    assert any(line.startswith("uv tool install --python 3.14 --editable") for line in lines)
+    assert lines[-1] == "chttr setup --no-meet"
+
+
+def test_bin_setup_skips_the_download_when_the_model_is_there(tmp_path):
+    env, log = _stubs(tmp_path, "3.14")
+    model = install.Path(env["HOME"]) / ".local/share/voxtype/models/parakeet-tdt-0.6b-v3-int8"
+    model.mkdir(parents=True)
+    for name in ("encoder-model.int8.onnx", "decoder_joint-model.int8.onnx", "vocab.txt"):
+        (model / name).write_text("x")
+    subprocess.run(["bash", str(ROOT / "bin/setup")], env=env, check=True, capture_output=True)
+    assert not any(line.startswith("python3 -I") for line in log.read_text().splitlines())
+
+
+def test_bin_setup_stops_when_the_download_fails(tmp_path):
+    env, log = _stubs(tmp_path, "3.14")
+    stub = install.Path(env["PATH"].split(":")[0]) / "python3"
+    stub.write_text(stub.read_text().replace("exit 0\n", "[[ $1 == -I ]] && exit 1\nexit 0\n"))
+    done = subprocess.run(["bash", str(ROOT / "bin/setup")], env=env, capture_output=True, text=True)
+    assert done.returncode == 1
+    assert "continue where it stopped" in done.stdout
+    assert not any(line.startswith("chttr setup") for line in log.read_text().splitlines())

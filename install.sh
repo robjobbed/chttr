@@ -78,5 +78,9 @@ else
   git clone --quiet --depth 1 "$repo" "$src"
 fi
 
-export CHTTR_PYTHON="${CHTTR_PYTHON:-3.13}"
+# Python: the system's own when it is 3.12 or newer (nothing to download), else a uv-managed 3.13.
+py="${CHTTR_PYTHON:-$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null)}"
+[[ $py =~ ^3\.([0-9]+)(\.[0-9]+)?$ ]] && ((BASH_REMATCH[1] >= 12)) || py=3.13
+# (bin/setup chooses with the same lines; CHTTR_PYTHON=3.14 picks one yourself)
+[[ $py == 3.13 && -z ${CHTTR_PYTHON:-} ]] && echo "Your python3 is older than 3.12, so uv fetches its own Python 3.13 for chttr."
 exec "$src/bin/setup" "$@"
