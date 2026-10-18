@@ -454,7 +454,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def _mic_check(cfg, seconds: float = 4.0) -> bool:
-    """Record a few seconds, show the level and what the recognizer heard."""
+    """Record a few seconds, show the levels and what the recognizer heard."""
+    from . import levels
     from .recorder import Recorder
     from .transcriber import Transcriber
 
@@ -467,12 +468,25 @@ def _mic_check(cfg, seconds: float = 4.0) -> bool:
         return False
     time.sleep(seconds)
     audio, _ = rec.stop()
-    peak = rec.peak_db
-    verdict = "PROBLEM: silent (muted, or the wrong input device?)" if peak < -45 else \
-        "quiet; speak up or try [audio] whisper_mode = true" if peak < -25 else \
-        "clipping; lower the input volume" if peak > -1 else "good"
-    print(f"mic:         peak {peak:.0f} dB: {verdict}")
-    text = Transcriber(cfg).transcribe(audio)
+    peak, chunks = rec.peak_db, list(rec.levels_db)
+    configured = cfg.audio.threshold_db
+    # The same numbers the daemon goes by: the room's floor, your speech (the chunks
+    # clearly above it, so one short word counts) and the threshold that follows them.
+    floor = levels.noise_floor(chunks)
+    speech = levels.speech_level(chunks, floor)
+    thr = levels.effective_threshold(chunks, configured) if cfg.audio.adaptive_threshold else configured
+    text = Transcriber(cfg).transcribe(audio)     # the verdict never contradicts "heard:"
+    if peak < -45:
+        verdict = "PROBLEM: silent (muted, or the wrong input device?)"
+    elif peak > -1:
+        verdict = "clipping; lower the input volume"
+    elif speech <= thr and not text:
+        verdict = f"too quiet: speech is under the {thr:.0f} dB threshold; raise the input level or move closer"
+    elif speech < configured:
+        verdict = f"quiet but usable (threshold lowered to {thr:.0f} dB)" if thr < configured else "quiet but usable"
+    else:
+        verdict = "good"
+    print(f"mic:         peak {peak:.0f} dB, speech {speech:.0f} dB, floor {floor:.0f} dB: {verdict}")
     print(f"heard:       {text or '(nothing)'}")
     return peak >= -45 and bool(text)
 

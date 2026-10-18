@@ -21,7 +21,7 @@ import numpy as np
 
 from . import config as C
 from . import context as CX
-from . import devmode
+from . import devmode, levels
 from . import polish as P
 from .config import Config, Mode
 from .dictionary import Dictionary
@@ -75,6 +75,7 @@ class Daemon:
         self.app = self.title = ""
         self.selection = ""
         self.heard_speech = False
+        self.levels = levels.Tracker()
         self.last_speech = 0.0
         self.captions_stop: threading.Event | None = None
         self.captions_thread: threading.Thread | None = None
@@ -175,9 +176,15 @@ class Daemon:
 
     def _on_level(self, rms: float, peak_db: float) -> None:
         rms_db = 20 * np.log10(max(rms, 1e-6))
-        if rms_db > self.cfg.audio.threshold_db:
+        self.levels.update(rms_db)
+        a = self.cfg.audio
+        thr = self.levels.threshold(a.threshold_db) if a.adaptive_threshold else a.threshold_db
+        if rms_db > thr:
             self.heard_speech = True
             self.last_speech = time.monotonic()
+        streamer = self.streamer
+        if streamer is not None:
+            streamer.threshold_db = thr     # segments close on your pauses, at any mic level
         self._overlay_send(f"{rms:.5f} {peak_db:.1f}")
 
     def _overlay_close(self) -> None:
@@ -575,6 +582,7 @@ class Daemon:
         self.field = self.pool.submit(self._read_field) if want_field and kind != COMMAND else None
         self.app, self.title, self.selection = app, title, selection
         self.heard_speech = False
+        self.levels = levels.Tracker()
         self.last_speech = time.monotonic()
         self._unmute_if_needed()
         self._overlay_open(kind if kind != PTT else "")
@@ -781,8 +789,23 @@ class Daemon:
 
     def _no_speech(self, secs: float, peak_db: float) -> None:
         if peak_db < QUIET_PEAK_DB:
-            self.feedback.notify("No speech detected: mic is silent",
-                                 f"Peak {peak_db:.0f} dB. Check the input device or mute (SUPER+CTRL+A → Audio).",
+            omarchy = current_desktop().compositor == "hyprland" and shutil.which("omarchy-menu")
+            hint = " (Super+Ctrl+A opens Audio)." if omarchy else "."
+            self.feedback.notify("No speech detected: the mic is silent",
+                                 f"Peak {peak_db:.0f} dB. Check the input device and mute" + hint,
+                                 urgency="normal", timeout_ms=6000)
+        elif peak_db < -25:
+            # The tracker holds the recording that just ended, unless you have started
+            # another since (_start replaces it); then its numbers are not this one's.
+            a, tracker = self.cfg.audio, self.levels
+            levels_text = ""
+            if tracker.count and self.state != RECORDING and self.jobs <= 1:
+                thr = tracker.threshold(a.threshold_db) if a.adaptive_threshold else a.threshold_db
+                levels_text = f" over a {tracker.floor:.0f} dB floor"
+                if thr < a.threshold_db:
+                    levels_text += f"; chttr listened down to {thr:.0f} dB"
+            self.feedback.notify("No speech detected: the mic is quiet",
+                                 f"Peak {peak_db:.0f} dB{levels_text}. Raise the input level for best results.",
                                  urgency="normal", timeout_ms=6000)
         else:
             self.feedback.notify("No speech detected", f"{secs:.1f}s, peak {peak_db:.0f} dB", timeout_ms=2500)

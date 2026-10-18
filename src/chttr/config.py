@@ -78,6 +78,10 @@ speech_threshold_db = -38
 # Whisper mode: for dictating quietly (open office, someone asleep). Lowers the
 # speech threshold to -50 dB and boosts quiet recordings before recognition.
 whisper_mode = false
+# Lower the speech threshold to fit the room: 10 dB above the measured noise floor
+# but no lower than 20 dB under your speech, never below -62 dB and never above
+# speech_threshold_db. Quiet laptop mics need this.
+adaptive_threshold = true
 # Double-tap the dictation key to switch to hands-free; tap once more to stop.
 double_tap = true
 
@@ -291,6 +295,7 @@ class AudioCfg:
     no_speech_timeout: float = 10
     speech_threshold_db: float = -38
     whisper_mode: bool = False
+    adaptive_threshold: bool = True
     double_tap: bool = True
 
     @property
