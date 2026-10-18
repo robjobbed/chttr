@@ -120,15 +120,22 @@ _OPEN_RE = re.compile(r"(\s*)\b(?:open|left)\s+(paren|parenthesis|square bracket
                       re.IGNORECASE)
 _CLOSE_RE = re.compile(r"\s*\b(close|closed|right)\s+(paren|parenthesis|square bracket|bracket|curly brace|brace|curly)\b",
                        re.IGNORECASE)
-# Words that make "pipe" and "arrow" ordinary words: "pipe the output to jq", "the arrow keys"
-_PROSE_BEFORE = {"a", "an", "the", "this", "that", "my", "your", "data", "named", "pipe"}
+# Words that make "pipe" and "arrow" ordinary words: "pipe the output to jq", "the arrow keys",
+# "press the down arrow", "a fat arrow function"
+_PROSE_BEFORE = {"a", "an", "the", "this", "that", "my", "your", "data", "named", "pipe", "up", "down", "left",
+                 "right", "return", "back", "fat", "water", "drain", "gas", "exhaust", "broken"}
 _PROSE_AFTER = {"it", "the", "that", "this", "them", "into", "to", "through", "output", "everything", "all",
-                "function", "functions", "key", "keys", "icon", "button", "up", "down", "left", "right", "symbol"}
+                "function", "functions", "key", "keys", "icon", "button", "up", "down", "left", "right", "symbol",
+                "burst", "leaks", "is", "was", "syntax", "operator"}
+# Where prose is likely (a coding agent's prompt, an editor), "pipe" is a pipe only into a command
+_PIPE_INTO = {"grep", "rg", "less", "more", "head", "tail", "sort", "uniq", "wc", "jq", "yq", "awk", "sed", "xargs",
+              "tee", "cut", "tr", "fzf", "bat", "cat", "column", "nl", "fmt", "rev", "sh", "bash", "zsh", "python",
+              "python3", "node", "wl-copy", "xclip", "pbcopy", "delta", "diff", "base64", "gzip", "fx", "ag", "perl"}
 _SYMBOLS = [   # (spoken, typed); the spaces around them stay
     (r"\b(?:double\s+ampersand|ampersand\s+ampersand)\b", "&&"),
     (r"\b(?:double\s+pipe|pipe\s+pipe)\b", "||"),
     (r"\s*\bdouble\s+colon\b\s*", "::"),
-    (r"\bfat\s+arrow\b", "=>"),
+    (r"(?<=\S) fat\s+arrow\b", " =>"),
     (r"(?<=\S) arrow\b", " ->"),
     (r"(?<=\S) pipe (?=\S)", " | "),
     (r"\bampersand\b", "&"),
@@ -137,12 +144,14 @@ _SYMBOLS = [   # (spoken, typed); the spaces around them stay
 _SYMBOL_RES = [(re.compile(p, re.IGNORECASE), typed) for p, typed in _SYMBOLS]
 
 
-def _symbol(typed: str, text: str):
+def _symbol(typed: str, text: str, prose: bool):
     def sub(m: re.Match) -> str:
-        if typed.strip() in ("->", "|"):
+        if typed.strip() in ("->", "=>", "|"):
             before = re.findall(r"[\w']+", text[:m.start()])
-            after = re.findall(r"[\w']+", text[m.end():])
+            after = re.findall(r"[\w'-]+", text[m.end():])
             if (before and before[-1].lower() in _PROSE_BEFORE) or (after and after[0].lower() in _PROSE_AFTER):
+                return m.group(0)
+            if prose and typed.strip() == "|" and not (after and after[0].lower() in _PIPE_INTO):
                 return m.group(0)
         return typed
     return sub
@@ -160,10 +169,12 @@ def _open(m: re.Match, text: str) -> str:
     return bracket if attach or not m.group(1) else " " + bracket
 
 
-def apply_symbols(text: str) -> str:
+def apply_symbols(text: str, prose: bool = False) -> str:
     """Spoken flags, paths and symbols, for terminals and code editors:
     "ls dash l tilde slash notes pipe grep dash dash ignore dash case todo"
-    -> "ls -l ~/notes | grep --ignore-case todo"."""
+    -> "ls -l ~/notes | grep --ignore-case todo".
+    `prose` (a coding agent's prompt, an editor): "pipe" only before a command
+    ("the water pipe burst" stays as it is)."""
     text = _FLAG_RE.sub(lambda m: "--" + "-".join(re.split(r"\s+dash\s+", m.group(1), flags=re.IGNORECASE)), text)
     text = _SHORT_FLAG_RE.sub(lambda m: "-" + m.group(1), text)
     text = _HOME_RE.sub(lambda m: ("~/" if m.group(1).lower() == "tilde" else "./")
@@ -172,37 +183,46 @@ def apply_symbols(text: str) -> str:
     text = _OPEN_RE.sub(lambda m: _open(m, text), text)
     text = _CLOSE_RE.sub(lambda m: _PAIRS[m.group(2).lower()][1], text)
     for pattern, typed in _SYMBOL_RES:
-        text = pattern.sub(_symbol(typed, text), text)
+        text = pattern.sub(_symbol(typed, text, prose), text)
     return text
 
 
-_ENTER_RE = re.compile(r"(?P<sep>^|\s*[,;.:\u2014-]+\s*|\s+)(run it|press enter|hit enter|send it|and go)[\s.!]*$",
+_ENTER_RE = re.compile(r"(?P<sep>^|\s*[,;.:!?\u2014-]+\s*|\s+)(run it|press enter|hit enter|send it|and go)[\s.!]*$",
                        re.IGNORECASE)
-# "fix the bug and run it", "Priyanka will send it": part of the sentence, not a key press
+# "fix the bug and run it", "Priyanka will send it", "pytest won't run it": part of the sentence, not a key press
 _CONNECTORS = {"and", "then", "to", "or", "but", "so", "will", "would", "can", "could", "should", "must", "might",
                "please", "i", "we", "you", "they", "he", "she", "i'll", "we'll", "you'll", "let's", "just", "also",
-               "me", "us", "not", "don't", "gonna", "wanna", "ll", "d"}
+               "me", "us", "not", "don't", "gonna", "wanna", "ll", "d", "never", "nobody", "cannot", "who", "what",
+               "how", "why", "which", "that", "where", "when", "finally", "always"}
 
 
-def strip_enter(text: str) -> tuple[str, bool]:
+def strip_enter(text: str, strict: bool = False) -> tuple[str, bool]:
     """ "git status, run it" -> ("git status", True): ending a dictation with "run it",
     "press enter", "hit enter", "send it" or "and go" presses Enter after typing.
     Only at the very end, and not when it is part of the sentence: "run it again
-    later" and "fix the test and run it" are left alone."""
+    later", "fix the test and run it" and "pytest won't run it" are left alone.
+    `strict` (a coding agent, where Enter sends the prompt): only after a pause
+    the recognizer wrote down as punctuation ("Fix the parser tests. Send it."),
+    or on its own."""
     m = _ENTER_RE.search(text)
     if not m:
         return text, False
     head = text[:m.start()]
     if m.group("sep").strip() == "" and head:
-        words = re.findall(r"[\w'\u2019]+", head.lower().replace("\u2019", "'"))
-        if words and words[-1] in _CONNECTORS:
+        if strict:
             return text, False
-    return head.rstrip(" ,;:\u2014-"), True
+        words = re.findall(r"[\w']+", head.lower().replace("\u2019", "'"))
+        if words and (words[-1] in _CONNECTORS or words[-1].endswith("n't")):
+            return text, False
+    head = head.rstrip(" ,;:\u2014-")
+    if strict and head and m.group("sep").strip()[:1] in (".", "!", "?"):
+        head += m.group("sep").strip()[0]        # a prompt keeps its full stop
+    return head, True
 
 
-def transform(text: str, code: bool) -> str:
+def transform(text: str, code: bool, prose: bool = False) -> str:
     if code:        # symbols first: "dash dash ignore dash case" is a flag, not kebab case
-        return apply_files(apply_casing(apply_symbols(text)))
+        return apply_files(apply_casing(apply_symbols(text, prose)))
     return apply_casing(text)
 
 

@@ -57,6 +57,17 @@ def test_modes_match_window_class_case_insensitively():
     ("chromium", "New chat - Claude - Chromium", "assistant"),
     ("chromium", "Hacker News", None),
     ("code-oss", "notion.md - project", "code"),                         # a title never beats the editor
+    ("com.mitchellh.ghostty", "\u2733 Fix the parser tests", "agent"),     # Claude Code names the window after the task
+    ("ghostty", "\u2836 Running the tests", "agent"),                       # with a spinner while it works
+    ("ghostty", "claude", "agent"),
+    ("ghostty", "nvim ~/.claude/CLAUDE.md", "terminal"),                  # a path is not the agent
+    ("ghostty", "~/Work/claude-notes", "terminal"),
+    ("org.gnome.Ptyxis", "~", "terminal"),
+    ("org.gnome.Terminal", "\u2733 Claude Code", "agent"),
+    ("chromium", "Notion \u2013 Gmail import guide - Google Docs", "docs"),  # the app is the suffix, not the subject
+    ("chromium", "Discord invite - me@example.com - Gmail", "email"),
+    ("chromium", "Slack | general | Acme", "chat"),
+    ("chromium", "(3) WhatsApp", "chat"),
 ])
 def test_modes_match_the_window_title(window_class, title, mode):
     cfg = C.load_config(C.Path("/nonexistent"))
@@ -82,6 +93,18 @@ def test_title_only_modes_match_any_app(tmp_path):
     assert cfg.mode_for("chromium", "PROJ-12 - Jira").name == "jira"
     assert cfg.mode_for("chromium", "Inbox") is None
     assert cfg.mode_for("", "PROJ-12 - Jira").name == "jira"
+
+
+def test_modes_left_as_an_earlier_release_wrote_them_follow_the_defaults(tmp_path):
+    path = tmp_path / "c.toml"
+    path.write_text("[output]\ntyper = \"wtype\"\n\n" + C._MODES_1_0)
+    cfg = C.load_config(path)
+    assert [m.name for m in cfg.modes] == [m.name for m in C._default_modes()]
+    assert cfg.mode_for("ghostty", "\u2733 Claude Code").name == "agent"
+    assert cfg.output.typer == "wtype"                   # the rest of the file is still read
+    # one changed word and they are yours
+    path.write_text(C._MODES_1_0.replace("no sign-off.", "no sign-off, no emoji."))
+    assert [m.name for m in C.load_config(path).modes] == ["terminal", "code", "chat", "email", "docs"]
 
 
 def test_user_modes_replace_the_defaults(tmp_path):

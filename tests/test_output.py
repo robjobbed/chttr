@@ -35,11 +35,16 @@ def test_smart_join(before, after, text, joined, trailing):
     assert O.smart_join(before, after, text, ["Sohrab"]) == (joined, trailing)
 
 
-def test_names_keep_their_capital_when_chttr_knows_them():
-    # a name chttr can't know (not in your words, not on screen) reads as an ordinary word
-    assert O.smart_join("as we said, ", "", "Priyanka will call") == ("priyanka will call", None)
-    assert O.smart_join("as we said, ", "", "Priyanka will call", ["Priyanka"]) == ("Priyanka will call", None)
+def test_names_days_and_months_keep_their_capital():
+    # only a common sentence opener ("The", "Tomorrow", "We") is lower-cased mid-sentence
+    assert O.smart_join("as we said, ", "", "Priyanka will call") == ("Priyanka will call", None)
+    assert O.smart_join("the meeting with", "", "Priyanka went well") == (" Priyanka went well", None)
+    assert O.smart_join("let's meet on", "", "Monday at noon") == (" Monday at noon", None)
+    assert O.smart_join("we ship in", "", "May.") == (" May.", None)
+    assert O.smart_join("thanks to", "", "Will for the notes") == (" Will for the notes", None)
     assert O.smart_join("as we said, ", "", "Claude Code works", ["claude code"]) == ("Claude Code works", None)
+    assert O.smart_join("as we said,", "", "The plan works") == (" the plan works", None)
+    assert O.smart_join("I think", "", "We're fine") == (" we're fine", None)
 
 
 def test_smart_join_in_code_only_fixes_spacing():

@@ -66,9 +66,24 @@ def test_keep_list_collects_identifiers_for_the_model():
     ("make ampersand ampersand make install", "make && make install"),
     ("run backtick npm test backtick first", "run `npm test` first"),
     ("a dash of salt", "a dash of salt"),
+    ("when I press the down arrow nothing happens", "when I press the down arrow nothing happens"),
+    ("the left arrow", "the left arrow"),
+    ("a fat arrow function", "a fat arrow function"),
 ])
 def test_symbols(spoken, typed):
     assert DM.transform(spoken, code=True) == typed
+
+
+@pytest.mark.parametrize(("spoken", "typed"), [
+    ("the water pipe burst", "the water pipe burst"),
+    ("why does the build pipe fail", "why does the build pipe fail"),
+    ("run ls dash l pipe less", "run ls -l | less"),
+    ("check cat log pipe grep error", "check cat log | grep error"),
+    ("return x fat arrow x", "return x => x"),
+])
+def test_symbols_in_prose(spoken, typed):
+    # a coding agent's prompt: "pipe" is a pipe only into a command
+    assert DM.transform(spoken, code=True, prose=True) == typed
 
 
 def test_symbols_only_in_code_apps():
@@ -86,7 +101,26 @@ def test_symbols_only_in_code_apps():
     ("please run it again later", "please run it again later", False),   # mid-sentence: left alone
     ("fix the failing test and run it", "fix the failing test and run it", False),
     ("Priyanka will send it", "Priyanka will send it", False),
+    ("The CLI won't run it.", "The CLI won't run it.", False),               # negated: part of the sentence
+    ("I can't run it", "I can't run it", False),
+    ("I can’t run it", "I can’t run it", False),
+    ("pytest doesn't run it", "pytest doesn't run it", False),
+    ("never run it", "never run it", False),
+    ("nobody can send it", "nobody can send it", False),
+    ("I don't know how run it", "I don't know how run it", False),
     ("git status", "git status", False),
 ])
 def test_strip_enter(spoken, typed, enter):
     assert DM.strip_enter(spoken) == (typed, enter)
+
+
+@pytest.mark.parametrize(("spoken", "typed", "enter"), [
+    ("Fix the parser tests. Send it.", "Fix the parser tests.", True),         # the prompt keeps its full stop
+    ("Does it pass? Send it", "Does it pass?", True),
+    ("Fix the parser tests, send it", "Fix the parser tests", True),
+    ("Send it.", "", True),
+    ("Fix the parser tests send it", "Fix the parser tests send it", False),   # no pause: part of the prompt
+    ("The tests pass but pytest won't run it.", "The tests pass but pytest won't run it.", False),
+])
+def test_strip_enter_for_coding_agents_needs_a_pause(spoken, typed, enter):
+    assert DM.strip_enter(spoken, strict=True) == (typed, enter)

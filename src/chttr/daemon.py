@@ -19,10 +19,11 @@ from pathlib import Path
 
 import numpy as np
 
-from . import commands, devmode
 from . import config as C
 from . import context as CX
+from . import devmode
 from . import polish as P
+from .commands import local_command
 from .config import Config, Mode
 from .dictionary import Dictionary
 from .feedback import Feedback
@@ -97,6 +98,7 @@ class Daemon:
         self.last_tap = 0.0
         self.atspi_misses = 0
         self.field: Future | None = None             # the focused text field, read at key press
+        self.field_stale = False                     # ...while an earlier dictation was still to be typed into it
         self.pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="chttr-context")
         self.offered: set[tuple[str, str]] = set()   # corrections already offered this session
         self._stop = threading.Event()
@@ -573,6 +575,7 @@ class Daemon:
         want_field = (self.cfg.polish.screen_context != "off" or self.cfg.history.learn_from_edits) \
             and self.atspi_misses < ATSPI_GIVE_UP
         self.field = self.pool.submit(self._read_field) if want_field and kind != COMMAND else None
+        self.field_stale = self.jobs > 0
         self.app, self.title, self.selection = app, title, selection
         self.heard_speech = False
         self.last_speech = time.monotonic()
@@ -612,7 +615,8 @@ class Daemon:
         self._restore_mute_state()
         self.feedback.play("stop")
         self.feedback.notify("Transcribing…", f"{secs:.1f}s of audio, peak {peak_db:.0f} dB", timeout_ms=0)
-        job = (seq, audio, secs, peak_db, self.kind, self.app, self.title, self.selection, captions, self.field)
+        job = (seq, audio, secs, peak_db, self.kind, self.app, self.title, self.selection, captions, self.field,
+               self.field_stale)
         self.field = None
         threading.Thread(target=self._process, args=job, daemon=True).start()
         return {"ok": True, "state": self.state, "seconds": round(secs, 1), "peak_db": round(peak_db, 1)}
@@ -645,7 +649,7 @@ class Daemon:
 
     def _process(self, seq: int, audio: np.ndarray, secs: float, peak_db: float, kind: str,
                  app: str, title: str, selection: str, captions: threading.Thread | Streamer | None,
-                 field_future: Future | None = None) -> None:
+                 field_future: Future | None = None, field_stale: bool = False) -> None:
         raw = text = ""
         method = ""
         mode: Mode | None = None
@@ -676,13 +680,13 @@ class Daemon:
                 log.info("dictionary: %r", fixed)
             mode = self.cfg.mode_for(app, title)
             if kind == COMMAND:
-                text = self._run_command(fixed, selection, app, title, mode, dictionary)
+                text = self._run_command(fixed, selection, app, title, mode, dictionary, seq)
                 if not text:
                     return
             else:
-                coded = devmode.transform(fixed, bool(mode and mode.is_code))
-                coded, enter_after = (devmode.strip_enter(coded) if (mode and mode.is_code and self.cfg.output.spoken_enter)
-                                      else (coded, False))
+                coded = devmode.transform(fixed, bool(mode and mode.is_code), prose=bool(mode and mode.name != "terminal"))
+                coded, enter_after = (devmode.strip_enter(coded, strict=mode.name != "terminal")
+                                      if (mode and mode.is_code and self.cfg.output.spoken_enter) else (coded, False))
                 keep = devmode.keep_list(fixed, coded)
                 if coded != fixed:
                     log.info("dev mode: %r", coded)
@@ -691,7 +695,8 @@ class Daemon:
                     if coded else ""        # it was only "run it": nothing to type, just Enter
                 text = dictionary.expand_snippets(text)
             ts_override = None
-            if kind != COMMAND and field is not None and self.cfg.polish.screen_context != "off":
+            # an earlier dictation typed after the field was read changed what is before the cursor
+            if kind != COMMAND and field is not None and not field_stale and self.cfg.polish.screen_context != "off":
                 text, ts_override = smart_join(field.before, field.after, text, dictionary.vocabulary + names,
                                                code=bool(mode and mode.is_code))
             self._wait_turn(seq)
@@ -703,6 +708,9 @@ class Daemon:
                              newline=(mode.newline if mode else "enter"))
             if enter_after and method in ("type", "paste"):
                 press_enter(0.2 if method == "paste" else 0.0)
+                if not text:            # it was only "run it"
+                    self.feedback.notify("Pressed Enter", "", timeout_ms=1500)
+                    return
             label = "Replaced" if kind == COMMAND and selection else "Typed"
             if self.cfg.history.learn_from_edits and kind != COMMAND and method in ("type", "paste"):
                 timer = threading.Timer(8.0, self._learn_from_edits, args=(text,))
@@ -827,13 +835,21 @@ class Daemon:
             return text
 
     def _run_command(self, instruction: str, selection: str, app: str, title: str,
-                     mode: Mode | None, dictionary: Dictionary) -> str:
+                     mode: Mode | None, dictionary: Dictionary, seq: int | None = None) -> str:
         if selection:
-            local = commands.local_command(instruction, selection)
-            if local == "" and not (mode and mode.in_terminal):     # "delete that"
+            # with a model at hand, only exact phrases: a near miss is the model's to read
+            local = local_command(instruction, selection, fuzzy=P.backend(self.cfg.polish) == "none")
+            if local == "" and mode and mode.in_terminal:          # "delete that"
+                self.feedback.notify("Can't delete in a terminal", "Terminals have no key that deletes a selection.",
+                                     timeout_ms=3000)
+                return ""
+            if local == "":
                 log.info("command handled locally: delete")
+                if seq is not None:
+                    self._wait_turn(seq)        # after the dictations before it have been typed
                 delete_selection()
-                self.feedback.notify("Deleted", f"{len(selection.split())} words", timeout_ms=2000)
+                n = len(selection.split())
+                self.feedback.notify("Deleted", f"{n} word{'s' if n != 1 else ''}", timeout_ms=2000)
                 return ""
             if local:
                 log.info("command handled locally")

@@ -11,7 +11,7 @@
 
 Anything else (and anything without a selection: writing new text) needs the
 cleanup model. Instructions are matched loosely: "um, can you make it all caps
-please." works, and so do small mis-hearings ("upper cases").
+please." works, and without a model so do small mis-hearings ("upper cases").
 """
 
 from __future__ import annotations
@@ -167,23 +167,36 @@ for _phrase, _fn in TRANSFORMS.items():
 _FUZZY = [k for k in _TABLE if len(k) >= 8]
 
 
-def match(instruction: str) -> str | None:
-    """The table phrase an instruction means, or None."""
+def _near(said: str, phrase: str) -> bool:
+    """A mis-hearing, not a different edit: as many words, each one nearly the same
+    ("upper cases" is "upper case"; "remove spaces" is not "remove whitespace")."""
+    a, b = said.split(), phrase.split()
+    return len(a) == len(b) and all(difflib.SequenceMatcher(None, x, y).ratio() >= 0.75 for x, y in zip(a, b, strict=True))
+
+
+def match(instruction: str, fuzzy: bool = True) -> str | None:
+    """The table phrase an instruction means, or None. `fuzzy` also accepts small
+    mis-hearings; with a model at hand chttr only takes exact phrases and leaves
+    the rest to it."""
     said = normalize(instruction)
     if not said:
         return None
     if said in _TABLE:
         return said
-    close = difflib.get_close_matches(said, _FUZZY, n=1, cutoff=0.8)
+    if not fuzzy:
+        return None
+    close = [c for c in difflib.get_close_matches(said, _FUZZY, n=3, cutoff=0.8) if _near(said, c)]
     return close[0] if close else None
 
 
-def local_command(instruction: str, selection: str) -> str | None:
+def local_command(instruction: str, selection: str, fuzzy: bool = True) -> str | None:
     """The selection transformed as instructed, "" to delete it, or None when the
-    instruction needs a model (or there is no selection: writing new text does)."""
+    instruction needs a model (or there is no selection: writing new text does).
+    Pass `fuzzy=False` when a model is configured: a near miss goes to the model
+    instead of becoming the wrong edit."""
     if not selection:
         return None
-    phrase = match(instruction)
+    phrase = match(instruction, fuzzy)
     if phrase is None:
         return None
     # the edit applies to the text; the whitespace around it (a selected line's newline) stays

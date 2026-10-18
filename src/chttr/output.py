@@ -144,7 +144,25 @@ _NO_SPACE_BEFORE = ",.;:!?)]}"
 _MID_SENTENCE = re.compile(r"[^\W\d_][\"'\u201d\u2019)]*[ \t]*$|[,;:][ \t]*$")
 _SENTENCE_END = re.compile(r"[.!?][\"'\u201d\u2019)\]]*\s*$")
 _QUOTES = "\"'\u201c\u201d\u2018\u2019`"
-_I_WORDS = {"i", "i'm", "i'll", "i've", "i'd"}
+# Words the recognizer capitalises only because they start its sentence. Anything
+# else keeps its capital mid-sentence: it may be a name (Monday, Priyanka, Will).
+_STARTER_WORDS = """
+a an the this that these those there here it its it's that's there's what's
+and but or so then also plus yet nor because since though although while if unless until when whenever
+where wherever which who whom whose what why how whether as than like
+we you they he she me us them him her his hers my our your their mine ours yours theirs one
+we're we'll we've we'd you're you'll you've you'd they're they'll they've they'd he's he'll she's she'll
+let's let is are was were be been being am do does did don't doesn't didn't have has had having
+can can't could couldn't would wouldn't should shouldn't must might won't isn't aren't wasn't weren't
+not no yes yeah yep nope ok okay sure thanks thank please sorry hi hey hello well oh dear good great nice
+now today tonight tomorrow yesterday soon later then again already still just only even maybe perhaps
+probably definitely actually really very quite too either neither both all any some each every
+everyone everything everybody someone something somebody anyone anything anybody nothing nobody none
+more most less least much many few other another such same next last first second after before
+to of in on at by for with from into onto about over under around through between without within
+otherwise however therefore instead meanwhile anyway besides hopefully unfortunately luckily basically
+"""
+_STARTERS = frozenset(_STARTER_WORDS.split())
 
 
 def _first_word(text: str) -> str:
@@ -164,11 +182,12 @@ def _in_vocabulary(text: str, vocabulary: list[str]) -> bool:
 
 def _keeps_capital(text: str, vocabulary: list[str]) -> bool:
     """A capital at the start of `text` that is not just the start of a sentence:
-    I, I'm, ...; an acronym or a mixed-case name (NASA, McAllister); a quote; one of your words."""
+    anything but a common sentence opener ("The", "Tomorrow", "We"), so names, days
+    and months (Priyanka, Monday) stay; and one of your words, an acronym or a quote."""
     word = _first_word(text)
     if not word or text.lstrip()[:1] in _QUOTES:
         return True
-    if word.replace("\u2019", "'").lower() in _I_WORDS or sum(c.isupper() for c in word) >= 2:
+    if word.replace("\u2019", "'").lower() not in _STARTERS or sum(c.isupper() for c in word) >= 2:
         return True
     return _in_vocabulary(text, vocabulary)
 

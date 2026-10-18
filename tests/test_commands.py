@@ -49,6 +49,17 @@ def test_anything_else_needs_a_model(instruction):
     assert CM.local_command(instruction, "some selected text") is None
 
 
+@pytest.mark.parametrize("instruction", ["remove spaces", "remove empty spaces", "remove the spaces"])
+def test_a_different_edit_is_not_a_mis_hearing(instruction):
+    assert CM.local_command(instruction, "a  b\n\nc") is None
+
+
+def test_with_a_model_only_exact_phrases_are_done_locally():
+    assert CM.local_command("upper case", "hi", fuzzy=False) == "HI"
+    assert CM.local_command("Please make it upper case.", "hi", fuzzy=False) == "HI"
+    assert CM.local_command("upper cases", "hi", fuzzy=False) is None       # the model reads it
+
+
 def test_writing_new_text_needs_a_model():
     assert CM.local_command("upper case", "") is None
 
