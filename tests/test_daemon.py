@@ -1780,3 +1780,10 @@ def test_a_reload_updates_the_bar_at_once(daemon, monkeypatch, tmp_path):
     path.write_text('[hotkeys]\ndictate = "F9"\n', encoding="utf-8")
     assert daemon.handle("reload")["ok"] is True
     assert json.loads(C.STATE_JSON.read_text(encoding="utf-8"))["hotkeys"]["dictate"] == "F9"
+
+
+def test_a_prompt_to_a_coding_agent_keeps_its_full_stop_without_a_model(daemon, monkeypatch):
+    monkeypatch.setattr(Dm, "focused_window", lambda: ("com.mitchellh.ghostty", "✳ Fix the parser tests"))
+    assert daemon.cfg.mode_for(*Dm.focused_window()).name == "agent"
+    assert dictate(daemon, "um check the parser and run pytest dash dash verbose period") \
+        == "Check the parser and run pytest --verbose."

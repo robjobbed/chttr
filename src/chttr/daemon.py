@@ -1278,7 +1278,9 @@ class Daemon:
     def _polish(self, text: str, app: str, title: str, mode: Mode | None, dictionary: Dictionary,
                 keep: list[str] | None = None, names: list[str] | None = None, screen_text: str = "") -> str:
         level = self.cfg.polish.level
-        code, chat = bool(mode and mode.is_code), bool(mode and mode.name == "chat")
+        # A coding agent's prompt is prose (sentences, a full stop), though it runs in a terminal.
+        code = bool(mode and mode.is_code and mode.name != "agent")
+        chat = bool(mode and mode.name == "chat")
         # Line breaks are folded only where typing one would send the message.
         fold = chat and getattr(mode, "newline", "enter") != "shift+enter"
         if (mode and not mode.polish) or level == "none":
