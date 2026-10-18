@@ -143,7 +143,7 @@ update. **Arch** users can also build `packaging/aur/chttr-git/PKGBUILD`.
 Either way, setup:
 
 1. installs the `chttr` command with [uv](https://docs.astral.sh/uv/) (your
-   Python if it is 3.12+; on Arch-based systems uv's own copy, so a pacman
+   Python if it is 3.12 to 3.14; on Arch-based systems uv's own copy, so a pacman
    update can't break it) from a git checkout, so updates are a `git pull` away,
 2. downloads the speech model (Parakeet, ~670 MB, skipped if Omarchy's voxtype
    already has it; resumes after a dropped connection) and the meeting models

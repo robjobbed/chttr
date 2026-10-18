@@ -222,7 +222,7 @@ bar, overlay and notifications that tell you what is going on.
 - Model downloads continue after a dropped connection, retry with backoff, and
   show a progress bar with speed and ETA. They check for free disk space first
   and run while the Python packages install.
-- The installer uses your system Python when it is 3.12 or newer, instead of
+- The installer uses your system Python when it is 3.12 to 3.14 (onnxruntime has no wheels for 3.15 yet), instead of
   always downloading one. On Arch-based systems it keeps uv's own copy of
   Python, so a pacman update of python can't break chttr (set
   `UV_PYTHON_PREFERENCE=system` to use the system one anyway). It also checks

@@ -26,10 +26,11 @@ if [[ -f $config ]] && grep -Eq '^[[:space:]]*name[[:space:]]*=[[:space:]]*"whis
   extra=(--with pywhispercpp)
 fi
 
-# Python: the system's own when it is 3.12 or newer (nothing to download), else a uv-managed 3.13.
+# Python: the system's own when it is 3.12 to 3.14 (nothing to download), else a uv-managed 3.13.
+# 3.15 is too new: onnxruntime, which runs the speech model, has no wheels for it yet.
 sys_py="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || true)"
 py="${CHTTR_PYTHON:-$sys_py}"
-[[ $py =~ ^3\.([0-9]+)(\.[0-9]+)?$ ]] && ((BASH_REMATCH[1] >= 12)) || py=3.13
+[[ $py =~ ^3\.([0-9]+)(\.[0-9]+)?$ ]] && ((BASH_REMATCH[1] >= 12)) && { [[ -n ${CHTTR_PYTHON:-} ]] || ((BASH_REMATCH[1] <= 14)); } || py=3.13
 
 # Arch-family systems move python3 to the next minor version in an ordinary update, which
 # would leave chttr's environment (and chttr.service) broken until setup ran again, so

@@ -87,14 +87,15 @@ else
   git clone --quiet --depth 1 "$repo" "$src"
 fi
 
-# Python: the system's own when it is 3.12 or newer (nothing to download), else a uv-managed 3.13.
+# Python: the system's own when it is 3.12 to 3.14 (nothing to download), else a uv-managed 3.13.
+# 3.15 is too new: onnxruntime, which runs the speech model, has no wheels for it yet.
 sys_py="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || true)"
 py="${CHTTR_PYTHON:-$sys_py}"
-[[ $py =~ ^3\.([0-9]+)(\.[0-9]+)?$ ]] && ((BASH_REMATCH[1] >= 12)) || py=3.13
+[[ $py =~ ^3\.([0-9]+)(\.[0-9]+)?$ ]] && ((BASH_REMATCH[1] >= 12)) && { [[ -n ${CHTTR_PYTHON:-} ]] || ((BASH_REMATCH[1] <= 14)); } || py=3.13
 # (bin/setup chooses with the same lines; CHTTR_PYTHON=3.14 picks one yourself)
 if [[ -z ${CHTTR_PYTHON:-} && $py != "$sys_py" ]]; then
   if [[ -n $sys_py ]]; then
-    echo "Your python3 is $sys_py and chttr needs 3.12 or newer, so uv fetches its own Python 3.13 for chttr."
+    echo "Your python3 is $sys_py and chttr needs 3.12 to 3.14, so uv fetches its own Python 3.13 for chttr."
   else
     echo "No python3 found, so uv fetches its own Python 3.13 for chttr."
   fi

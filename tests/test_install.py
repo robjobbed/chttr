@@ -321,7 +321,7 @@ ROOT = install.Path(__file__).resolve().parents[1]
 PY_SNIPPET = [
     """sys_py="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || true)\"""",
     'py="${CHTTR_PYTHON:-$sys_py}"',
-    "[[ $py =~ ^3\\.([0-9]+)(\\.[0-9]+)?$ ]] && ((BASH_REMATCH[1] >= 12)) || py=3.13",
+    "[[ $py =~ ^3\\.([0-9]+)(\\.[0-9]+)?$ ]] && ((BASH_REMATCH[1] >= 12)) && { [[ -n ${CHTTR_PYTHON:-} ]] || ((BASH_REMATCH[1] <= 14)); } || py=3.13",
 ]
 
 
@@ -367,6 +367,7 @@ def test_installer_scripts_parse_and_share_the_python_choice(script):
 @pytest.mark.parametrize(("system", "override", "expected"), [
     ("3.14", "", "3.14"), ("3.12", "", "3.12"), ("3.11", "", "3.13"), (None, "", "3.13"),
     ("3.14", "3.13", "3.13"), ("3.14", "3.10", "3.13"),
+    ("3.15", "", "3.13"), ("3.15", "3.15", "3.15"),     # no onnxruntime wheels for 3.15 yet, unless you ask for it
 ])
 def test_python_choice(tmp_path, system, override, expected):
     env, _ = _stubs(tmp_path, system)
@@ -385,7 +386,8 @@ def _install_sh_python_block() -> str:
 
 @pytest.mark.parametrize(("system", "override", "notice"), [
     ("3.13", "", ""), ("3.14", "", ""), ("3.14", "3.13", ""),
-    ("3.11", "", "Your python3 is 3.11 and chttr needs 3.12 or newer, so uv fetches its own Python 3.13 for chttr."),
+    ("3.11", "", "Your python3 is 3.11 and chttr needs 3.12 to 3.14, so uv fetches its own Python 3.13 for chttr."),
+    ("3.15", "", "Your python3 is 3.15 and chttr needs 3.12 to 3.14, so uv fetches its own Python 3.13 for chttr."),
     (None, "", "No python3 found, so uv fetches its own Python 3.13 for chttr."),
 ])
 def test_install_sh_says_when_uv_fetches_a_python(tmp_path, system, override, notice):
