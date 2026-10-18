@@ -179,8 +179,12 @@ def cmd_connect(args: argparse.Namespace) -> int:
     from . import apikey, vault
     from . import integrations as I
 
-    if args.service == "claude":
+    try:
         cfg = C.load_config()
+    except ValueError as exc:
+        print(f"config.toml: {exc}; using the default key file", file=sys.stderr)
+        cfg = C.Config(modes=C._default_modes())
+    if args.service == "claude":
         if not args.remove:
             return 0 if apikey.connect_interactive(cfg) else 1
         if apikey.remove(cfg):
@@ -198,10 +202,7 @@ def cmd_connect(args: argparse.Namespace) -> int:
         print(f"disconnected {args.service}" if vault.remove(args.service) else f"{args.service} wasn't connected")
         return 0
     if args.service is None:
-        try:
-            print(f"  {'Claude':8} {apikey.status(C.load_config())}")
-        except ValueError:
-            print(f"  {'Claude':8} {apikey.status(C.Config())}")
+        print(f"  {'Claude':8} {apikey.status(cfg)}")
         for d in I.DESTINATIONS:
             print(f"  {I.label(d):8} {'connected' if vault.load(d) else '-'}")
         print("\nsecrets: " + ("desktop keyring (secret-tool)" if vault.keyring_available()

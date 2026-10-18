@@ -186,7 +186,7 @@ def download(spec: ModelFile, dest: Path, progress: Callable[..., None] | None =
                         if report:
                             report(done, spec.size, rate(done))
             if done < spec.size:
-                raise ConnectionError(f"the connection closed after {done} of {spec.size} bytes")
+                raise ConnectionError(f"the connection dropped at {_amounts(done, spec.size)}")
         except Exception as exc:
             if isinstance(exc, urllib.error.HTTPError) and exc.code == 416:   # our .part is no use to the server
                 tmp.unlink(missing_ok=True)
@@ -200,7 +200,11 @@ def download(spec: ModelFile, dest: Path, progress: Callable[..., None] | None =
                               "run it again to continue where it stopped") from exc
             delay = RETRY_DELAYS[retries]
             retries += 1
-            log.warning("%s: %s; retrying in %d s", spec.name, _reason(exc), delay)
+            if hasattr(progress, "retrying"):           # a console bar: say it on its own line
+                progress.retrying(f"{_reason(exc)}; retrying in {delay} s")
+                log.info("%s: %s; retrying in %d s", spec.name, _reason(exc), delay)
+            else:
+                log.warning("%s: %s; retrying in %d s", spec.name, _reason(exc), delay)
             _sleep(delay)
     if done != spec.size or h.hexdigest() != spec.sha256:
         tmp.unlink(missing_ok=True)
@@ -214,7 +218,9 @@ def _reason(exc: BaseException) -> str:
     if isinstance(exc, urllib.error.HTTPError):
         return f"HTTP {exc.code}"
     if isinstance(exc, urllib.error.URLError):
-        return str(exc.reason)
+        return _reason(exc.reason) if isinstance(exc.reason, BaseException) else str(exc.reason)
+    if isinstance(exc, OSError) and exc.strerror:
+        return exc.strerror
     return str(exc) or type(exc).__name__
 
 
@@ -276,6 +282,12 @@ def console_progress(name: str, stream=None) -> Callable[[int, int, float], None
         out.write(("\r" + line + "\033[K" if tty else line) + ("\n" if finished else ""))
         out.flush()
 
+    def retrying(message: str) -> None:
+        out.write(("\n" if tty and last[1] >= 0 else "") + f"    {name}: {message}\n")
+        out.flush()
+        last[0] = 0.0                       # redraw the bar on the next chunk
+
+    show.retrying = retrying
     return show
 
 

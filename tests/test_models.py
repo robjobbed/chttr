@@ -277,3 +277,16 @@ def test_running_models_py_reports_a_failure_in_one_line(tmp_path, monkeypatch, 
     assert _run_models_py(tmp_path, monkeypatch, forbidden) == 1
     err = capsys.readouterr().err.strip()
     assert err.startswith("chttr: model download failed:") and "\n" not in err
+
+
+def test_a_retry_is_reported_on_its_own_line_under_the_bar(tmp_path, monkeypatch, slept):
+    class Tty(io.StringIO):
+        def isatty(self):
+            return True
+
+    data = b"0123456789" * 3
+    monkeypatch.setattr(M.urllib.request, "urlopen", RangeServer(data, chunk=4, failures=1))
+    out = Tty()
+    M.download(spec_for(data), tmp_path / "model.onnx", M.console_progress("model.onnx", out))
+    assert "\n    model.onnx: Connection reset by peer; retrying in 1 s\n" in out.getvalue()
+    assert out.getvalue().endswith("100%  1/1 KB\x1b[K\n")
