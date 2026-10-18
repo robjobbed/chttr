@@ -21,7 +21,7 @@ import numpy as np
 
 from . import config as C
 from . import context as CX
-from . import devmode, levels
+from . import devmode, levels, tidy
 from . import polish as P
 from .config import Config, Mode
 from .dictionary import Dictionary
@@ -66,6 +66,7 @@ class Daemon:
         self.recorder = Recorder(cfg.audio.device, on_level=self._on_level)
         self.transcriber = Transcriber(cfg)
         self.polish_warned = False
+        P.breaker.on_recover = lambda: setattr(self, "polish_warned", False)
         self.overlay: subprocess.Popen | None = None
         self.overlay_lock = threading.Lock()
         self.overlay_warned = False
@@ -644,7 +645,9 @@ class Daemon:
     def _wait_turn(self, seq: int) -> None:
         """Block until every earlier dictation has been delivered (or given up)."""
         with self.delivery:
-            self.delivery.wait_for(lambda: self.next_delivery >= seq, timeout=60)
+            # an earlier dictation may still be cleaning up (twice the budget on Ollama) or typing
+            self.delivery.wait_for(lambda: self.next_delivery >= seq,
+                                   timeout=max(60, 2 * (self.cfg.polish.cleanup_timeout_seconds + 10)))
 
     def _done_turn(self, seq: int) -> None:
         with self.delivery:
@@ -812,30 +815,62 @@ class Daemon:
 
     def _polish(self, text: str, app: str, title: str, mode: Mode | None, dictionary: Dictionary,
                 keep: list[str] | None = None, names: list[str] | None = None, screen_text: str = "") -> str:
-        if (mode and not mode.polish) or self.cfg.polish.level == "none":
+        level = self.cfg.polish.level
+        code, chat = bool(mode and mode.is_code), bool(mode and mode.name == "chat")
+        # Line breaks are folded only where typing one would send the message.
+        fold = chat and getattr(mode, "newline", "enter") != "shift+enter"
+        if (mode and not mode.polish) or level == "none":
             return text
+        # Fillers, stutters, spacing and the terminal's trailing period go first, so
+        # "um git status" takes the quick path.
+        text = tidy.tidy(text, "light", code=code, chat=chat, fold_newlines=fold)
         if P.quick_path(text, self.cfg.polish.quick_max_words):
-            # Nothing for a model to fix. Terminals and editors still get no trailing period.
-            if mode and mode.trailing_space is False and text.endswith(".") and not text.endswith(".."):
-                text = text[:-1]
             log.info("short and clean; typed without a model round trip")
             return text
-        if P.backend(self.cfg.polish) == "none":
-            return text
+        which = P.backend(self.cfg.polish)
+        if which == "none":
+            out = tidy.tidy(text, level, code=code, chat=chat, fold_newlines=fold)
+            self._hint_cleanup_off(text)
+            return out
         try:
             t1 = time.monotonic()
             vocabulary = dictionary.vocabulary + (names or [] if self.cfg.polish.screen_context in ("names", "full") else [])
             out = P.polish(text, self.cfg.polish, app, title, vocabulary, style=mode.style if mode else "",
                            keep=list(dictionary.snippets) + (keep or []), screen_text=screen_text)
-            log.info("polish (%s) %.2fs: %r", mode.name if mode else "default", time.monotonic() - t1, out)
+            out = tidy.for_app(out, code=code, chat=chat, fold_newlines=fold)   # a stray trailing period in a terminal
+            self.polish_warned = False                         # it works: the next failure is news
+            log.info("polish (%s) %.2fs: %d words", mode.name if mode else "default", time.monotonic() - t1,
+                     len(out.split()))
+            log.debug("polished: %r", out)
             return out
-        except Exception as exc:  # noqa: BLE001 - any failure falls back to raw text
-            log.warning("polish failed, using raw transcript: %s", exc)
+        except Exception as exc:  # noqa: BLE001 - any failure falls back to local cleanup
+            log.warning("polish failed (%s); local cleanup instead", exc)
             if not self.polish_warned:
                 self.polish_warned = True
-                self.feedback.notify("chttr: cleanup unavailable", f"{type(exc).__name__}: {str(exc)[:160]}",
-                                     urgency="normal", timeout_ms=8000)
-            return text
+                if P.breaker.open:
+                    self.feedback.notify("Cleanup offline", "Typing locally cleaned text until "
+                                         f"{'Claude' if which == 'claude' else 'Ollama'} answers again.",
+                                         urgency="normal", timeout_ms=8000)
+                else:
+                    why = str(exc) if isinstance(exc, P.PolishUnavailable) else f"{type(exc).__name__}: {exc}"
+                    self.feedback.notify("chttr: cleanup unavailable", why[:160],
+                                         urgency="normal", timeout_ms=8000)
+            return tidy.tidy(text, level, code=code, chat=chat, fold_newlines=fold)
+
+    def _hint_cleanup_off(self, text: str) -> None:
+        """Once per install: say that cleanup runs locally and how to get Claude's
+        (unless you chose backend = "none" yourself)."""
+        flag = C.DATA_DIR / "hinted-cleanup"
+        if self.cfg.polish.backend == "none" or len(text.split()) <= self.cfg.polish.quick_max_words \
+                or flag.exists():
+            return
+        self.feedback.notify("Cleaning up locally", "Fillers and spoken punctuation are handled on this machine. "
+                             "For Claude cleanup, run: chttr connect claude", timeout_ms=10000)
+        try:
+            C.ensure_data_dir()
+            flag.touch()
+        except OSError as exc:
+            log.debug("could not write %s: %s", flag, exc)
 
     def _run_command(self, instruction: str, selection: str, app: str, title: str,
                      mode: Mode | None, dictionary: Dictionary) -> str:

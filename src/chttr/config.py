@@ -104,7 +104,8 @@ typer = "auto"
 # Wispr Flow-style cleanup: fillers removed, punctuation fixed, self-corrections
 # applied, formatting adapted to the focused app. Also powers command mode.
 # backend: "auto"   - Claude if a key is available, else Ollama if it is
-#                     running, else no cleanup
+#                     running, else local cleanup on this machine (fillers,
+#                     spoken punctuation, capitals; no model)
 #          "claude" | "ollama" | "none"
 backend = "auto"
 # Dictation cleanup and command mode. Haiku answers in a few hundred milliseconds,
@@ -114,6 +115,8 @@ cleanup_model = "claude-haiku-5-5"
 model = "claude-opus-5-5"
 effort = "low"
 timeout_seconds = 20
+# Dictation cleanup waits at most this long for the model; then the locally cleaned text is typed.
+cleanup_timeout_seconds = 5
 # Short phrases with no fillers, self-corrections or spoken punctuation ("git
 # status", "sounds good") are typed as recognized, without a model round trip.
 # The longest phrase that can skip cleanup, in words; 0 sends everything.
@@ -134,7 +137,8 @@ screen_context = "local"
 # Optional: file containing an Anthropic API key (chmod 600). Used when
 # ANTHROPIC_API_KEY is not in the daemon's environment.
 api_key_file = "~/.config/chttr/anthropic-api-key"
-# Local alternative (fully offline): https://ollama.com, e.g. `ollama pull llama3.2`
+# Local alternative (fully offline): https://ollama.com, e.g. `ollama pull llama3.2`.
+# qwen2.5:1.5b is fast on a CPU laptop; llama3.2 is more accurate.
 ollama_model = "llama3.2"
 ollama_url = "http://127.0.0.1:11434"
 # Tell the model which app is focused (its window class, e.g. "Slack") so it can
@@ -320,6 +324,7 @@ class PolishCfg:
     model: str = "claude-opus-5-5"
     effort: str = "low"
     timeout_seconds: float = 20
+    cleanup_timeout_seconds: float = 5
     quick_max_words: int = 4
     level: str = "medium"
     screen_context: str = "local"
