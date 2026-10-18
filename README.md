@@ -11,8 +11,9 @@ text appears in whatever app has focus. Take a call in Zoom, Teams or Meet: get
 notes with a name on every line, no bot in the call. Then ask your meetings
 questions, from the terminal or from Claude Code.
 
-Speech recognition runs on your machine. Claude (optional) does the cleanup and
-writes the notes. Everything lands in plain files you own.
+Speech recognition runs on your machine. Claude (optional) does the best
+cleanup and notes; without a key, chttr cleans up your text and writes meeting
+notes on your machine. Everything lands in plain files you own.
 
 ```text
 you say:   "um so send the contract to Sorov by Tuesday, no, Friday"
@@ -21,9 +22,9 @@ it types:  Send the contract to Sohrab by Friday.
 
 ![The meeting library: searching every meeting for "forty five" jumps to the moment it was said](docs/img/library.png)
 
-> **1.0 release candidate, used daily on an Omarchy laptop.** 250+ tests and
-> real-model benchmarks run in CI on every change; GNOME and KDE support is new
-> and would love your reports. Issues and fixes welcome:
+> **1.1, used daily on an Omarchy laptop.** 1,500 tests and real-model
+> benchmarks run in CI on every change; GNOME and KDE support is new and would
+> love your reports. Issues and fixes welcome:
 > [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## What you get
@@ -37,12 +38,22 @@ it types:  Send the contract to Sohrab by Friday.
 - **Cleanup that reads like you typed it.** Fillers out, punctuation in,
   "Tuesday, no, Friday" becomes "Friday", spoken formatting honoured. Claude
   Haiku, or Ollama for fully offline use, at four levels from `light` to `high`.
+  With neither, local rules still remove fillers and turn "comma" and "new
+  line" into punctuation; they also take over whenever the model is slow or
+  unreachable, so you never wait more than 5 s.
 - **It knows where you are.** Terminals get one plain line, editors keep
-  identifiers, chat stays casual, email gets sentences. Names on screen near the
-  cursor fix sound-alike names. Correct a name once and it offers to remember it.
+  identifiers, chat stays casual (line breaks never send the message), email
+  gets sentences, and Gmail, Docs or Slack in a browser tab count too. A new
+  dictation fits the sentence already before the cursor. Names on screen near
+  the cursor fix sound-alike names. Correct a name once and it offers to
+  remember it.
 - **Developer dictation.** "camel case user id" types `userId`; in editors and
-  terminals "at src slash app dot ts" types `@src/app.ts` for Claude Code,
-  Cursor and Aider.
+  terminals "at src slash app dot ts" types `@src/app.ts`, "dash dash verbose"
+  types `--verbose`, and ending with "run it" presses Enter. Prompts to Claude
+  Code, Codex and Aider stay sentences.
+- **Quiet mics just work.** The speech threshold follows your room and your
+  voice, and the waveform pill (in your Omarchy theme's colours) shows
+  listening, transcribing and done.
 - **Command mode, hands-free, whisper mode.** Select text and say "make this
   shorter"; double-tap for hands-free; dictate quietly in an open office.
 
@@ -55,11 +66,14 @@ it types:  Send the contract to Sohrab by Friday.
   Meet's captions, voices it has heard before, your calendar invite, and Claude
   reading the conversation. People in the room with you get their own label.
 - **Notes your way.** 18 styles (general, sales BANT/MEDDPICC, 1:1, standup,
-  interview, retro, ...) or your own, switchable after the call. Markdown files
-  in `~/Documents/Meetings`.
+  interview, retro, ...) or your own, switchable after the call, from Claude or
+  Ollama; on-device notes with no model at all. Markdown files in
+  `~/Documents/Meetings`.
+- **A brief before the next one.** Five minutes before a calendar meeting,
+  what you agreed with those people last time and what's still open.
 - **Ask your meetings.** `chttr ask "what did Dana commit to last month?"`
   answers with citations to the moment; `chttr mcp` gives Claude Code the same
-  tools; `chttr ui` is a searchable library in your browser.
+  tools; `chttr ui` is your dictations and meetings in the browser.
 - **Send them on.** Slack, Notion, HubSpot or a webhook, one click after the
   call (never without it, unless you say so).
 
@@ -74,14 +88,17 @@ it types:  Send the contract to Sohrab by Friday.
 Time from releasing the key to recognized text, measured by `chttr bench` on the
 same recordings (synthesized speech, so word error rates are only a smoke test):
 
-| Recording | Full pass over the recording | With streaming (after release) |
+| Recording | Full pass over the recording | With streaming (`tail`) |
 |---|---:|---:|
 | 11 s email, GitHub runner (4 vCPU) | 774 ms | **264 ms** |
 | 18 s notes, GitHub runner (4 vCPU) | 1307 ms | **617 ms** |
 | 19 s notes, desktop CPU | 708 ms | **334 ms** |
 
-Cleanup with Claude Haiku adds a few hundred milliseconds; short phrases with
-nothing to fix skip it. The [Benchmark workflow](https://github.com/robjobbed/chttr/actions/workflows/bench.yml)
+The streaming figure is a quick release 0.2 s after the last word. Letting go
+in the pause after it is faster still: chttr reuses the recognition pass that
+already ran in that pause, so a short dictation appears at once (`chttr bench`
+reports this as `release`, next to `tail`). Cleanup with Claude Haiku adds a
+few hundred milliseconds; short phrases with nothing to fix skip it. The [Benchmark workflow](https://github.com/robjobbed/chttr/actions/workflows/bench.yml)
 re-measures on every change to `main`; run `chttr bench your.wav` on your machine.
 
 ## How it compares
@@ -92,7 +109,7 @@ As of October 2026, from each product's own documentation:
 |---|---|---|---|---|---|
 | Runs on Linux | ✓ | ✗ (Mac, Windows, iOS, Android) | Bot only | ✓ | Build from source |
 | Speech recognized on your machine | ✓ | ✗ | ✗ | ✓ | ✓ |
-| LLM cleanup of dictation | ✓ (Claude or Ollama) | ✓ | – | – | – |
+| LLM cleanup of dictation | ✓ (Claude or Ollama; local rules without) | ✓ | – | – | – |
 | Meeting notes without a bot | ✓ | Notetaker (Mac, Windows) | Mac app | – | ✓ |
 | Speaker names | ✓ (captions, voices, calendar) | – | ✓ | – | Planned |
 | Ask across all meetings | ✓ (`chttr ask`, MCP) | – | ✓ (Team plans) | – | Planned |
@@ -125,20 +142,31 @@ update. **Arch** users can also build `packaging/aur/chttr-git/PKGBUILD`.
 
 Either way, setup:
 
-1. installs the `chttr` command with [uv](https://docs.astral.sh/uv/) (Python
-   3.12+) from a git checkout, so updates are a `git pull` away,
+1. installs the `chttr` command with [uv](https://docs.astral.sh/uv/) (your
+   Python if it is 3.12+; on Arch-based systems uv's own copy, so a pacman
+   update can't break it) from a git checkout, so updates are a `git pull` away,
 2. downloads the speech model (Parakeet, ~670 MB, skipped if Omarchy's voxtype
-   already has it) and the meeting models (~29 MB), checksum-verified,
+   already has it; resumes after a dropped connection) and the meeting models
+   (~29 MB), checksum-verified,
 3. sets up the hotkeys for your desktop (below),
-4. registers the Google Meet extension with Chromium, Chrome, Brave, Vivaldi or Edge,
-5. starts the daemon as a systemd user service (`chttr.service`).
+4. registers the Google Meet extension with Chromium, Chrome, Brave, Vivaldi or
+   Edge, and turns on the accessibility switches screen context reads apps with,
+5. offers to add a Claude key, if you're at a terminal and have none,
+6. starts the daemon as a systemd user service (`chttr.service`), waits until it
+   answers, and ends with a card of the shortcuts that are really bound.
 
 Run it again any time (`bin/setup --no-keybindings --no-meet --no-service` skips
 parts), and check everything with:
 
 ```bash
 chttr doctor                     # desktop, typing, hotkeys, engine, cleanup, daemon, calendar, Meet
+chttr doctor --fix               # run the fixes that need no sudo, then check again
+chttr keys                       # the shortcuts bound right now
 ```
+
+`chttr uninstall` takes out the service, key bindings and Meet extension again,
+restoring each file as it was; `--purge` also deletes chttr's data and settings
+(never your meeting notes).
 
 ### Desktop support
 
@@ -168,23 +196,29 @@ that it lands on the clipboard with a notification.
 | **Super+Shift+Insert** | Dictation history |
 | **Super+Alt+Insert** | Start / stop recording a meeting |
 
-The bar widget: left click opens chttr's menu (record a meeting, last notes,
-history, stats, settings), right click starts or stops a meeting recording.
+The bar widget shows what chttr is doing: a slashed microphone when it's off
+(click to start it), an hourglass while the model loads or it transcribes, a
+red dot and timer during a meeting, a small dot when cleanup is off. Left click
+opens chttr's menu (record a meeting, last notes, history, the meeting library,
+settings), right click starts or stops a meeting recording.
 
 ### Claude cleanup
 
-Claude gives the best cleanup and is what writes meeting notes. Put an
-Anthropic API key in a file (read on each use):
+Claude gives the best cleanup and meeting notes. Add an Anthropic API key
+(checked with Anthropic, stored readable only by you):
 
 ```bash
-install -m 600 /dev/null ~/.config/chttr/anthropic-api-key
-echo 'sk-ant-...' > ~/.config/chttr/anthropic-api-key
+chttr connect claude             # paste the key; --remove takes it out again
 ```
 
-Fully offline: install [Ollama](https://ollama.com), `ollama pull llama3.2`, and
-leave `polish.backend = "auto"`; chttr uses Claude when a key is present, else
-Ollama when it is running, else no cleanup. Command mode needs one of the two.
-Meeting notes use the same choice; with neither, you get on-device notes.
+Fully offline: install [Ollama](https://ollama.com), `ollama pull qwen2.5:1.5b`
+(fast on a laptop CPU; set `[polish] ollama_model`), and leave
+`polish.backend = "auto"`, or pick "Use Ollama for cleanup" in the chttr menu.
+chttr uses Claude when a key is present, else Ollama when it is running, else
+local rules (fillers, spoken punctuation, capitals; no model). Command mode's
+common edits (sort lines, title case, bullet list, "delete that" and more) work
+without a model; anything else needs one of the two. Meeting notes use the same
+choice; with neither, you get on-device notes.
 
 System tools used: `pw-record`/`pw-play` (PipeWire) and `notify-send` everywhere;
 `wl-copy`/`wl-paste` on Wayland or `xclip`/`xsel` on X11; a typing tool from the
@@ -321,11 +355,15 @@ Then ask Claude Code things like "check my meetings for what we decided about
 the API rate limits" while you work. Read-only: `search_meetings`,
 `read_transcript`, `get_notes`, `list_meetings`, `list_action_items`.
 
-**In the browser**, `chttr ui` opens the library: search with highlighted
-matches, notes and transcripts with clickable timestamps (synced to the audio
-when `keep_audio` kept it), click a speaker to rename them, switch the notes
-style, and every action item across meetings in one table. It listens on
-127.0.0.1 only, with a one-time token in the link.
+**In the browser**, `chttr ui` opens on a Home page (words dictated, time saved,
+your streak, recent meetings, what the daemon is doing) with tabs for your
+dictations (what chttr heard against what it typed), meetings, action items and
+Lingo. Search runs as you type (`speaker:`, `after:`, `before:` and `on:`
+filters); transcripts read as turns with follow-along audio when `keep_audio`
+kept it; click a speaker to rename them, switch the notes style, or export to
+Markdown, JSON or CSV. `chttr ui --open "<citation>"` jumps to a `chttr ask`
+citation. It follows your Omarchy theme, works from the keyboard (`?` lists the
+keys), and listens on 127.0.0.1 only, with a one-time token in the link.
 
 ### Send notes where your team works
 
@@ -431,6 +469,14 @@ caption selectors at the top of `content.js` are the place to look. It reads
 English UI labels first, with icon names and Meet's `jsname` attributes as
 fallbacks.
 
+**Before the next meeting.** Five minutes before a calendar event with other
+people, a notification shows what you agreed last time and the open action
+items, from your own notes only (`[meeting] brief_minutes`; 0 turns it off).
+During a call it only names the meeting, so nothing shows on a shared screen.
+`chttr brief` prints it any time, or for one meeting by title
+(`chttr brief standup`). If your calendar feed isn't named after your address,
+set `[meeting] email` so chttr knows which invitee is you.
+
 Recording laws differ: in many places everyone on a call has to agree to being
 recorded. Tell people.
 
@@ -448,14 +494,16 @@ recorded. Tell people.
 | `chttr fix [WRONG RIGHT]` | Learn a correction from the last dictation |
 | `chttr lingo` | Lingo in your browser: fix how words are spelled, from past dictations |
 | `chttr learn` / `forget` / `snippet` / `dictionary` | Edit the dictionary |
-| `chttr status [--follow] [--json]` | `idle` / `recording` / `transcribing`; `--json` matches the Omarchy bar indicator format |
+| `chttr status [--follow] [--json]` | `idle` / `recording` / `transcribing` / `loading` / `off`; `--json` matches the Omarchy bar indicator format |
 | `chttr transcribe file.wav [--raw] [--engine E] [-v]` | One-off transcription without the daemon |
 | `chttr bench FILE.wav… [--cleanup] [--format FORMAT]` | Time recognition (full pass vs. after release), cleanup, real-time factor; word error rate when FILE.txt exists; FORMAT is text, json or markdown |
-| `chttr polish [--app NAME]` | Clean up text from stdin |
-| `chttr doctor [--verify]` | Check engine, cleanup backend, daemon and key permissions; `--verify` hashes the models |
+| `chttr polish [--app NAME] [--local]` | Clean up text from stdin (`--local`: the local rules only) |
+| `chttr doctor [--verify] [--mic] [--fix] [--json]` | Check everything and name the fix; `--fix` runs the safe fixes, `--mic` records a test, `--verify` hashes the models |
 | `chttr reload` | Re-read config.toml (switching engines reloads the model) |
 | `chttr config` | Create and print the config file |
 | `chttr setup` | Models, service, keybindings, Meet extension (what `bin/setup` runs) |
+| `chttr keys` | The shortcuts bound right now, and what catches them |
+| `chttr uninstall [--purge]` | Remove what setup added; `--purge` also deletes data and settings |
 | `chttr menu` | The bar widget's menu |
 | `chttr meeting start` / `stop` / `toggle` / `cancel` / `status` | Record a meeting by hand |
 | `chttr meeting list` | Recorded meetings and their status |
@@ -466,11 +514,12 @@ recorded. Tell people.
 | `chttr meeting styles` | List note styles |
 | `chttr meeting voices [--forget KEY]` | Remembered voices |
 | `chttr meeting install` | Register the Meet extension and native host |
-| `chttr connect [slack\|notion\|hubspot\|webhook] [--remove]` | Connect a destination for meeting notes (no argument: list them) |
+| `chttr connect [claude\|slack\|notion\|hubspot\|webhook] [--remove]` | Add a Claude key, or a destination for meeting notes (no argument: list them) |
 | `chttr send [MEETING] [--to DEST] [-y]` | Send a meeting's notes to your connected destinations |
-| `chttr ask [-v] QUESTION` | Answer a question from your meetings, with citations |
+| `chttr ask [-v] [--local] QUESTION` | Answer a question from your meetings, with citations (`--local`: search only) |
+| `chttr brief [TITLE]` | What you agreed last time with the people in your next meeting |
 | `chttr mcp` | Your meetings as an MCP server for Claude Code / Claude Desktop |
-| `chttr ui [--port N] [--no-browser]` | The meeting library in your browser |
+| `chttr ui [--port N] [--no-browser] [--open CITATION]` | Your dictations and meetings in the browser |
 
 ## Config
 
@@ -505,7 +554,8 @@ flowchart LR
   F --> I[Slack, Notion, HubSpot, webhook]
 ```
 
-`daemon.py` owns a small state machine (`idle` → `recording` → `transcribing`),
+`daemon.py` owns a small state machine (`loading` while the model loads, then
+`idle` → `recording` → `transcribing`),
 listens on `$XDG_RUNTIME_DIR/chttr/chttr.sock`, and tracks what a recording is
 for (dictate, hands-free, command). `recorder.py` runs `pw-record` at 16 kHz
 mono and meters every 20 ms chunk; the daemon uses the levels for hands-free
@@ -517,12 +567,14 @@ which also feeds the overlay's live captions; after release only the audio
 since the last pause is recognized. A new dictation can start while the
 previous one is still being cleaned up, and results are typed in order.
 `transcriber.py` wraps Parakeet (onnx-asr) and whisper.cpp,
-trims silence and filters whisper's silence hallucinations. `polish.py` holds
-the cleanup and command prompts and talks to Claude or Ollama. `output.py`
+trims silence and filters whisper's silence hallucinations; `levels.py` fits the
+speech threshold to the room. `polish.py` holds
+the cleanup and command prompts and talks to Claude or Ollama, behind a short
+timeout and a breaker; `tidy.py` is the local cleanup. `output.py`
 reads the selection (Ctrl+C into an emptied clipboard, restored afterwards;
 the primary selection in terminals) and delivers text. `history.py` is the
 picker and stats. The state file at `$XDG_RUNTIME_DIR/chttr/state` is what
-`status --follow` watches.
+`status --follow` watches; `state.json` next to it is what the bar reads.
 
 The `meeting/` package is everything after the call: `recorder.py` captures
 the two channels, `pipeline.py` runs VAD, transcription, echo removal and
@@ -537,8 +589,9 @@ side. `BarWidget.qml` and `manifest.json` make the repo an Omarchy plugin.
 ## Development
 
 ```bash
-uv sync --group dev && uv run pytest     # 120+ tests, no models or audio devices needed
+uv sync --group dev && uv run pytest     # 1,500 tests, no models or audio devices needed
 uv run ruff check . && uv run pyright
+node --test tests/js                     # the meeting library's JavaScript
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the layout and guidelines,
