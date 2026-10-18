@@ -49,6 +49,8 @@ def cmd_send(args: argparse.Namespace) -> int:
         reply = send(args.command)
     except DaemonNotRunning as exc:
         print(exc, file=sys.stderr)
+        if args.command in ("start", "command", "toggle"):     # a key press: the binding discards stderr
+            _offline_notice()
         return 2
     if args.json:
         print(json.dumps(reply))
@@ -58,6 +60,53 @@ def cmd_send(args: argparse.Namespace) -> int:
     elif reply.get("message"):
         print(reply["message"])
     return 0
+
+
+def _offline_notice() -> None:
+    """A dictation key was pressed with no daemon: start the service and say so."""
+    import subprocess
+
+    from . import install
+
+    if not install.UNIT.exists():
+        install.notify("chttr is not running", "Run: chttr setup", urgency="normal", timeout_ms=6000)
+        return
+    try:
+        started = subprocess.run(["systemctl", "--user", "start", "chttr.service"], capture_output=True,
+                                 check=False).returncode == 0
+    except FileNotFoundError:
+        started = False
+    if started:
+        install.notify("chttr is starting", "Hold the key again in a few seconds.", urgency="normal", timeout_ms=6000)
+    else:
+        install.notify("chttr couldn't start", "See: journalctl --user -u chttr, or run chttr doctor",
+                       urgency="normal", timeout_ms=6000)
+
+
+def cmd_keys(args: argparse.Namespace) -> int:
+    """The shortcuts that really trigger chttr, and who catches them."""
+    from . import hotkeys as H
+    from .desktop import detect
+
+    try:
+        cfg = C.load_config()
+    except ValueError as exc:
+        print(f"config.toml: {exc}", file=sys.stderr)
+        cfg = C.Config(modes=C._default_modes())
+    desk = detect()
+    backend = H.resolve(cfg.hotkeys.backend, desk.compositor)
+    keys = H.effective_bindings(cfg, desk, backend=backend)
+    width = max([len(H.DESCRIPTIONS[a]) for a in keys] + [0])
+    for action, key in keys.items():
+        print(f"  {H.DESCRIPTIONS[action]:<{width}}   {key}")
+    _, source = H.compositor_bindings(desk.compositor) if backend == "compositor" else ({}, None)
+    print()
+    print({
+        "compositor": f"Bound in {source}." if source else "Bound by your compositor (chttr setup adds the bindings).",
+        "portal": "Registered with your desktop's shortcuts portal; change them in its keyboard settings.",
+        "evdev": f"chttr reads the keyboard directly; change them in [hotkeys] of {C.CONFIG_FILE}.",
+    }.get(backend, "Nothing catches the keys yet; see: chttr doctor"))
+    return 0 if keys else 1
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -122,17 +171,37 @@ def cmd_bench(args: argparse.Namespace) -> int:
 
 
 def cmd_connect(args: argparse.Namespace) -> int:
-    """Connect (or list / remove) a destination for meeting notes."""
+    """Connect (or list / remove) Claude or a destination for meeting notes."""
     import getpass
     import json as _json
+    import os
 
+    from . import apikey, vault
     from . import integrations as I
-    from . import vault
 
+    if args.service == "claude":
+        cfg = C.load_config()
+        if not args.remove:
+            return 0 if apikey.connect_interactive(cfg) else 1
+        if apikey.remove(cfg):
+            print(f"Claude disconnected (removed {apikey.path(cfg)}).")
+        else:
+            print(f"no Claude key file at {apikey.path(cfg)}")
+        if os.environ.get("ANTHROPIC_API_KEY"):
+            print("ANTHROPIC_API_KEY is still set in your environment; unset it to stop using Claude.")
+        try:
+            send("reload")
+        except (DaemonNotRunning, OSError, ValueError):
+            pass
+        return 0
     if args.remove:
         print(f"disconnected {args.service}" if vault.remove(args.service) else f"{args.service} wasn't connected")
         return 0
     if args.service is None:
+        try:
+            print(f"  {'Claude':8} {apikey.status(C.load_config())}")
+        except ValueError:
+            print(f"  {'Claude':8} {apikey.status(C.Config())}")
         for d in I.DESTINATIONS:
             print(f"  {I.label(d):8} {'connected' if vault.load(d) else '-'}")
         print("\nsecrets: " + ("desktop keyring (secret-tool)" if vault.keyring_available()
@@ -905,8 +974,9 @@ def build_parser() -> argparse.ArgumentParser:
     ak.add_argument("-v", "--verbose", action="store_true", help="show the searches Claude runs")
     ak.set_defaults(func=cmd_ask)
 
-    cn = sub.add_parser("connect", help="connect Slack, Notion, HubSpot or a webhook for meeting notes (no args: list)")
-    cn.add_argument("service", nargs="?", choices=["slack", "notion", "hubspot", "webhook"])
+    cn = sub.add_parser("connect", help="connect Claude (an API key), or Slack, Notion, HubSpot or a webhook for "
+                                        "meeting notes (no args: list)")
+    cn.add_argument("service", nargs="?", choices=["claude", "slack", "notion", "hubspot", "webhook"])
     cn.add_argument("--remove", action="store_true", help="disconnect it")
     cn.set_defaults(func=cmd_connect)
 
@@ -1023,6 +1093,9 @@ def build_parser() -> argparse.ArgumentParser:
     se.add_argument("--no-keybindings", action="store_true")
     se.add_argument("--no-meet", action="store_true", help="skip the Google Meet extension")
     se.set_defaults(func=cmd_setup)
+
+    ky = sub.add_parser("keys", help="show the shortcuts that are bound right now")
+    ky.set_defaults(func=cmd_keys)
 
     mn = sub.add_parser("menu", help="the bar widget's menu")
     mn.set_defaults(func=cmd_menu)
