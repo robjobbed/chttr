@@ -219,7 +219,11 @@ def no_daemon(monkeypatch, tmp_path):
     return tmp_path
 
 
-def test_setup_reports_what_the_page_needs(server, no_daemon):
+def test_setup_reports_what_the_page_needs(server, no_daemon, monkeypatch):
+    from chttr import hotkeys as H
+
+    monkeypatch.setattr(H, "resolve", lambda backend, compositor: "evdev")  # [hotkeys] applies, whatever this machine has
+    monkeypatch.setattr(U, "_keys_cache", (0.0, None, {}))
     status, body, _ = get(server + "/api/setup", TOKEN)
     s = json.loads(body)
     assert status == 200 and s["daemon"] is False and s["extension_installed"] is False

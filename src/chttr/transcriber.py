@@ -177,7 +177,11 @@ class ParakeetTranscriber:
 def engine_key(cfg: Config) -> tuple:
     if cfg.engine.name == "whisper":
         return ("whisper", cfg.whisper.model, cfg.whisper.language, _threads(cfg.engine.threads or cfg.whisper.threads))
-    return ("parakeet", str(resolve_parakeet(cfg.engine.parakeet_dir)), _threads(cfg.engine.threads))
+    try:
+        where = str(resolve_parakeet(cfg.engine.parakeet_dir))
+    except FileNotFoundError:               # comparing settings must not fail on a missing model
+        where = cfg.engine.parakeet_dir
+    return ("parakeet", where, _threads(cfg.engine.threads))
 
 
 class Transcriber:
