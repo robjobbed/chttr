@@ -126,6 +126,15 @@ def test_connect_interactive_checks_then_saves_and_reloads(cfg, monkeypatch, cap
     assert "key accepted" in out and 'Try it: hold F9 and say "um send the contract Tuesday, no, Friday".' in out
 
 
+def test_connect_interactive_from_setup_leaves_the_tip_to_setup(cfg, monkeypatch, capsys):
+    monkeypatch.setattr(apikey.getpass, "getpass", lambda prompt: GOOD)
+    fake_client(monkeypatch)
+    monkeypatch.setattr("chttr.client.send", lambda cmd, timeout=5.0: {"ok": True})
+    assert apikey.connect_interactive(cfg, tip=False) is True
+    out = capsys.readouterr().out
+    assert "key accepted" in out and "Try it" not in out
+
+
 def test_connect_interactive_keeps_a_rejected_key_out(cfg, monkeypatch, capsys):
     monkeypatch.setattr(apikey.getpass, "getpass", lambda prompt: GOOD)
     fake_client(monkeypatch, _error(anthropic.AuthenticationError, 401))

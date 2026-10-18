@@ -225,3 +225,10 @@ def test_key_labels_are_normalised():
     assert H.key_label(["Mod1", "Insert"]) == "Alt+Insert"
     assert H.key_label(["SUPER", "SHIFT", "INSERT"]) == "Super+Shift+Insert"
     assert H.key_label(["mod4", "f12"]) == "Super+F12"
+
+
+def test_effective_bindings_auto_reads_the_given_home(tmp_path, monkeypatch):
+    monkeypatch.setattr(H, "resolve", lambda backend, compositor: pytest.fail("looked at the real home"))
+    (tmp_path / ".config/hypr").mkdir(parents=True)
+    (tmp_path / ".config/hypr/bindings.lua").write_text('o.bind("F9", "chttr: push-to-talk", "chttr start")\n')
+    assert H.effective_bindings(_cfg("auto"), _desk("hyprland"), home=tmp_path) == {"dictate": "F9"}

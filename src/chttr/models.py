@@ -196,8 +196,7 @@ def download(spec: ModelFile, dest: Path, progress: Callable[..., None] | None =
             if done > before:
                 retries = 0                     # it was moving: a fresh set of retries
             if retries >= len(RETRY_DELAYS):
-                raise OSError(f"{spec.name}: download failed after {retries + 1} tries ({_reason(exc)}); "
-                              "run it again to continue where it stopped") from exc
+                raise OSError(f"{spec.name}: download failed after {retries + 1} tries ({_reason(exc)})") from exc
             delay = RETRY_DELAYS[retries]
             retries += 1
             if hasattr(progress, "retrying"):           # a console bar: say it on its own line

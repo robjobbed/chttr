@@ -144,7 +144,7 @@ def test_download_gives_up_after_the_retries_with_a_plain_error(tmp_path, monkey
         raise urllib.error.URLError(OSError(-3, "Temporary failure in name resolution"))
 
     monkeypatch.setattr(M.urllib.request, "urlopen", offline)
-    with pytest.raises(OSError, match=r"failed after 6 tries.*name resolution.*continue where it stopped"):
+    with pytest.raises(OSError, match=r"failed after 6 tries \(.*name resolution\)$"):
         M.download(spec_for(b"x" * 10), tmp_path / "model.onnx")
     assert slept == [1, 2, 4, 8, 16]
 

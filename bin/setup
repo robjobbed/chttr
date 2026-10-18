@@ -27,10 +27,20 @@ if [[ -f $config ]] && grep -Eq '^[[:space:]]*name[[:space:]]*=[[:space:]]*"whis
 fi
 
 # Python: the system's own when it is 3.12 or newer (nothing to download), else a uv-managed 3.13.
-py="${CHTTR_PYTHON:-$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null)}"
+sys_py="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || true)"
+py="${CHTTR_PYTHON:-$sys_py}"
 [[ $py =~ ^3\.([0-9]+)(\.[0-9]+)?$ ]] && ((BASH_REMATCH[1] >= 12)) || py=3.13
 
-echo "Installing the chttr command (Python $py and its packages)…"
+# Arch-family systems move python3 to the next minor version in an ordinary update, which
+# would leave chttr's environment (and chttr.service) broken until setup ran again, so
+# there chttr gets uv's own copy of Python $py. UV_PYTHON_PREFERENCE=system overrides it.
+own=
+if [[ -z ${UV_PYTHON_PREFERENCE:-} ]] && grep -Eqs '^ID(_LIKE)?=.*arch' /etc/os-release; then
+  export UV_PYTHON_PREFERENCE=only-managed
+  own=", uv's own copy"
+fi
+
+echo "Installing the chttr command (Python $py$own and its packages)…"
 
 # The speech model (~670 MB) downloads while uv installs the packages; `chttr setup`
 # then finds it. models.py is standard library only, so any python3 >= 3.8 runs it.

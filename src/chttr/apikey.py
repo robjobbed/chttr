@@ -105,9 +105,10 @@ def _dictate_key(cfg) -> str:
         return "Insert"
 
 
-def connect_interactive(cfg, prompt: str = DEFAULT_PROMPT) -> bool:
+def connect_interactive(cfg, prompt: str = DEFAULT_PROMPT, tip: bool = True) -> bool:
     """Ask for a key (hidden), check it with Anthropic, store it 0600 and tell the daemon.
-    True when a key was stored."""
+    True when a key was stored. `tip=False` leaves out the "Try it" line (setup, where
+    the daemon isn't ready yet, ends with its own)."""
     from .client import DaemonNotRunning, send
 
     try:
@@ -138,5 +139,6 @@ def connect_interactive(cfg, prompt: str = DEFAULT_PROMPT) -> bool:
         send("reload")
     except (DaemonNotRunning, OSError, ValueError):
         pass
-    print(f'  Try it: hold {_dictate_key(cfg)} and say "um send the contract Tuesday, no, Friday".')
+    if tip:
+        print(f'  Try it: hold {_dictate_key(cfg)} and say "um send the contract Tuesday, no, Friday".')
     return True

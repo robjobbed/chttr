@@ -29,6 +29,7 @@ UNIT = Path.home() / ".config/systemd/user/chttr.service"
 HYPR = Path.home() / ".config/hypr"
 READY_TIMEOUT = 45.0        # seconds for the daemon to answer after a restart
 POLL = 0.25
+FAILED_CHECK = 2.0          # how often to ask systemd whether it gave up on the service
 GLYPH = "\U000f036c"       # nf-md-microphone, for Omarchy's notifications
 
 UNIT_TEXT = """\
@@ -169,12 +170,12 @@ def service(exe: str) -> bool:
 def wait_ready(timeout: float = READY_TIMEOUT) -> bool:
     """Poll `status` until the daemon has its speech model; on a timeout show why."""
     start = time.monotonic()
+    deadline, next_check = start + timeout, start + FAILED_CHECK
     _say("daemon: starting…")
     loading = False
-    polls = int(timeout / POLL)
-    for i in range(polls + 1):
+    while True:
         try:
-            reply = send("status", timeout=2)
+            reply = send("status", timeout=min(2.0, max(POLL, deadline - time.monotonic())))
         except (DaemonNotRunning, OSError, ValueError):
             reply = None
         if reply and reply.get("ok", True):
@@ -189,10 +190,14 @@ def wait_ready(timeout: float = READY_TIMEOUT) -> bool:
             else:
                 _say(f"daemon: ready ({time.monotonic() - start:.0f} s)")
                 return True
-        if i % 8 == 7 and _service_failed():                 # crash-looped into systemd's start limit
+        now = time.monotonic()
+        if now >= deadline:
             break
-        if i < polls:
-            time.sleep(POLL)
+        if now >= next_check:
+            next_check = now + FAILED_CHECK
+            if _service_failed():                       # crash-looped into systemd's start limit
+                break
+        time.sleep(POLL)
     _journal_tail()
     _say("daemon: PROBLEM: not answering; see the log above")
     return False
@@ -310,14 +315,14 @@ def offer_claude(cfg) -> None:
     _say("Claude (optional): smarter cleanup and meeting notes. Keys: https://console.anthropic.com/settings/keys")
     try:
         apikey.connect_interactive(cfg, prompt="  Paste an Anthropic API key for Claude cleanup and meeting notes "
-                                               "(Enter to skip): ")
+                                               "(Enter to skip): ", tip=False)
     except (EOFError, KeyboardInterrupt):
         print()
 
 
 def _box(title: str, rows: list[tuple[str, str]]) -> list[str]:
     left = max([len(a) for a, _ in rows] + [0])
-    body = [f"{a:<{left}}   {b}" for a, b in rows] or ["no keys are bound yet (see the keybindings line above)"]
+    body = [f"{a:<{left}}   {b}" for a, b in rows] or ["no keys are bound yet"]
     width = max(len(line) for line in [*body, title + "  "])
     top = f"╭─ {title} " + "─" * (width - len(title) - 1) + "╮"
     return [top, *(f"│ {line:<{width}} │" for line in body), "╰" + "─" * (width + 2) + "╯"]
@@ -379,6 +384,8 @@ def run(do_models: bool = True, do_service: bool = True, do_bindings: bool = Tru
         ok.append(service(exe))
     keys = card(exe, cfg, meet_installed=do_meet)
     if "dictate" not in keys:
+        _say("keybindings: PROBLEM: no key starts dictation (bind `chttr start` on press and `chttr release` "
+             "on release); see: chttr keys")
         ok.append(False)
     print()
     if not all(ok):

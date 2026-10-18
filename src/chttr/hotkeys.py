@@ -448,6 +448,8 @@ def effective_bindings(cfg, desk, home: Path | None = None, backend: str | None 
     action without a binding there isn't listed); the portal and evdev backends use
     [hotkeys] from config.toml. Nothing is bound when no backend can catch keys."""
     hk = getattr(cfg, "hotkeys", cfg)
+    if backend is None and home is not None and hk.backend == "auto" and compositor_bindings(desk.compositor, home)[0]:
+        backend = "compositor"                  # what resolve() decides, but for this home
     backend = backend or resolve(hk.backend, desk.compositor)
     if backend == "none":
         return {}

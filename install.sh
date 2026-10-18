@@ -79,8 +79,15 @@ else
 fi
 
 # Python: the system's own when it is 3.12 or newer (nothing to download), else a uv-managed 3.13.
-py="${CHTTR_PYTHON:-$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null)}"
+sys_py="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || true)"
+py="${CHTTR_PYTHON:-$sys_py}"
 [[ $py =~ ^3\.([0-9]+)(\.[0-9]+)?$ ]] && ((BASH_REMATCH[1] >= 12)) || py=3.13
 # (bin/setup chooses with the same lines; CHTTR_PYTHON=3.14 picks one yourself)
-[[ $py == 3.13 && -z ${CHTTR_PYTHON:-} ]] && echo "Your python3 is older than 3.12, so uv fetches its own Python 3.13 for chttr."
+if [[ -z ${CHTTR_PYTHON:-} && $py != "$sys_py" ]]; then
+  if [[ -n $sys_py ]]; then
+    echo "Your python3 is $sys_py and chttr needs 3.12 or newer, so uv fetches its own Python 3.13 for chttr."
+  else
+    echo "No python3 found, so uv fetches its own Python 3.13 for chttr."
+  fi
+fi
 exec "$src/bin/setup" "$@"

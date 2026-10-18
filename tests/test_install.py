@@ -42,9 +42,15 @@ def system(tmp_path, monkeypatch):
     monkeypatch.setattr(install, "HYPR", tmp_path / "hypr")
     fake = FakeSystem()
     monkeypatch.setattr(install.subprocess, "run", fake)
-    sleeps = []
-    monkeypatch.setattr(install.time, "sleep", sleeps.append)
-    fake.sleeps = sleeps
+    sleeps, clock = [], [1000.0]
+
+    def sleep(secs):
+        sleeps.append(secs)
+        clock[0] += secs
+
+    monkeypatch.setattr(install.time, "sleep", sleep)
+    monkeypatch.setattr(install.time, "monotonic", lambda: clock[0])
+    fake.sleeps, fake.clock = sleeps, clock
     return fake
 
 
@@ -99,8 +105,24 @@ def test_service_stops_waiting_once_systemd_gives_up(system, monkeypatch, capsys
     system.active = "failed"
     asked = scripted_send(monkeypatch, [DaemonNotRunning("no")])
     assert install.service("/bin/chttr") is False
-    assert len(asked) == 8                          # 2 s, not 45
+    assert len(asked) == 9                          # polls at 0, 0.25 … 2 s, not 45
     assert "not answering" in capsys.readouterr().out
+
+
+def test_service_wait_is_bounded_by_the_clock_when_the_daemon_hangs(system, monkeypatch, capsys):
+    asked = []
+
+    def hung(command, timeout=5.0):                 # accepts the connection, never answers
+        asked.append(command)
+        system.clock[0] += timeout
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(install, "send", hung)
+    start = system.clock[0]
+    assert install.service("/bin/chttr") is False
+    assert system.clock[0] - start <= install.READY_TIMEOUT + install.POLL   # ~45 s, not 180 x 2 s
+    assert len(asked) == 21
+    assert "daemon: PROBLEM: not answering" in capsys.readouterr().out
 
 
 def test_service_reports_a_missing_model(system, monkeypatch, capsys):
@@ -216,7 +238,11 @@ def test_run_returns_1_without_the_banner_when_a_step_failed(setup_steps, monkey
 def test_run_is_not_ready_when_nothing_catches_the_keys(setup_steps, monkeypatch, capsys):
     monkeypatch.setattr(H, "effective_bindings", lambda cfg, desk, **kw: {})
     assert install.run() == 1
-    assert "no keys are bound yet" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "no keys are bound yet" in out
+    assert "  keybindings: PROBLEM: no key starts dictation (bind `chttr start` on press and `chttr release` " \
+           "on release); see: chttr keys" in out
+    assert out.index("PROBLEM: no key starts dictation") < out.index("Not quite ready")
 
 
 def test_run_without_the_service_does_not_claim_ready(setup_steps, capsys):
@@ -230,7 +256,8 @@ def test_offer_claude_only_at_a_terminal_with_no_backend(monkeypatch):
     from chttr import apikey
 
     asked = []
-    monkeypatch.setattr(apikey, "connect_interactive", lambda cfg, prompt="": asked.append(prompt) or True)
+    monkeypatch.setattr(apikey, "connect_interactive",
+                        lambda cfg, prompt="", tip=True: asked.append((prompt, tip)) or True)
     monkeypatch.setattr(P, "backend", lambda cfg: "none")
     cfg = C.Config()
     monkeypatch.setattr(install.sys.stdin, "isatty", lambda: False, raising=False)
@@ -238,7 +265,7 @@ def test_offer_claude_only_at_a_terminal_with_no_backend(monkeypatch):
     assert asked == []
     monkeypatch.setattr(install.sys.stdin, "isatty", lambda: True, raising=False)
     install.offer_claude(cfg)
-    assert asked == ["  Paste an Anthropic API key for Claude cleanup and meeting notes (Enter to skip): "]
+    assert asked == [("  Paste an Anthropic API key for Claude cleanup and meeting notes (Enter to skip): ", False)]
     cfg.polish.backend = "none"                     # cleanup turned off on purpose: don't ask
     install.offer_claude(cfg)
     assert len(asked) == 1
@@ -262,7 +289,8 @@ def test_notify_prefers_omarchy(monkeypatch):
 
 ROOT = install.Path(__file__).resolve().parents[1]
 PY_SNIPPET = [
-    """py="${CHTTR_PYTHON:-$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null)}\"""",
+    """sys_py="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || true)\"""",
+    'py="${CHTTR_PYTHON:-$sys_py}"',
     "[[ $py =~ ^3\\.([0-9]+)(\\.[0-9]+)?$ ]] && ((BASH_REMATCH[1] >= 12)) || py=3.13",
 ]
 
@@ -270,6 +298,7 @@ PY_SNIPPET = [
 def _stubs(tmp_path, version: str | None):
     """A PATH directory with fake python3/uv that log their arguments, and a fake HOME."""
     import os
+    import shutil
 
     bin_ = tmp_path / "stubs"
     bin_.mkdir()
@@ -280,13 +309,17 @@ def _stubs(tmp_path, version: str | None):
             f'if [[ $* == *print* ]]; then echo {version}; exit 0; fi\n'
             f'[[ $1 == -I ]] && echo "python3 $*" >> {log}\n'
             "exit 0\n")
-    (bin_ / "uv").write_text(f'#!/bin/bash\necho "uv $*" >> {log}\n')
+    (bin_ / "uv").write_text(f'#!/bin/bash\necho "uv $*" >> {log}\n'
+                             f'echo "UV_PYTHON_PREFERENCE=${{UV_PYTHON_PREFERENCE:-}}" >> {log}\n')
     home = tmp_path / "home"
     (home / ".local/bin").mkdir(parents=True)
     (home / ".local/bin/chttr").write_text(f'#!/bin/bash\necho "chttr $*" >> {log}\n')
     for f in [*bin_.iterdir(), home / ".local/bin/chttr"]:
         f.chmod(0o755)
-    path = f"{bin_}:/usr/bin:/bin" if version is not None else str(bin_)     # None: no python3 at all
+    if version is None:                             # no python3 at all: PATH has only what bin/setup needs
+        for tool in ("dirname", "grep"):
+            (bin_ / tool).symlink_to(shutil.which(tool))
+    path = f"{bin_}:/usr/bin:/bin" if version is not None else str(bin_)
     env = {"PATH": path, "HOME": str(home), "XDG_DATA_HOME": str(home / "data"),
            "XDG_CONFIG_HOME": str(home / "config"), "LANG": os.environ.get("LANG", "C.UTF-8")}
     return env, log
@@ -309,9 +342,59 @@ def test_python_choice(tmp_path, system, override, expected):
     env, _ = _stubs(tmp_path, system)
     if override:
         env["CHTTR_PYTHON"] = override
-    out = subprocess.run(["/bin/bash", "-c", "\n".join([*PY_SNIPPET, 'echo "$py"'])], env=env, capture_output=True,
-                         text=True, check=True).stdout.strip()
-    assert out == expected
+    script = "\n".join(["set -euo pipefail", *PY_SNIPPET, 'echo "$py"'])     # the scripts' own shell options
+    out = subprocess.run(["/bin/bash", "-c", script], env=env, capture_output=True, text=True, check=True).stdout
+    assert out.strip() == expected
+
+
+def _install_sh_python_block() -> str:
+    """install.sh from its Python choice up to the exec of bin/setup."""
+    text = (ROOT / "install.sh").read_text()
+    return text[text.index("# Python:"):text.index('exec "$src/bin/setup"')]
+
+
+@pytest.mark.parametrize(("system", "override", "notice"), [
+    ("3.13", "", ""), ("3.14", "", ""), ("3.14", "3.13", ""),
+    ("3.11", "", "Your python3 is 3.11 and chttr needs 3.12 or newer, so uv fetches its own Python 3.13 for chttr."),
+    (None, "", "No python3 found, so uv fetches its own Python 3.13 for chttr."),
+])
+def test_install_sh_says_when_uv_fetches_a_python(tmp_path, system, override, notice):
+    env, _ = _stubs(tmp_path, system)
+    if override:
+        env["CHTTR_PYTHON"] = override
+    script = "\n".join(["set -euo pipefail", _install_sh_python_block()])
+    out = subprocess.run(["/bin/bash", "-c", script], env=env, capture_output=True, text=True, check=True).stdout
+    assert out.strip() == notice
+
+
+def _arch_family() -> bool:
+    import re
+
+    try:
+        text = install.Path("/etc/os-release").read_text()
+    except OSError:
+        return False
+    return bool(re.search(r"^ID(_LIKE)?=.*arch", text, re.M))
+
+
+def test_bin_setup_without_python3_installs_with_uvs_own(tmp_path):
+    env, log = _stubs(tmp_path, None)
+    done = subprocess.run(["/bin/bash", str(ROOT / "bin/setup")], env=env, capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr
+    assert "Installing the chttr command (Python 3.13" in done.stdout
+    lines = log.read_text().splitlines()
+    assert any(line.startswith("uv tool install --python 3.13 --editable") for line in lines)
+    assert lines[-1] == "chttr setup"
+
+
+def test_bin_setup_keeps_uvs_own_python_on_arch(tmp_path):
+    env, log = _stubs(tmp_path, "3.14")
+    subprocess.run(["bash", str(ROOT / "bin/setup")], env=env, check=True, capture_output=True)
+    expected = "only-managed" if _arch_family() else ""
+    assert f"UV_PYTHON_PREFERENCE={expected}" in log.read_text().splitlines()
+    env["UV_PYTHON_PREFERENCE"] = "system"          # your own choice wins
+    subprocess.run(["bash", str(ROOT / "bin/setup")], env=env, check=True, capture_output=True)
+    assert log.read_text().splitlines()[-2] == "UV_PYTHON_PREFERENCE=system"
 
 
 def test_bin_setup_downloads_the_model_while_uv_installs(tmp_path):
