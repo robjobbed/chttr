@@ -101,11 +101,12 @@ def test_run_and_report(tmp_path, monkeypatch):
     assert "| hello.wav |" in md and "Tail (no reuse)" in md
 
 
-def short_dictation(tmp_path):
+def short_dictation(tmp_path, amplitude=0.3):
     """1.5 s of speech, then 0.75 s of quiet."""
     wav = tmp_path / "short.wav"
     t = np.arange(int(1.5 * 16000)) / 16000
-    audio = np.concatenate([(0.3 * np.sin(2 * np.pi * 220 * t)).astype(np.float32), np.zeros(12000, np.float32)])
+    audio = np.concatenate([(amplitude * np.sin(2 * np.pi * 220 * t)).astype(np.float32),
+                            np.zeros(12000, np.float32)])
     with wave.open(str(wav), "wb") as wf:
         wf.setnchannels(1)
         wf.setsampwidth(2)
@@ -125,6 +126,23 @@ def test_run_counts_the_pause_as_a_head_start(tmp_path, monkeypatch):
     assert res.segments == 0
     assert all(ms >= 45 for ms in res.tail_ms)          # recognized after the release
     assert res.release_ms == [0.0, 0.0]                  # done during the pause (a 50 ms pass, 210 ms head start)
+
+
+@pytest.mark.parametrize("adaptive", [True, False])
+def test_run_fits_the_threshold_to_a_quiet_mic_like_the_daemon(tmp_path, monkeypatch, adaptive):
+    import chttr.transcriber
+
+    monkeypatch.setattr(chttr.transcriber, "Transcriber", FakeTranscriber)
+    monkeypatch.setattr(FakeTranscriber, "delay", 0.05)
+    from chttr.config import Config
+
+    cfg = Config()
+    cfg.audio.adaptive_threshold = adaptive
+    _, [res] = bench.run([short_dictation(tmp_path, amplitude=0.006)], cfg, runs=2)   # about -47 dB
+    if adaptive:                                         # the pause is heard: its pass is reused
+        assert res.release_ms == [0.0, 0.0]
+    else:                                                # under -38 dB nothing counts as speech
+        assert all(ms >= 45 for ms in res.release_ms)
 
 
 def test_run_waits_for_whatever_the_pause_pass_has_not_finished(tmp_path, monkeypatch):

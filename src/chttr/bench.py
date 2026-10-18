@@ -25,6 +25,7 @@ from pathlib import Path
 
 import numpy as np
 
+from . import levels as L
 from . import streaming as S
 from .config import Config
 from .transcriber import SAMPLE_RATE, load_wav
@@ -106,7 +107,6 @@ def run(files: list[Path], cfg: Config, runs: int = 3, cleanup: bool = False) ->
     t0 = time.monotonic()
     transcriber = Transcriber(cfg)
     load_ms = (time.monotonic() - t0) * 1000
-    threshold = cfg.audio.speech_threshold_db
     results = []
     for path in files:
         audio = load_wav(path)
@@ -118,6 +118,9 @@ def run(files: list[Path], cfg: Config, runs: int = 3, cleanup: bool = False) ->
             res.full_ms.append((time.monotonic() - t) * 1000)
 
         levels = chunk_levels(audio)
+        threshold = cfg.audio.speech_threshold_db       # the daemon fits it to the recording, so this does too
+        if cfg.audio.adaptive_threshold:
+            threshold = L.effective_threshold(levels, threshold)
         end = release_point(levels, threshold)
         segments = stream_segments(levels, threshold, end)
         res.segments = len(segments)
