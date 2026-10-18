@@ -256,3 +256,101 @@ def test_screen_context_backs_off_when_atspi_never_answers(daemon, monkeypatch):
         daemon.handle("release")
         wait_idle(daemon)
     assert len(calls) == Dm.ATSPI_GIVE_UP
+
+
+# ---- quiet mics --------------------------------------------------------------
+def db(level: float) -> float:
+    return 10 ** (level / 20)
+
+
+def run_watchdog(d, until, timeout=1.5) -> bool:
+    """Run the hands-free watchdog until `until()` holds (or the timeout)."""
+    t = threading.Thread(target=d._watchdog, daemon=True)
+    t.start()
+    end = time.monotonic() + timeout
+    while time.monotonic() < end and not until():
+        time.sleep(0.02)
+    d._stop.set()
+    t.join(1)
+    return until()
+
+
+@pytest.mark.parametrize("adaptive", [True, False])
+def test_hands_free_quiet_speech_is_heard(daemon, adaptive):
+    daemon.cfg.audio.adaptive_threshold = adaptive
+    daemon.cfg.audio.no_speech_timeout = 0.3
+    daemon.cfg.audio.auto_stop_silence = 0.2
+    daemon.transcriber.texts = ["said quietly"]
+    daemon.handle("toggle")
+    daemon.recorder.elapsed = 1.0                      # past no_speech_timeout
+    for _ in range(15):
+        daemon._on_level(db(-70), -60.0)               # the room, before you speak
+    for _ in range(30):
+        daemon._on_level(db(-44), -40.0)               # a quiet laptop mic
+    assert daemon.heard_speech is adaptive
+    assert run_watchdog(daemon, lambda: daemon.state != Dm.RECORDING)
+    wait_idle(daemon)
+    if adaptive:                                       # stopped on the pause, and typed
+        assert daemon.typed == ["said quietly"]
+        assert "Dictation cancelled" not in daemon.feedback.notes
+    else:                                              # 1.0: "nothing heard", cancelled
+        assert daemon.typed == []
+        assert "Dictation cancelled" in daemon.feedback.notes
+
+
+def test_on_level_lowers_the_streaming_threshold(daemon):
+    from types import SimpleNamespace
+
+    daemon.streamer = SimpleNamespace(threshold_db=-38.0)
+    for _ in range(20):
+        daemon._on_level(db(-70), -60.0)
+    assert daemon.streamer.threshold_db == pytest.approx(-60)
+    daemon.cfg.audio.adaptive_threshold = False
+    daemon._on_level(db(-70), -60.0)
+    assert daemon.streamer.threshold_db == -38
+    daemon.streamer = None
+
+
+def test_loud_speech_is_heard_as_before(daemon):
+    daemon._on_level(db(-20), -10.0)
+    assert daemon.heard_speech
+
+
+class NotedFeedback(QuietFeedback):
+    def notify(self, title, body="", **kw):
+        self.notes.append(f"{title} | {body}")
+
+
+def no_speech_note(daemon, monkeypatch, peak_db, compositor="hyprland") -> str:
+    from chttr.desktop import Desktop
+
+    monkeypatch.setattr(Dm, "current_desktop", lambda: Desktop("wayland", compositor))
+    daemon.feedback = NotedFeedback(daemon.cfg.feedback, daemon.runtime)
+    daemon._no_speech(2.0, peak_db)
+    return daemon.feedback.notes[-1]
+
+
+def test_no_speech_message_mentions_the_floor(daemon, monkeypatch):
+    for _ in range(20):
+        daemon._on_level(db(-66), -50.0)
+    note = no_speech_note(daemon, monkeypatch, -31.0)
+    assert note.startswith("No speech detected: the mic is quiet")
+    assert "Peak -31 dB over a -66 dB floor; chttr listened down to -56 dB." in note
+    assert "Raise the input level" in note
+
+
+def test_no_speech_message_without_levels_skips_the_floor(daemon, monkeypatch):
+    note = no_speech_note(daemon, monkeypatch, -31.0)
+    assert "Peak -31 dB; chttr listened down to -38 dB." in note
+
+
+def test_no_speech_on_a_loud_mic_stays_short(daemon, monkeypatch):
+    assert no_speech_note(daemon, monkeypatch, -12.0) == "No speech detected | 2.0s, peak -12 dB"
+
+
+@pytest.mark.parametrize("compositor", ["hyprland", "sway", "gnome", "kde"])
+def test_silent_mic_names_the_omarchy_shortcut_only_on_hyprland(daemon, monkeypatch, compositor):
+    note = no_speech_note(daemon, monkeypatch, -60.0, compositor)
+    assert note.startswith("No speech detected: the mic is silent | Peak -60 dB. Check the input device and mute")
+    assert ("Super+Ctrl+A" in note) is (compositor == "hyprland")
+    assert note.endswith(".")
