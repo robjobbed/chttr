@@ -56,7 +56,8 @@ QUIET_PEAK_DB = -45.0                   # below this the mic is probably not pic
 CAPTION_INTERVAL = 0.8                  # seconds between live-caption passes
 CAPTION_WINDOW = 8.0                    # only the last this-many seconds are re-transcribed
 DOUBLE_TAP = 0.45                       # a second press this soon after a short tap: hands-free
-ATSPI_GIVE_UP = 5                       # unreadable fields in a row before screen context stops
+ATSPI_GIVE_UP = 5                       # unreadable fields in a row before screen context pauses
+ATSPI_RETRY = 600                       # seconds before it tries the accessibility bus again
 TAP = 0.35                              # recordings shorter than this are taps, not dictations
 OVERLAY_RESPAWN = 30.0                  # seconds between attempts to restart an overlay that died
 CALL_TIMEOUT = 90                       # no word from the Meet tab for this long: the call is over
@@ -111,6 +112,7 @@ class Daemon:
         self.hotkeys = None
         self.last_tap = 0.0
         self.atspi_misses = 0
+        self.atspi_retry_at = 0.0
         self.field: Future | None = None             # the focused text field, read at key press
         self.field_stale = False                     # ...while an earlier dictation was still to be typed into it
         self.pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="chttr-context")
@@ -835,7 +837,7 @@ class Daemon:
     def _start(self, kind: str, app: str, title: str, selection: str) -> dict:
         self.kind = kind
         want_field = (self.cfg.polish.screen_context != "off" or self.cfg.history.learn_from_edits) \
-            and self.atspi_misses < ATSPI_GIVE_UP
+            and (self.atspi_misses < ATSPI_GIVE_UP or time.monotonic() >= self.atspi_retry_at)
         self.field = self.pool.submit(self._read_field) if want_field and kind != COMMAND else None
         self.field_stale = self.jobs > 0
         self.app, self.title, self.selection = app, title, selection
@@ -992,7 +994,8 @@ class Daemon:
                         self.feedback.notify("Pressed Enter", "", timeout_ms=1500)
                     return
             label = "Replaced" if kind == COMMAND and selection else "Typed"
-            if self.cfg.history.learn_from_edits and kind != COMMAND and method in ("type", "paste"):
+            if self.cfg.history.learn_from_edits and kind != COMMAND and method in ("type", "paste") \
+                    and self.atspi_misses < ATSPI_GIVE_UP:
                 timer = threading.Timer(8.0, self._learn_from_edits, args=(text,))
                 timer.daemon = True
                 timer.start()
@@ -1020,13 +1023,17 @@ class Daemon:
 
     def _read_field(self) -> CX.Field | None:
         """The focused text field. If the accessibility bus never answers (it isn't
-        running on every desktop), stop asking after a few tries this session."""
+        running on every desktop), pause after a few tries and try once more every
+        ten minutes (accessibility may be on by then, or you're in another app)."""
+        if self.atspi_misses >= ATSPI_GIVE_UP:
+            self.atspi_misses = ATSPI_GIVE_UP - 1    # the retry: one more miss pauses again
         field = CX.read_field(SYSTEM_PYTHON)
         if field is None:
             self.atspi_misses += 1
-            if self.atspi_misses == ATSPI_GIVE_UP:
-                log.info("no text field readable through AT-SPI %d times; screen context off until restart",
-                         ATSPI_GIVE_UP)
+            if self.atspi_misses >= ATSPI_GIVE_UP:
+                self.atspi_retry_at = time.monotonic() + ATSPI_RETRY
+                log.info("screen context: no readable text field %d times; trying again in %d min",
+                         ATSPI_GIVE_UP, ATSPI_RETRY // 60)
         else:
             self.atspi_misses = 0
         return field

@@ -399,3 +399,243 @@ def run(do_models: bool = True, do_service: bool = True, do_bindings: bool = Tru
     print(f"Ready. Hold {keys['dictate']} and talk; let go to type.")
     notify("chttr is ready", ready_message(keys), timeout_ms=12000)
     return 0
+
+
+# ---- screen context ------------------------------------------------------------------
+
+def accessibility() -> list[str]:
+    """Let screen context read Chromium, Electron and Qt apps: the desktop-wide
+    toolkit-accessibility switch, and Chromium's --force-renderer-accessibility."""
+    from . import native_host
+
+    done = []
+    if shutil.which("gsettings"):
+        try:
+            out = subprocess.run(["gsettings", "set", "org.gnome.desktop.interface", "toolkit-accessibility", "true"],
+                                 capture_output=True, text=True, timeout=10, check=False)
+            if out.returncode == 0:
+                done.append("toolkit-accessibility on (apps started from now on expose their text)")
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    return done + native_host.ensure_accessibility_flag()
+
+
+# ---- uninstall -------------------------------------------------------------------------
+
+BLOCK_HEADER = "chttr (https://github.com/robjobbed/chttr)"
+AUTOSTART_MARK = "   (now a systemd service: chttr.service)"
+OMARCHY_PLUGIN = Path.home() / ".config/omarchy/plugins/robjobbed.chttr"
+
+
+def _quiet(cmd: list[str]) -> None:
+    try:
+        subprocess.run(cmd, capture_output=True, check=False, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def _restore(path: Path, text: str) -> str:
+    """Write what's left of a config file after taking chttr out. If that is what
+    the .bak-chttr copy holds, put the copy back byte for byte and drop it."""
+    backup = path.with_name(path.name + ".bak-chttr")
+    if backup.exists() and backup.read_text(encoding="utf-8").rstrip("\n") == text.rstrip("\n"):
+        shutil.copy2(backup, path)
+        backup.unlink()
+        return "restored"
+    path.write_text(text, encoding="utf-8")
+    return "updated"
+
+
+def _without_block(text: str, template: str) -> str | None:
+    """`text` minus the block keybindings() appended (the header line, the lines
+    after it that mention chttr or are the template's own comments, and the blank
+    line before it). None if there is no such block."""
+    lines = text.split("\n")
+    start = next((i for i, line in enumerate(lines) if BLOCK_HEADER in line), None)
+    if start is None:
+        return None
+    own = {line.strip() for line in template.splitlines() if line.strip()}
+    end = start + 1
+    while end < len(lines) and lines[end].strip() and ("chttr" in lines[end] or lines[end].strip() in own):
+        end += 1
+    if start > 0 and not lines[start - 1].strip():
+        start -= 1
+    return "\n".join(lines[:start] + lines[end:])
+
+
+def _uninstall_service() -> list[str]:
+    done = []
+    if UNIT.exists():
+        _quiet(["systemctl", "--user", "disable", "--now", "chttr.service"])
+        UNIT.unlink()
+        _quiet(["systemctl", "--user", "daemon-reload"])
+        done.append(f"service: stopped and removed {_home(UNIT)}")
+    if C.SOCKET_PATH.exists():                          # a daemon started some other way
+        from .client import DaemonNotRunning, send
+
+        try:
+            send("quit", timeout=5)
+            done.append("daemon: stopped")
+        except (DaemonNotRunning, OSError, ValueError):
+            pass
+    return done
+
+
+def _uninstall_hyprland() -> list[str]:
+    done = []
+    changed = False
+    for name, template in (("bindings.lua", BINDINGS_LUA), ("bindings.conf", BINDINGS_CONF)):
+        path = HYPR / name
+        if not path.exists():
+            continue
+        text = path.read_text(encoding="utf-8")
+        rest = _without_block(text, template)
+        if rest is None:
+            if "chttr" in text:
+                done.append(f"keybindings: {_home(path)} has chttr lines setup didn't add; remove them by hand")
+            continue
+        how = _restore(path, rest)
+        changed = True
+        done.append(f"keybindings: {how} {_home(path)}")
+    for name in ("autostart.lua", "autostart.conf"):
+        path = HYPR / name
+        if not path.exists() or AUTOSTART_MARK not in path.read_text(encoding="utf-8"):
+            continue
+        prefix = "-- " if name.endswith(".lua") else "# "
+        lines = [line[len(prefix):-len(AUTOSTART_MARK)] if line.startswith(prefix) and line.endswith(AUTOSTART_MARK)
+                 else line for line in path.read_text(encoding="utf-8").split("\n")]
+        _restore(path, "\n".join(lines))
+        done.append(f"autostart: put back your old chttr daemon line in {_home(path)} "
+                    "(delete it if you're removing chttr for good)")
+    if changed:
+        _quiet(["hyprctl", "reload"])
+    return done
+
+
+def _uninstall_sway() -> list[str]:
+    done = []
+    config = Path.home() / ".config/sway/config"
+    target = Path.home() / ".config/sway/config.d/chttr.conf"
+    if target.exists():
+        target.unlink()
+        done.append(f"keybindings: removed {_home(target)}")
+    if config.exists():
+        text = config.read_text(encoding="utf-8")
+        include = f"include {target}"
+        if include in text.split("\n"):
+            lines = text.split("\n")
+            i = lines.index(include)
+            del lines[i]
+            if i > 0 and not lines[i - 1].strip():
+                del lines[i - 1]                       # the blank line setup put before it
+            rest = "\n".join(lines)
+            backup = config.with_name("config.bak-chttr")
+            if backup.exists() and backup.read_text(encoding="utf-8").rstrip("\n") == rest.rstrip("\n"):
+                shutil.copy2(backup, config)
+                backup.unlink()
+            elif not rest.strip() and not backup.exists():
+                config.unlink()                         # setup created it just for the include
+            else:
+                config.write_text(rest, encoding="utf-8")
+            done.append(f"keybindings: took the chttr include out of {_home(config)}")
+    if done:
+        _quiet(["swaymsg", "reload"])
+    return done
+
+
+def _home(path: Path) -> str:
+    try:
+        return "~/" + str(path.relative_to(Path.home()))
+    except ValueError:
+        return str(path)
+
+
+def _inside(path: Path, folder: Path) -> bool:
+    return path == folder or folder in path.parents
+
+
+def _delete_root(root: Path, notes: Path) -> str:
+    """Delete one of chttr's folders, sparing the meeting notes when they live in it.
+    Paths are compared resolved, so a notes folder reached through a symlink into
+    chttr's data counts as inside it, and a data folder moved to another disk and
+    linked back is deleted where it really is (then the link)."""
+    target, notes_r, link = root.resolve(), notes.resolve(), root.is_symlink()
+    try:
+        if _inside(notes_r, target):
+            for child in target.iterdir():
+                if _inside(notes_r, child.resolve()):
+                    continue
+                shutil.rmtree(child) if child.is_dir() and not child.is_symlink() else child.unlink()
+            return f"data: deleted {_home(root)} except your meeting notes in {_home(notes)}"
+        if target.is_dir():
+            shutil.rmtree(target)
+        if link:
+            root.unlink()
+    except OSError as exc:
+        return f"data: couldn't delete {_home(root)}: {exc.strerror or exc}"
+    if link:
+        return f"data: deleted {_home(root)} and {_home(target)}, the folder it linked to"
+    return f"data: deleted {_home(root)}"
+
+
+def _purge(yes: bool, ask) -> list[str]:
+    from . import integrations as I
+    from . import vault
+
+    try:
+        notes = Path(C.load_config(C.CONFIG_FILE).meeting.dir).expanduser()
+    except (OSError, ValueError):
+        notes = Path(C.MeetingCfg().dir).expanduser()
+    if not yes:
+        code = " (and the chttr code installed there)" if (C.DATA_DIR / "src").exists() else ""
+        try:
+            answer = ask(f"Delete history, meeting data, voices, the library index and the models in "
+                         f"{_home(C.DATA_DIR)}{code}, and your settings in {_home(C.CONFIG_DIR)}? [y/N] ")
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+        if not answer.strip().lower().startswith("y"):
+            return ["data: kept (nothing deleted)"]
+    done = []
+    for d in I.connected():                 # only what is stored: `secret-tool clear` succeeds on nothing too
+        try:
+            if vault.remove(d):
+                done.append(f"secrets: forgot the {I.label(d)} connection")
+        except (OSError, subprocess.SubprocessError):
+            pass
+    for root in (C.CONFIG_DIR, C.DATA_DIR):
+        if root.exists() or root.is_symlink():
+            done.append(_delete_root(root, notes))
+    done.append(f"meeting notes: left alone in {_home(notes)} ([meeting] dir); they're yours")
+    return done
+
+
+def uninstall(purge: bool = False, yes: bool = False, ask=None, say=None) -> list[str]:
+    """Undo `chttr setup`: the service, keybindings, Meet extension registration and
+    the autostart edit. With purge, also chttr's data and settings (after asking:
+    `ask(question)`, input() by default). Meeting notes in [meeting] dir are never
+    touched. Returns what was done; `say(line)` hears each line as it happens."""
+    from . import native_host
+
+    done: list[str] = []
+
+    def step(lines: list[str]) -> None:
+        for line in lines:
+            done.append(line)
+            if say:
+                say(line)
+
+    step(_uninstall_service())
+    step(_uninstall_hyprland())
+    step(_uninstall_sway())
+    step([f"meet: {line}" for line in native_host.uninstall()])
+    if not done:
+        step(["nothing from chttr setup was installed"])
+    if purge:
+        step(_purge(yes, ask or input))
+    else:
+        step([f"data: kept {_home(C.DATA_DIR)} and {_home(C.CONFIG_DIR)} (chttr uninstall --purge deletes them)"])
+    exe = shutil.which("chttr") or ""
+    steps = ["omarchy plugin remove robjobbed.chttr"] if OMARCHY_PLUGIN.exists() else []
+    steps.append("sudo pacman -Rns chttr-git" if exe.startswith("/usr/") else "uv tool uninstall chttr")
+    step([f"finish with: {steps[0]}", *(f"             {s}" for s in steps[1:])])
+    return done

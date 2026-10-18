@@ -499,67 +499,47 @@ def cmd_stats(args: argparse.Namespace) -> int:
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
-    cfg = C.load_config()
-    from .polish import backend
-    from .transcriber import resolve_model, resolve_parakeet
+    from dataclasses import asdict
 
-    ok = True
+    from . import doctor
+
+    cfg = C.load_config()
+    env = doctor.Env()
+    checks = doctor.run_all(cfg, env)
+    if args.fix:
+        fixable = [c for c in checks if not c.ok and c.auto and c.fix]
+        out = sys.stderr if args.json else sys.stdout
+        if fixable:
+            message = f"fixing {len(fixable)} problem{'' if len(fixable) == 1 else 's'}…"
+        elif any(not c.ok for c in checks):
+            message = "nothing --fix can do on its own; see the fix: lines below"
+        else:
+            message = "nothing to fix"
+        print(message, file=out, flush=True)
+        for line in doctor.apply_fixes(checks, env, cfg):
+            print(line, file=out, flush=True)
+        print(file=out)
+        env.cache.clear()
+        checks = doctor.run_all(cfg, env)
+    ok = all(c.ok for c in checks)
+    if args.json:
+        print(json.dumps([asdict(c) for c in checks], indent=2))
+        return 0 if ok else 1
     print(f"config:      {C.CONFIG_FILE}")
-    if cfg.engine.name == "parakeet":
-        try:
-            print(f"engine:      parakeet ({resolve_parakeet(cfg.engine.parakeet_dir)})")
-            import onnx_asr  # noqa: F401
-        except (FileNotFoundError, ImportError) as exc:
-            ok = False
-            print(f"engine:      parakeet: PROBLEM: {exc}")
-    else:
-        print(f"engine:      whisper ({resolve_model(cfg.whisper.model)})")
-    b = backend(cfg.polish)
-    hint = {"none": "  (raw text; add ~/.config/chttr/anthropic-api-key or run Ollama for cleanup + command mode)"}
-    print(f"cleanup:     {b}{hint.get(b, '')}")
-    key_file = Path(cfg.polish.api_key_file).expanduser() if cfg.polish.api_key_file else None
-    if key_file and key_file.is_file() and C.too_open(key_file):
-        ok = False
-        print(f"api key:     PROBLEM: {key_file} is readable by other users; fix with: chmod 600 {key_file}")
+    print(doctor.render(checks, hint=not args.fix))
     if args.verify:
         ok = _verify_models(cfg) and ok
     if args.mic:
         ok = _mic_check(cfg) and ok
-    try:
-        print(f"daemon:      {send('status').get('state')}")
-    except DaemonNotRunning:
-        ok = False
-        print("daemon:      not running")
-    print(f"modes:       {', '.join(m.name for m in cfg.modes) or '(none)'}")
-    from . import desktop as DT
-    from . import hotkeys as H
-
-    desk = DT.detect()
-    for line in DT.report(desk):
-        print(line)
-    hk = H.resolve(cfg.hotkeys.backend, desk.compositor)
-    hk_desc = {"compositor": "your compositor's bindings (chttr setup adds them)",
-               "portal": "the desktop's global-shortcuts portal",
-               "evdev": "keyboard devices (input group)",
-               "none": "PROBLEM: none; add yourself to the input group or bind chttr start/release yourself"}
-    print(f"hotkeys:     {hk_desc.get(hk, hk)}")
-    if hk == "none":
-        ok = False
-    from . import integrations as I
-    from . import vault
-
-    linked = I.connected()
-    where = "keyring" if vault.keyring_available() else "secrets.json (no secret-tool)"
-    print(f"send notes:  {', '.join(I.label(d) for d in linked) + f' ({cfg.integrations.send}; secrets in {where})' if linked else 'nothing connected (chttr connect)'}")
-    from .gcal import read_urls
-    from .native_host import BROWSER_DIRS, HOST_NAME
-
-    print(f"meetings:    notes to {cfg.meeting.dir}; auto = {cfg.meeting.auto}")
-    print(f"calendar:    {len(read_urls(cfg.meeting.calendar_file))} iCal address(es)"
-          + ("" if read_urls(cfg.meeting.calendar_file) else "  (chttr meeting calendar URL)"))
-    hosts = [d.name for d, _ in BROWSER_DIRS if (d / "NativeMessagingHosts" / f"{HOST_NAME}.json").exists()]
-    print(f"meet ext:    {'registered for ' + ', '.join(hosts) if hosts else 'not installed (chttr meeting install)'}")
     return 0 if ok else 1
+
+
+def cmd_uninstall(args: argparse.Namespace) -> int:
+    from .install import uninstall
+
+    print("chttr uninstall", flush=True)
+    uninstall(purge=args.purge, yes=args.yes, say=lambda line: print(f"  {line}", flush=True))
+    return 0
 
 
 def _mic_check(cfg, seconds: float = 4.0) -> bool:
@@ -1137,6 +1117,8 @@ def build_parser() -> argparse.ArgumentParser:
     dr = sub.add_parser("doctor", help="check the engine, cleanup backend and daemon")
     dr.add_argument("--verify", action="store_true", help="also hash every model file against its pinned SHA-256")
     dr.add_argument("--mic", action="store_true", help="also record 4 seconds and show the level and the transcript")
+    dr.add_argument("--json", action="store_true", help="print the checks as JSON")
+    dr.add_argument("--fix", action="store_true", help="run the safe fixes (no sudo), then check again")
     dr.set_defaults(func=cmd_doctor)
 
     me = sub.add_parser("meeting", help="record meetings: transcripts with speaker names, summary and action items")
@@ -1196,6 +1178,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     ky = sub.add_parser("keys", help="show the shortcuts that are bound right now")
     ky.set_defaults(func=cmd_keys)
+
+    un = sub.add_parser("uninstall", help="remove the service, keybindings and Meet extension that setup added")
+    un.add_argument("--purge", action="store_true", help="also delete history, meeting data, models and settings")
+    un.add_argument("-y", "--yes", action="store_true", help="don't ask before --purge deletes anything")
+    un.set_defaults(func=cmd_uninstall)
 
     mn = sub.add_parser("menu", help="the bar widget's menu")
     mn.set_defaults(func=cmd_menu)

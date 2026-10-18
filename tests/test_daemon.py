@@ -1421,3 +1421,54 @@ def test_record_click_during_the_meet_call_records_it(daemon, fake_sessions):
     assert daemon.handle('meeting start {"call": "abc-defg-hij"}')["ok"]
     [session] = fake_sessions
     assert (session.code, session.title, session.source) == ("abc-defg-hij", "Weekly sync", "extension")
+
+
+def _dictate(daemon):
+    daemon.handle("start")
+    daemon.handle("release")
+    wait_idle(daemon)
+
+
+def test_screen_context_tries_again_after_the_cool_down(daemon, monkeypatch):
+    calls = []
+    monkeypatch.setattr(Dm.CX, "read_field", lambda *a, **k: calls.append(1))
+    real, offset = time.monotonic, [0.0]
+    monkeypatch.setattr(Dm.time, "monotonic", lambda: real() + offset[0])
+    daemon.transcriber.texts = ["one two three four five six"] * 12
+    for _ in range(7):
+        _dictate(daemon)
+    assert len(calls) == Dm.ATSPI_GIVE_UP                      # paused
+    offset[0] += Dm.ATSPI_RETRY - 5
+    _dictate(daemon)
+    assert len(calls) == Dm.ATSPI_GIVE_UP                      # not yet
+    offset[0] += 10
+    _dictate(daemon)
+    _dictate(daemon)
+    assert len(calls) == Dm.ATSPI_GIVE_UP + 1                  # one more try, then paused again
+    offset[0] += Dm.ATSPI_RETRY + 1
+    monkeypatch.setattr(Dm.CX, "read_field", lambda *a, **k: calls.append(1) or Dm.CX.Field("Mail", "Hi Dana", ""))
+    _dictate(daemon)
+    _dictate(daemon)
+    assert len(calls) == Dm.ATSPI_GIVE_UP + 3 and daemon.atspi_misses == 0   # readable again: back to normal
+
+
+def test_learn_from_edits_waits_while_screen_context_is_paused(daemon, monkeypatch):
+    timers = []
+
+    class FakeTimer:
+        def __init__(self, interval, fn, args=()):
+            timers.append(args)
+            self.daemon = False
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(Dm.threading, "Timer", FakeTimer)
+    daemon.cfg.history.learn_from_edits = True
+    daemon.transcriber.texts = ["first dictation", "second dictation"]
+    daemon.atspi_misses, daemon.atspi_retry_at = Dm.ATSPI_GIVE_UP, time.monotonic() + 600
+    _dictate(daemon)
+    assert daemon.typed == ["first dictation"] and timers == []  # no helper spawned while paused
+    daemon.atspi_misses = 0
+    _dictate(daemon)
+    assert timers == [("second dictation",)]
