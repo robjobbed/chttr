@@ -1049,7 +1049,8 @@ class Daemon:
             if (c.heard, c.right) in self.offered:
                 continue
             self.offered.add((c.heard, c.right))
-            log.info("you changed %r to %r", c.heard, c.right)
+            log.info("you corrected a word; offering to learn it")
+            log.debug("you changed %r to %r", c.heard, c.right)
             # The click runs `chttr learn`, which saves the word and says so.
             self.feedback.offer(f"Learn \u201c{c.right}\u201d?",
                                 f"You changed \u201c{c.heard}\u201d to \u201c{c.right}\u201d. "

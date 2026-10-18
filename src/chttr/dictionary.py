@@ -125,7 +125,7 @@ class Dictionary:
             close = difflib.SequenceMatcher(None, low.replace("h", ""), name.lower().replace("h", "")).ratio()
             if close < 0.5 or abs(len(word) - len(name)) > 3:
                 return word
-            log.info("sounds like %s: %r -> %r", name, word, name)
+            log.debug("sounds like %s: %r -> %r", name, word, name)
             return name
 
         return re.sub(r"\b[^\W\d_]{3,}\b", sub, text)
