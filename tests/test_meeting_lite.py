@@ -104,6 +104,23 @@ def test_lists_are_capped_keeping_the_strongest_items_in_time_order():
     assert starts == sorted(starts)
 
 
+def test_sentences_of_one_turn_stay_in_the_order_they_were_said():
+    out = lite.notes_lite(meeting([("Dana", "them", 0, "Let me check the numbers. I will send the long report tomorrow.")]))
+    assert section(out, "Commitments") == ["Dana (00:00:00): Let me check the numbers.",
+                                           "Dana (00:00:00): I will send the long report tomorrow."]
+    assert [a["task"] for a in out["action_items"]] == ["Let me check the numbers.",
+                                                         "I will send the long report tomorrow."]
+
+
+@pytest.mark.parametrize("filler", ["I will be honest, it's fine.", "I can tell you it's a mess.",
+                                    "I'm going to be out on Monday.", "Let me go back to the slide.",
+                                    "I can imagine that was hard.", "I will say the demo went well.",
+                                    "Let me start with the agenda."])
+def test_filler_is_not_a_commitment(filler):
+    out = lite.notes_lite(meeting([("Dana", "them", 0, filler)]))
+    assert section(out, "Commitments") == [] and out["action_items"] == []
+
+
 def test_talk_time_falls_back_to_utterance_lengths_and_handles_one_speaker():
     out = lite.notes_lite(meeting([("Dana", "them", 0, "Hello there everyone."), ("Dana", "them", 2, "Bye.")],
                                   title=""))
@@ -178,7 +195,7 @@ def test_pipeline_without_a_key_writes_on_device_notes(recorded, monkeypatch):
 def test_pipeline_falls_back_to_on_device_notes_when_the_model_fails(recorded, monkeypatch):
     directory, cfg = recorded
     monkeypatch.setattr(N, "available", lambda cfg: True)
-    monkeypatch.setattr(pipeline, "choose_style", lambda result, cfg: "general")
+    monkeypatch.setattr(pipeline, "choose_style", lambda result, cfg: "standup")   # e.g. from a style rule
 
     def fail(*a, **k):
         raise RuntimeError("Ollama is not answering at http://127.0.0.1:11434")
@@ -186,12 +203,13 @@ def test_pipeline_falls_back_to_on_device_notes_when_the_model_fails(recorded, m
     monkeypatch.setattr(pipeline, "write_notes", fail)
     md = pipeline.process(directory, cfg)
     result = json.loads((directory / "result.json").read_text(encoding="utf-8"))
-    assert result["notes"]["style"] == "lite"
+    assert result["notes"]["style"] == "lite" and result["notes"]["wanted"] == "standup"
     assert result["notes"]["error"] == "RuntimeError: Ollama is not answering at http://127.0.0.1:11434"
     text = md.read_text(encoding="utf-8")
     assert "> Notes could not be written: RuntimeError: Ollama is not answering at http://127.0.0.1:11434. " \
-           f"Try again with `chttr meeting style general --meeting {directory.name}`." in text
+           f"Try again with `chttr meeting style standup --meeting {directory.name}`." in text
     assert "## Commitments" in text
+    assert "*On-device notes*\n" in text and "add a Claude key" not in text   # they already have a model
 
 
 def test_pipeline_without_summary_writes_no_notes(recorded, monkeypatch):

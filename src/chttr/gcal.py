@@ -107,14 +107,16 @@ def _email(value) -> str:
 
 def _events(data: bytes, around: datetime, window: timedelta, me_email: str = "") -> tuple[list[Event], str]:
     """Events within `window` of `around`, and whose calendar it is. You are the attendee
-    with `me_email` ([meeting] email), else the feed's name when it is an address (a
-    primary Google calendar is named after its owner; a secondary one is not)."""
+    whose address names the feed (a primary Google calendar is named after its owner; a
+    secondary one is not) or is `me_email` ([meeting] email); both count, so several
+    feeds under different addresses all know you."""
     import icalendar
     import recurring_ical_events
 
     cal = icalendar.Calendar.from_ical(data)
-    owner = str(cal.get("X-WR-CALNAME", "")).strip().lower()
-    owner = me_email.strip().lower() or (owner if "@" in owner else "")
+    calname = str(cal.get("X-WR-CALNAME", "")).strip().lower()
+    mine = ({me_email.strip().lower()} | ({calname} if "@" in calname else set())) - {""}
+    owner = calname if "@" in calname else me_email.strip().lower()
     events = []
     for comp in recurring_ical_events.of(cal).between(around - window, around + window):
         if str(comp.get("STATUS", "")).upper() == "CANCELLED":
@@ -139,7 +141,7 @@ def _events(data: bytes, around: datetime, window: timedelta, me_email: str = ""
                 continue
             attendees.append(Attendee(name=name, email=email, organizer=email == organizer_email,
                                       status=str(a.params.get("PARTSTAT", "")).upper(),
-                                      is_me=bool(owner) and email == owner))
+                                      is_me=email in mine))
         events.append(Event(title=str(comp.get("SUMMARY", "")).strip() or "(untitled)", start=start_dt, end=end_dt,
                             meet_code=m.group(1) if m else "", description=str(comp.get("DESCRIPTION", "")),
                             attendees=attendees))

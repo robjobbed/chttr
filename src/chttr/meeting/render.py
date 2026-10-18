@@ -77,10 +77,17 @@ def render(directory: Path, result: dict, cfg: Config) -> Path:
 
     lite = notes.get("style") == "lite"
     if notes.get("error"):
-        retry = f" Try again with `chttr meeting style general --meeting {directory.name}`." if lite else ""
+        retry = ""
+        if lite:     # the style that was asked for, so trying again doesn't change it
+            wanted = notes.get("wanted") or meta.get("style") or "general"
+            extra = re.sub(r'["`]', "'", meta.get("style_extra", ""))[:200]
+            how = f'--prompt "{extra}"' if wanted == "custom" and extra else \
+                (wanted if wanted != "custom" else "general")
+            retry = f" Try again with `chttr meeting style {how} --meeting {directory.name}`."
         lines += [f"> Notes could not be written: {str(notes['error']).rstrip('.')}.{retry}", ""]
     if lite:
-        lines += ["*On-device notes* · add a Claude key (chttr connect claude) or run Ollama for full notes", ""]
+        hint = "" if notes.get("error") else " · add a Claude key (chttr connect claude) or run Ollama for full notes"
+        lines += ["*On-device notes*" + hint, ""]
     elif notes.get("sections"):
         how = f"*{notes.get('style_name', 'Notes')} notes*"
         if notes.get("style") == "custom" and notes.get("extra"):

@@ -43,6 +43,7 @@ def test_a_lone_word_is_echo_only_when_they_said_it_at_that_moment():
     assert _is_echo(Utterance(10.1, 10.5, "mic", "yeah"), them)          # their "yeah" leaking back
     assert not _is_echo(Utterance(11.0, 11.4, "mic", "right"), them)     # you, agreeing while they talk
     assert not _is_echo(Utterance(30.0, 30.4, "mic", "yeah"), them)      # nobody else talking: a real turn
+    assert _is_echo(Utterance(12.0, 12.3, "mic", "…"), them)             # no words while they talk: noise
 
 
 def test_a_short_answer_right_after_a_question_is_kept():

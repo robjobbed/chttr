@@ -108,7 +108,7 @@ def tool_functions(on_call=None):
         if around:
             try:    # "12:40" is 12 min 40 s, "40" is 40 s
                 h, m, s = (int(float(x)) for x in (["0", "0", *around.strip().split(":")])[-3:])
-            except ValueError:
+            except (ValueError, OverflowError):     # "inf" and "1e999" too
                 return json.dumps({"error": f"around must be hh:mm:ss, not {around!r}"})
             lines = L.context_around(meeting_id, h * 3600 + m * 60 + s, seconds)
         else:
@@ -222,6 +222,11 @@ def ask_ollama(question: str, cfg: Config, on_search=None) -> str:
     try:
         with urllib.request.urlopen(req, timeout=300) as r:
             data = json.load(r)
+    except urllib.error.HTTPError as exc:
+        from .notes import ollama_http_error
+
+        raise RuntimeError(f"Ollama ({cfg.polish.ollama_model}): {ollama_http_error(exc, cfg.polish.ollama_model)}") \
+            from exc
     except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"Ollama ({cfg.polish.ollama_model}) did not answer: {exc}") from exc
     return str((data.get("message") or {}).get("content", "")).strip()

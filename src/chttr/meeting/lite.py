@@ -44,8 +44,12 @@ DUE = re.compile(
 COMMITMENT = re.compile(
     rf"\b(?:I will|I'll|we'll|we will|let me|I can(?!'t|not)|I'm going to|we're going to"
     rf"|by (?:{_DAYS}|tomorrow|next week|end of (?:the )?(?:day|week)))\b", re.IGNORECASE)
+# Phrases that sound like a promise but are talk ("I will be honest", "Let me go back to
+# the slide", "I'm going to be out on Monday")
 NOT_A_COMMITMENT = re.compile(
-    r"\b(?:share my screen|let me see|let me think|let me know|let me ask|I can see|I can hear|I can't)\b", re.IGNORECASE)
+    r"\b(?:share my screen|let me (?:see|think|know|ask|start|say|go back|be honest)|I can (?:see|hear|imagine|tell)"
+    r"|I can't|(?:I will|I'll) (?:say|be honest|tell you what)|to be honest"
+    r"|(?:I'm going to|I'll|I will|we'll|we will) be (?:out|off|away)|I will say)\b", re.IGNORECASE)
 QUESTION_WORDS = {"who", "what", "when", "where", "why", "how", "can", "could", "should", "do", "does", "did", "is",
                   "are", "will"}
 SMALL_TALK = re.compile(r"\b(?:can you (?:hear|see) (?:me|my screen)|am I (?:muted|audible|on mute)|how are you)\b",
@@ -81,9 +85,10 @@ def _is_commitment(s: str) -> bool:
 
 def _keep(found: list[tuple[float, int, str]], limit: int) -> list[int]:
     """Indexes of the `limit` best of (start, rank, item) (higher rank, then longer item
-    first), back in time order."""
+    first), back in the order they were said (sentences of one turn share its start, and
+    the index keeps their order)."""
     best = sorted(range(len(found)), key=lambda i: (-found[i][1], -len(found[i][2])))[:limit]
-    return sorted(best, key=lambda i: found[i][0])
+    return sorted(best, key=lambda i: (found[i][0], i))
 
 
 def _due(s: str) -> str:

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 import subprocess
+from difflib import SequenceMatcher
 from pathlib import Path
 
 import numpy as np
@@ -19,6 +21,15 @@ log = logging.getLogger("chttr.meeting")
 GLYPH = "\U000f0219"      # nf-md-file_document
 
 
+def _same_person(old: str, new: str) -> bool:
+    """Whether a rename only corrects the spelling or adds a surname ("Dana" -> "Dana
+    Smith", "Jon" -> "John"), rather than naming someone else."""
+    a, b = (re.sub(r"[^\w]", "", (n.split() or [""])[0].lower()) for n in (old, new))
+    if not a or not b:
+        return False
+    return a.startswith(b) or b.startswith(a) or SequenceMatcher(None, a, b).ratio() > 0.75
+
+
 def rename(directory: Path, old: str, name: str, email: str, cfg: Config) -> Path:
     """Fix a speaker's name in a processed meeting and remember their voice."""
     result = read_json(directory / "result.json")
@@ -29,12 +40,25 @@ def rename(directory: Path, old: str, name: str, email: str, cfg: Config) -> Pat
         raise SystemExit(f"no speaker {old!r} in this meeting; speakers: {', '.join(speakers)}")
     if speakers[old].source == "me":
         raise SystemExit("that's you; set [meeting] me = \"Your Name\" in the config instead")
-    clusters = list(speakers[old].clusters)
-    # A name chttr was sure of (captions, the invite, a remembered voice) was stored with
-    # this voice after the call; when that name was wrong, forget it so later calls don't
-    # repeat the mistake.
-    wrong_key = (speakers[old].email.lower() or old.lower()) if speakers[old].source in ("captions", "calendar", "voice") else ""
-    _relabel(result, old, name, email, "corrected", "corrected by hand")
+    was = speakers[old]
+    clusters = list(was.clusters)
+    # A spelling fix keeps the person's address and their learned voice; naming someone
+    # else drops the address that belonged to the wrong name.
+    same = (was.source != "unknown" and _same_person(old, name)
+            and (not email or not was.email or email.lower() == was.email.lower()))
+    new_email = email or (was.email if same else "")
+    if not same and not email:
+        result["speakers"][old]["email"] = ""
+    # The voice stored under the old name. For a spelling fix it moves to the new name
+    # with its history. A name chttr was sure of (captions, the invite, a remembered
+    # voice) was stored with this voice after the call; when that name was wrong, forget
+    # it so later calls don't repeat the mistake.
+    old_key = was.email.lower() or old.lower()
+    if not same and was.source not in ("captions", "calendar", "voice"):
+        old_key = ""
+    _relabel(result, old, name, new_email, "corrected", "corrected by hand")
+    new_email = result["speakers"][name]["email"]      # merged into a speaker who has one
+    new_key = new_email.lower() or name.strip().lower()
     utts = [Utterance(**u) for u in result["utterances"]]
     md = render(directory, result, cfg)
     result["markdown"] = str(md)
@@ -47,15 +71,19 @@ def rename(directory: Path, old: str, name: str, email: str, cfg: Config) -> Pat
         if vecs:
             voices = D.load_voices()
             voice = D.centroid(np.stack(vecs))
-            stored = voices.get(wrong_key)
-            if stored is not None and wrong_key != (email.lower() or name.strip().lower()) \
-                    and float(stored.embedding @ voice) >= D.VOICE_MATCH_ATTENDEE:
-                del voices[wrong_key]
-                log.info("forgot the voice stored for %s: it was %s", stored.name or wrong_key, name)
-            D.remember(voices, name, email, voice, max(secs, 60))
+            prior = voices.get(old_key)
+            if prior is not None and old_key != new_key and float(prior.embedding @ voice) >= D.VOICE_MATCH_ATTENDEE:
+                del voices[old_key]
+                if same:
+                    if new_key not in voices or voices[new_key].count < prior.count:
+                        prior.key, prior.name, prior.email = new_key, name, new_email or prior.email
+                        voices[new_key] = prior
+                    log.info("moved the voice stored for %s to %s", old, name)
+                else:
+                    log.info("forgot the voice stored for %s: it was %s", prior.name or old_key, name)
+            D.remember(voices, name, new_email, voice, max(secs, 60))
             D.save_voices(voices)
     return md
-
 
 
 def _directory_for(md: Path) -> Path | None:
@@ -86,9 +114,12 @@ def notify_done(md: Path, summary_line: str, offer: list[str] | None = None, on_
 
     title = f"{done_title(directory or _directory_for(md))}: {md.stem}"
     if shutil.which("omarchy-notification-send"):
+        # No buttons here, so say where sending went
+        body = summary_line + "\nClick to open." + (
+            f" Send it to {', '.join(label(d) for d in offer)} with: chttr send" if offer else "")
         try:
             subprocess.run(["omarchy-notification-send", "--app-name", "chttr", "-g", GLYPH, "-u", "normal",
-                            "-t", "120000", title, summary_line + "\nClick to open.", "--exec", "xdg-open", str(md)],
+                            "-t", "120000", title, body, "--exec", "xdg-open", str(md)],
                            capture_output=True, timeout=10, check=False)
         except (OSError, subprocess.TimeoutExpired):
             pass

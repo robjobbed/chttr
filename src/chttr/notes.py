@@ -197,6 +197,21 @@ def _matches(value, schema: dict) -> bool:
     return True
 
 
+def ollama_http_error(exc: urllib.error.HTTPError, model: str) -> str:
+    """What Ollama said when it refused a request, with the fix for a model that isn't
+    downloaded yet."""
+    try:
+        detail = exc.read().decode("utf-8", "replace")[:300]
+    except OSError:
+        detail = ""
+    try:
+        detail = json.loads(detail).get("error", detail)
+    except (json.JSONDecodeError, AttributeError):
+        pass
+    hint = f" (get it with: ollama pull {model})" if exc.code == 404 else ""
+    return f"{str(detail).strip() or exc}{hint}"
+
+
 def _call_ollama(cfg: PolishCfg, schema: dict, system: str, content: list[dict], max_tokens: int) -> dict:
     """The same request on a local model, with the schema as Ollama's structured output
     format. A reply that doesn't match gets one more try."""
@@ -211,13 +226,7 @@ def _call_ollama(cfg: PolishCfg, schema: dict, system: str, content: list[dict],
             with urllib.request.urlopen(req, timeout=OLLAMA_TIMEOUT) as r:
                 data = json.load(r)
         except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", "replace")[:300]
-            try:
-                detail = json.loads(detail).get("error", detail)
-            except (json.JSONDecodeError, AttributeError):
-                pass
-            hint = f" (get it with: ollama pull {cfg.ollama_model})" if exc.code == 404 else ""
-            raise RuntimeError(f"Ollama: {detail}{hint}") from exc
+            raise RuntimeError(f"Ollama: {ollama_http_error(exc, cfg.ollama_model)}") from exc
         except (OSError, urllib.error.URLError) as exc:
             raise RuntimeError(f"Ollama is not answering at {cfg.ollama_url} ({exc})") from exc
         text = str((data.get("message") or {}).get("content", ""))

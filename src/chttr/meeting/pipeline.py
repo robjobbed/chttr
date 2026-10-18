@@ -166,12 +166,14 @@ def process(directory: Path, cfg: Config, summary: bool | None = None) -> Path:
         log.info("notes: on-device (no Claude key or Ollama)")
         result["notes"] = lite.notes_lite(result)
     elif want_summary and all_utts:
+        style_id = ""
         try:
+            style_id = choose_style(result, cfg)
             with D.timed("notes"):
-                write_notes(result, cfg, choose_style(result, cfg), meta.get("style_extra", ""))
+                write_notes(result, cfg, style_id, meta.get("style_extra", ""))
         except Exception as exc:  # noqa: BLE001 - the transcript is still worth saving
             log.warning("notes failed: %s; writing on-device notes instead", exc)
-            result["notes"] = {**lite.notes_lite(result), "error": f"{type(exc).__name__}: {exc}"}
+            result["notes"] = {**lite.notes_lite(result), "error": f"{type(exc).__name__}: {exc}", "wanted": style_id}
 
     # ---- remember voices we are sure of ------------------------------------
     for sp in speakers.values():

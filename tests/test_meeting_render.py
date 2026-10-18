@@ -150,6 +150,17 @@ def test_render_marks_on_device_notes(tmp_path, cfg, result):
     assert "## Numbers and dates" in text and "- [ ] **Speaker 1**: I can send the contract." in text
 
 
+def test_a_failed_custom_style_is_retried_with_its_prompt(tmp_path, cfg, result):
+    from chttr.meeting import lite
+
+    result["meta"].update(style="custom", style_extra='every "number" and who said it')
+    result["notes"] = {**lite.notes_lite(result), "error": "RuntimeError: overloaded", "wanted": "custom"}
+    text = render.render(tmp_path, result, cfg).read_text(encoding="utf-8")
+    assert f"Try again with `chttr meeting style --prompt \"every 'number' and who said it\" --meeting {tmp_path.name}`." \
+        in text
+    assert "add a Claude key" not in text
+
+
 def test_notes_prompt_lists_each_speakers_share_of_the_talk(result):
     from chttr.meeting.styles import _notes_inputs
 
@@ -225,6 +236,58 @@ def test_rename_keeps_a_stored_voice_that_does_not_match(tmp_path, cfg, result, 
     assert set(D.load_voices()) == {"dana@x.com", "sam@x.com"}   # the real Dana sounds different: keep her
 
 
+def test_rename_that_fixes_the_spelling_keeps_the_learned_voice(tmp_path, cfg, result, monkeypatch):
+    voices_file = tmp_path / "voices.json"
+    monkeypatch.setattr(D.load_voices, "__defaults__", (voices_file,))
+    monkeypatch.setattr(D.save_voices, "__defaults__", (voices_file,))
+    voice = np.ones(8, dtype=np.float32) / np.sqrt(8)
+    D.save_voices({"dana@x.com": D.Voice("dana@x.com", "Dana", "dana@x.com", voice, 20, "2026-10-01T10:00:00+00:00")})
+    directory = tmp_path / "meeting"
+    directory.mkdir()
+    store.write_json(directory / "result.json", result)
+    np.savez(directory / "speakers.npz", **{"0": voice})
+
+    edit.rename(directory, "Dana", "Dana Smith", "", cfg)        # only adds her surname
+
+    voices = D.load_voices()
+    assert set(voices) == {"dana@x.com"}
+    assert voices["dana@x.com"].count == 21 and voices["dana@x.com"].name == "Dana Smith"
+    assert store.read_json(directory / "result.json")["speakers"]["Dana Smith"]["email"] == "dana@x.com"
+
+
+def test_rename_moves_a_voice_without_an_email_to_the_new_spelling(tmp_path, cfg, result, monkeypatch):
+    voices_file = tmp_path / "voices.json"
+    monkeypatch.setattr(D.load_voices, "__defaults__", (voices_file,))
+    monkeypatch.setattr(D.save_voices, "__defaults__", (voices_file,))
+    voice = np.ones(8, dtype=np.float32) / np.sqrt(8)
+    result["speakers"]["Dana"]["email"] = ""
+    D.save_voices({"dana": D.Voice("dana", "Dana", "", voice, 7, "2026-10-01T10:00:00+00:00")})
+    directory = tmp_path / "meeting"
+    directory.mkdir()
+    store.write_json(directory / "result.json", result)
+    np.savez(directory / "speakers.npz", **{"0": voice})
+
+    edit.rename(directory, "Dana", "Danna", "", cfg)
+
+    voices = D.load_voices()
+    assert set(voices) == {"danna"} and voices["danna"].count == 8
+
+
+def test_rename_to_someone_else_drops_the_wrong_address(tmp_path, cfg, result):
+    directory = tmp_path / "meeting"
+    directory.mkdir()
+    store.write_json(directory / "result.json", result)
+    edit.rename(directory, "Dana", "Sam", "", cfg)
+    assert store.read_json(directory / "result.json")["speakers"]["Sam"]["email"] == ""
+
+
+@pytest.mark.parametrize("old,new,same", [("Dana", "Dana Smith", True), ("Jon", "John", True),
+                                          ("Chris", "Christopher", True), ("Dana", "Sam", False),
+                                          ("Mark", "Mary", False), ("Steven", "Stephen", True), ("Ali", "Alex", False), ("Dana", "", False)])
+def test_same_person(old, new, same):
+    assert edit._same_person(old, new) is same
+
+
 class Run:
     def __init__(self, stdout=""):
         self.calls: list[list[str]] = []
@@ -251,7 +314,11 @@ def test_notify_done_on_omarchy_opens_the_notes_on_click(tmp_path, result, monke
 
     assert run.calls == [["omarchy-notification-send", "--app-name", "chttr", "-g", edit.GLYPH, "-u", "normal",
                           "-t", "120000", "On-device notes saved: 2026-10-11 1400 Pricing call",
-                          "10 min · Rob, Dana\nClick to open.", "--exec", "xdg-open", str(md)]]
+                          "10 min · Rob, Dana\nClick to open. Send it to Slack with: chttr send",
+                          "--exec", "xdg-open", str(md)]]
+    run.calls.clear()
+    edit.notify_done(md, "10 min · Rob, Dana")
+    assert run.calls[0][10] == "10 min · Rob, Dana\nClick to open."
 
 
 def test_notify_done_elsewhere_waits_for_open_or_send(tmp_path, result, monkeypatch):

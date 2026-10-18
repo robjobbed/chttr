@@ -33,7 +33,8 @@ def test_read_transcript_reads_mm_ss_as_minutes_and_seconds(lib, monkeypatch):  
     t["read_transcript"]("2026-10-01-140000", around="01:02:03")
     t["read_transcript"]("2026-10-01-140000", around="40")
     assert seen == [12 * 60 + 40, 3723, 40]
-    assert "error" in json.loads(t["read_transcript"]("2026-10-01-140000", around="soon"))
+    for bad in ("soon", "inf", "1e999", "nan"):
+        assert "error" in json.loads(t["read_transcript"]("2026-10-01-140000", around=bad))
 
 
 def rpc(lines: list[dict]) -> list[dict]:
@@ -166,3 +167,22 @@ def test_ask_with_ollama_answers_from_the_search_hits(lib, monkeypatch, capsys):
     assert run_ask(["contract"]) == 0                           # falls back to the search results
     out, err = capsys.readouterr()
     assert "Ali: I will send the revised contract" in out and "did not answer" in err
+
+
+def test_ask_with_ollama_missing_the_model_says_how_to_get_it(lib, monkeypatch, capsys):  # noqa: F811
+    import urllib.error
+
+    from chttr import notes, polish
+
+    monkeypatch.setattr(notes, "available", lambda cfg: True)
+    monkeypatch.setattr(polish, "backend", lambda cfg: "ollama")
+
+    def missing(req, timeout=None):
+        raise urllib.error.HTTPError(req.full_url, 404, "Not Found", {},  # pyright: ignore[reportArgumentType]
+                                     io.BytesIO(b'{"error":"model not found"}'))
+
+    monkeypatch.setattr("urllib.request.urlopen", missing)
+    assert run_ask(["contract"]) == 0                           # still prints the search results
+    out, err = capsys.readouterr()
+    assert "Ali: I will send the revised contract" in out
+    assert "model not found (get it with: ollama pull " in err and "HTTP Error" not in err
