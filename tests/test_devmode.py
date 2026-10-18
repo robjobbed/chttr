@@ -45,3 +45,48 @@ def test_keep_list_collects_identifiers_for_the_model():
     original = "rename camel case user id in at main dot py"
     out = DM.transform(original, code=True)
     assert DM.keep_list(original, out) == ["userId", "@main.py"]
+
+
+@pytest.mark.parametrize(("spoken", "typed"), [
+    ("ls dash l", "ls -l"),
+    ("git commit dash m fix the tests", "git commit -m fix the tests"),
+    ("pytest dash dash verbose", "pytest --verbose"),
+    ("grep dash dash ignore dash case todo", "grep --ignore-case todo"),     # a flag, not kebab case
+    ("npm install dash-dash save-dev", "npm install --save-dev"),
+    ("cat log pipe grep error", "cat log | grep error"),
+    ("pipe the output to jq", "pipe the output to jq"),                        # the verb stays a word
+    ("cd tilde slash work slash chttr", "cd ~/work/chttr"),
+    ("run dot slash setup dot sh", "run ./setup.sh"),
+    ("std double colon vector", "std::vector"),
+    ("fn main open paren close paren arrow i32", "fn main() -> i32"),
+    ("use the arrow keys", "use the arrow keys"),
+    ("x fat arrow x", "x => x"),
+    ("if open paren ready close paren open brace", "if (ready) {"),
+    ("items open bracket zero close bracket", "items[zero]"),
+    ("make ampersand ampersand make install", "make && make install"),
+    ("run backtick npm test backtick first", "run `npm test` first"),
+    ("a dash of salt", "a dash of salt"),
+])
+def test_symbols(spoken, typed):
+    assert DM.transform(spoken, code=True) == typed
+
+
+def test_symbols_only_in_code_apps():
+    assert DM.transform("ls dash l pipe less", code=False) == "ls dash l pipe less"
+
+
+@pytest.mark.parametrize(("spoken", "typed", "enter"), [
+    ("git status, run it", "git status", True),
+    ("git status run it", "git status", True),
+    ("Git status, run it.", "Git status", True),
+    ("make test - press enter", "make test", True),
+    ("ls. Hit enter!", "ls", True),
+    ("npm test and go", "npm test", True),
+    ("run it", "", True),                                    # just Enter
+    ("please run it again later", "please run it again later", False),   # mid-sentence: left alone
+    ("fix the failing test and run it", "fix the failing test and run it", False),
+    ("Priyanka will send it", "Priyanka will send it", False),
+    ("git status", "git status", False),
+])
+def test_strip_enter(spoken, typed, enter):
+    assert DM.strip_enter(spoken) == (typed, enter)

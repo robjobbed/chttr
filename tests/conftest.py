@@ -49,3 +49,13 @@ def _real_models_for_model_tests(request, monkeypatch):
 @pytest.fixture
 def fixtures() -> Path:
     return FIXTURES
+
+
+@pytest.fixture(autouse=True)
+def _no_real_key_presses(monkeypatch):
+    """The daemon presses Enter ("run it") and Backspace ("delete that") straight
+    through the desktop; tests must never reach the real one."""
+    from chttr import daemon
+
+    monkeypatch.setattr(daemon, "press_enter", lambda delay=0.0: None)
+    monkeypatch.setattr(daemon, "delete_selection", lambda: None)

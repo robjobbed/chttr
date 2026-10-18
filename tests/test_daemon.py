@@ -256,3 +256,116 @@ def test_screen_context_backs_off_when_atspi_never_answers(daemon, monkeypatch):
         daemon.handle("release")
         wait_idle(daemon)
     assert len(calls) == Dm.ATSPI_GIVE_UP
+
+
+def dictate(d, text, kind="start"):
+    d.transcriber.texts = [text]
+    d.handle(kind)
+    d.handle("release")
+    wait_idle(d)
+
+
+def test_dictation_joins_the_sentence_before_the_cursor(daemon, monkeypatch):
+    monkeypatch.setattr(Dm, "focused_window", lambda: ("thunderbird", "Write: Re: Friday"))
+    monkeypatch.setattr(Dm.CX, "read_field", lambda *a, **k: Dm.CX.Field("Mail", "as we said", ""))
+    dictate(daemon, "Tomorrow works")
+    assert daemon.typed == [" tomorrow works"]
+
+
+def test_command_mode_sorts_lines_without_a_model(daemon, monkeypatch):
+    monkeypatch.setattr(Dm, "focused_window", lambda: ("code-oss", "notes.txt"))
+    monkeypatch.setattr(Dm, "grab_selection", lambda terminal: "b\na")
+    dictate(daemon, "sort lines", "command")
+    assert daemon.typed == ["a\nb"]
+    assert "Command mode needs a model" not in daemon.feedback.notes
+
+
+def test_command_mode_needs_a_model_for_anything_else(daemon, monkeypatch):
+    monkeypatch.setattr(Dm, "grab_selection", lambda terminal: "some selected text")
+    dictate(daemon, "make it sound friendlier", "command")
+    assert daemon.typed == []
+    assert "Command mode needs a model" in daemon.feedback.notes
+
+
+def test_delete_that_deletes_the_selection(daemon, monkeypatch):
+    deleted = []
+    monkeypatch.setattr(Dm, "focused_window", lambda: ("thunderbird", "Write"))
+    monkeypatch.setattr(Dm, "grab_selection", lambda terminal: "a sentence I regret")
+    monkeypatch.setattr(Dm, "delete_selection", lambda: deleted.append(1))
+    dictate(daemon, "delete that", "command")
+    assert deleted == [1] and daemon.typed == []
+    assert "Deleted" in daemon.feedback.notes
+
+
+def test_command_mode_logs_no_words_at_info(daemon, monkeypatch, caplog):
+    monkeypatch.setattr(Dm.P, "backend", lambda cfg: "claude")
+    monkeypatch.setattr(Dm.P, "command", lambda *a, **k: "Secret rewritten text")
+    monkeypatch.setattr(Dm, "grab_selection", lambda terminal: "secret selected text")
+    with caplog.at_level("INFO", logger="chttr.daemon"):
+        dictate(daemon, "make it sound friendlier", "command")
+    assert daemon.typed == ["Secret rewritten text"]
+    info = " ".join(r.getMessage() for r in caplog.records if r.levelname == "INFO" and "command" in r.getMessage())
+    assert "4 words -> 3 words" in info and "friendlier" not in info and "Secret" not in info
+
+
+def test_run_it_types_the_command_and_presses_enter(daemon, monkeypatch):
+    pressed = []
+    monkeypatch.setattr(Dm, "press_enter", lambda delay=0.0: pressed.append(delay))
+    dictate(daemon, "git status, run it")
+    assert daemon.typed == ["git status"] and pressed == [0.0]
+
+
+def test_run_it_never_presses_enter_after_the_clipboard_fallback(daemon, monkeypatch):
+    pressed = []
+    monkeypatch.setattr(Dm, "press_enter", lambda delay=0.0: pressed.append(delay))
+    monkeypatch.setattr(Dm, "deliver", lambda text, cfg, **kw: daemon.typed.append(text) or "clipboard")
+    dictate(daemon, "git status, run it")
+    assert daemon.typed == ["git status"] and pressed == []
+
+
+def test_run_it_can_be_turned_off(daemon, monkeypatch):
+    pressed = []
+    monkeypatch.setattr(Dm, "press_enter", lambda delay=0.0: pressed.append(delay))
+    daemon.cfg.output.spoken_enter = False
+    dictate(daemon, "git status, run it")
+    assert daemon.typed == ["git status, run it"] and pressed == []
+
+
+def test_window_title_picks_the_mode(daemon, monkeypatch):
+    seen = []
+    monkeypatch.setattr(Dm, "deliver", lambda text, cfg, **kw: seen.append(kw) or "type")
+    monkeypatch.setattr(Dm.P, "backend", lambda cfg: "claude")
+    monkeypatch.setattr(Dm.P, "polish", lambda text, cfg, app, title, vocab, style="", **k: seen.append(style) or text)
+    monkeypatch.setattr(Dm, "focused_window", lambda: ("chromium", "Inbox - Gmail"))
+    dictate(daemon, "thanks for the notes from this morning")
+    email = daemon.cfg.mode_for("chromium", "Inbox - Gmail")
+    assert email.name == "email" and seen[0] == email.style
+    assert seen[1]["newline"] == "enter" and seen[1]["allow_paste"] is True
+
+
+def test_chat_tabs_get_shift_enter_line_breaks(daemon, monkeypatch):
+    seen = []
+    monkeypatch.setattr(Dm, "deliver", lambda text, cfg, **kw: seen.append(kw) or "type")
+    monkeypatch.setattr(Dm, "focused_window", lambda: ("chromium", "Slack | general | Acme"))
+    dictate(daemon, "sounds good")
+    assert seen[0]["newline"] == "shift+enter"
+
+
+def test_coding_agents_in_a_terminal_keep_their_sentences(daemon, monkeypatch):
+    styles, seen = [], []
+    monkeypatch.setattr(Dm, "deliver", lambda text, cfg, **kw: seen.append(kw) or "type")
+    monkeypatch.setattr(Dm.P, "backend", lambda cfg: "claude")
+    monkeypatch.setattr(Dm.P, "polish", lambda text, cfg, app, title, vocab, style="", **k: styles.append(style) or text)
+    monkeypatch.setattr(Dm, "focused_window", lambda: ("com.mitchellh.ghostty", "✳ Claude Code"))
+    dictate(daemon, "Look at the failing test. Then fix it in at main dot py.")
+    assert "AI coding agent" in styles[0]
+    assert seen[0]["allow_paste"] is False and seen[0]["trailing_space"] is False
+
+
+def test_saying_only_run_it_presses_enter(daemon, monkeypatch):
+    pressed = []
+    monkeypatch.setattr(Dm, "press_enter", lambda delay=0.0: pressed.append(delay))
+    monkeypatch.setattr(Dm.P, "backend", lambda cfg: "claude")
+    monkeypatch.setattr(Dm.P, "polish", lambda *a, **k: pytest.fail("nothing to clean up"))
+    dictate(daemon, "Run it.")
+    assert daemon.typed == [""] and pressed == [0.0]

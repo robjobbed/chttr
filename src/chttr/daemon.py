@@ -19,15 +19,15 @@ from pathlib import Path
 
 import numpy as np
 
+from . import commands, devmode
 from . import config as C
 from . import context as CX
-from . import devmode
 from . import polish as P
 from .config import Config, Mode
 from .dictionary import Dictionary
 from .feedback import Feedback
 from .meeting import Session, launch_processing
-from .output import current_desktop, deliver, focused_window, grab_selection
+from .output import current_desktop, delete_selection, deliver, focused_window, grab_selection, press_enter, smart_join
 from .recorder import Recorder
 from .streaming import Streamer
 from .transcriber import Transcriber, engine_key
@@ -554,8 +554,8 @@ class Daemon:
             app, title = focused_window()
             selection = ""
             if kind == COMMAND:
-                mode = self.cfg.mode_for(app)
-                selection = grab_selection(terminal=bool(mode and mode.name == "terminal")).strip()
+                mode = self.cfg.mode_for(app, title)
+                selection = grab_selection(terminal=bool(mode and mode.in_terminal)).strip()
         except Exception:
             log.exception("reading the focused window failed")
             app, title, selection = "", "", ""
@@ -649,6 +649,7 @@ class Daemon:
         raw = text = ""
         method = ""
         mode: Mode | None = None
+        enter_after = False
         try:
             t0 = time.monotonic()
             dictionary = Dictionary.load()
@@ -673,24 +674,35 @@ class Daemon:
             fixed = dictionary.apply(raw, names)
             if fixed != raw:
                 log.info("dictionary: %r", fixed)
-            mode = self.cfg.mode_for(app)
+            mode = self.cfg.mode_for(app, title)
             if kind == COMMAND:
                 text = self._run_command(fixed, selection, app, title, mode, dictionary)
                 if not text:
                     return
             else:
                 coded = devmode.transform(fixed, bool(mode and mode.is_code))
+                coded, enter_after = (devmode.strip_enter(coded) if (mode and mode.is_code and self.cfg.output.spoken_enter)
+                                      else (coded, False))
                 keep = devmode.keep_list(fixed, coded)
                 if coded != fixed:
                     log.info("dev mode: %r", coded)
                 text = self._polish(coded, app, title, mode, dictionary, keep, names,
-                                    field.before if field and self.cfg.polish.screen_context == "full" else "")
+                                    field.before if field and self.cfg.polish.screen_context == "full" else "") \
+                    if coded else ""        # it was only "run it": nothing to type, just Enter
                 text = dictionary.expand_snippets(text)
+            ts_override = None
+            if kind != COMMAND and field is not None and self.cfg.polish.screen_context != "off":
+                text, ts_override = smart_join(field.before, field.after, text, dictionary.vocabulary + names,
+                                               code=bool(mode and mode.is_code))
             self._wait_turn(seq)
             method = deliver(text, self.cfg.output,
                              mode=(mode.output if mode else ""),
-                             trailing_space=False if kind == COMMAND else (mode.trailing_space if mode else None),
-                             allow_paste=not (mode and mode.name == "terminal"))
+                             trailing_space=False if kind == COMMAND else (
+                                 ts_override if ts_override is not None else (mode.trailing_space if mode else None)),
+                             allow_paste=not (mode and mode.in_terminal),
+                             newline=(mode.newline if mode else "enter"))
+            if enter_after and method in ("type", "paste"):
+                press_enter(0.2 if method == "paste" else 0.0)
             label = "Replaced" if kind == COMMAND and selection else "Typed"
             if self.cfg.history.learn_from_edits and kind != COMMAND and method in ("type", "paste"):
                 timer = threading.Timer(8.0, self._learn_from_edits, args=(text,))
@@ -816,17 +828,31 @@ class Daemon:
 
     def _run_command(self, instruction: str, selection: str, app: str, title: str,
                      mode: Mode | None, dictionary: Dictionary) -> str:
+        if selection:
+            local = commands.local_command(instruction, selection)
+            if local == "" and not (mode and mode.in_terminal):     # "delete that"
+                log.info("command handled locally: delete")
+                delete_selection()
+                self.feedback.notify("Deleted", f"{len(selection.split())} words", timeout_ms=2000)
+                return ""
+            if local:
+                log.info("command handled locally")
+                return local
         if P.backend(self.cfg.polish) == "none":
             self.feedback.play("error")
             self.feedback.notify("Command mode needs a model",
-                                 "Add an Anthropic key to ~/.config/chttr/anthropic-api-key, or install and start Ollama.",
-                                 urgency="normal", timeout_ms=8000)
+                                 "Add a key (chttr connect claude) or run Ollama. Without a model these work on a "
+                                 "selection: upper case, lower case, title case, join lines, sort lines, bullet list, "
+                                 "numbered list, wrap in quotes, remove duplicates.",
+                                 urgency="normal", timeout_ms=10000)
             return ""
         try:
             t1 = time.monotonic()
             out = P.command(instruction, selection, self.cfg.polish, app, title, dictionary.vocabulary,
                             style=mode.style if mode else "")
-            log.info("command %.2fs: %r -> %r", time.monotonic() - t1, instruction, out[:200])
+            log.info("command %.2fs: %d words -> %d words", time.monotonic() - t1, len(instruction.split()),
+                     len(out.split()))
+            log.debug("command: %r -> %r", instruction, out[:200])
             return out
         except Exception as exc:  # noqa: BLE001
             log.warning("command failed: %s", exc)
