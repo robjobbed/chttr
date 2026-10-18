@@ -18,7 +18,7 @@ def send(command: str, timeout: float = 5.0) -> dict:
     try:
         sock.connect(str(C.SOCKET_PATH))
     except (FileNotFoundError, ConnectionRefusedError) as exc:
-        raise DaemonNotRunning("chttr daemon is not running (start it with: chttr daemon)") from exc
+        raise DaemonNotRunning("chttr daemon is not running (systemctl --user start chttr, or: chttr daemon)") from exc
     try:
         sock.sendall((command + "\n").encode())
         buf = b""

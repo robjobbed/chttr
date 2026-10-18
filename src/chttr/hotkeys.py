@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import select
 import struct
 import threading
@@ -338,3 +339,123 @@ class Hotkeys:
             self.dispatch(action, pressed)
         except Exception:
             log.exception("hotkey %s failed", action)
+
+
+# ---- the keys that are actually bound ---------------------------------------------------
+
+VERBS = {"start": "dictate", "command": "command", "toggle": "hands_free", "history": "history",
+         "meeting toggle": "meeting"}
+_VERB = re.compile(r"\bchttr\s+(start|command|toggle|history|meeting\s+toggle)\s*$")
+_MOD_NAMES = {"alt": "Alt", "mod1": "Alt", "super": "Super", "mod4": "Super", "win": "Super", "logo": "Super",
+              "meta": "Super", "ctrl": "Ctrl", "control": "Ctrl", "shift": "Shift"}
+_LUA_BIND = re.compile(r"""^\s*\w+\.bind\(\s*(["'])(.*?)\1\s*,\s*(["']).*?\3\s*,\s*(["'])(.*?)\4(.*)$""")
+_CONF_BIND = re.compile(r"^\s*bind([a-z]*)\s*=\s*(.*)$")
+_CONF_VAR = re.compile(r"^\s*\$(\w+)\s*=\s*(.*?)\s*$")
+_SWAY_BIND = re.compile(r"^\s*bindsym\s+((?:--[\w-]+\s+)*)(\S+)\s+exec\s+(.*)$")
+
+
+def key_label(tokens: Iterable[str]) -> str:
+    """["SUPER", "SHIFT", "Insert"] or ["Mod4", "Insert"] -> "Super+Shift+Insert"."""
+    parts = [t for t in tokens if t]
+    if not parts:
+        return ""
+    mods = [_MOD_NAMES.get(m.lower(), m.capitalize()) for m in parts[:-1]]
+    key = parts[-1]
+    if key.isalpha() and (key.islower() or key.isupper()) and len(key) > 1:
+        key = key.capitalize()
+    elif len(key) > 1 and key[0] in "fF" and key[1:].isdigit():
+        key = key.upper()
+    return "+".join([*mods, key])
+
+
+def _action(command: str) -> str | None:
+    m = _VERB.search(command.strip().strip("\"'"))
+    return VERBS[re.sub(r"\s+", " ", m.group(1))] if m else None
+
+
+def _parse_lua(text: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for line in text.splitlines():
+        if line.lstrip().startswith("--") or not (m := _LUA_BIND.match(line)):
+            continue
+        if re.search(r"release\s*=\s*true", m.group(6)):
+            continue
+        if (action := _action(m.group(5))) and action not in out:
+            out[action] = key_label(re.split(r"\s*\+\s*|\s+", m.group(2).strip()))
+    return out
+
+
+def _parse_conf(text: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    variables: dict[str, str] = {}
+    for line in text.splitlines():
+        line = line.split("#", 1)[0]
+        if v := _CONF_VAR.match(line):
+            variables[v.group(1)] = v.group(2)
+            continue
+        if not (m := _CONF_BIND.match(line)) or "r" in m.group(1):      # bindr / bindrd: key release
+            continue
+        fields = [f.strip() for f in m.group(2).split(",")]
+        if "d" in m.group(1):
+            del fields[2:3]                                          # the description
+        if len(fields) < 4 or fields[2] != "exec":
+            continue
+        if (action := _action(",".join(fields[3:]))) and action not in out:
+            mods = re.sub(r"\$(\w+)", lambda x: variables.get(x.group(1), x.group(0)), fields[0])
+            out[action] = key_label([*re.split(r"[\s+_]+", mods.strip()), fields[1]])
+    return out
+
+
+def _parse_sway(text: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for line in text.splitlines():
+        if line.lstrip().startswith("#") or not (m := _SWAY_BIND.match(line)) or "--release" in m.group(1):
+            continue
+        if (action := _action(m.group(3))) and action not in out:
+            out[action] = key_label(m.group(2).split("+"))
+    return out
+
+
+def binding_files(compositor: str, home: Path | None = None) -> list[tuple[Path, Callable[[str], dict[str, str]]]]:
+    """The compositor config files chttr bindings can live in, with their parser."""
+    cfg = (home or Path.home()) / ".config"
+    hypr = [(cfg / "hypr/bindings.lua", _parse_lua), (cfg / "hypr/bindings.conf", _parse_conf),
+            (cfg / "hypr/hyprland.conf", _parse_conf)]
+    sway = [(cfg / "sway/config.d/chttr.conf", _parse_sway), (cfg / "sway/config", _parse_sway)]
+    return {"hyprland": hypr, "sway": sway}.get(compositor, hypr + sway)
+
+
+def compositor_bindings(compositor: str, home: Path | None = None) -> tuple[dict[str, str], Path | None]:
+    """chttr's keys as the compositor binds them, and the first file they were found in."""
+    found: dict[str, str] = {}
+    source = None
+    for path, parse in binding_files(compositor, home):
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        got = {a: k for a, k in parse(text).items() if a not in found}
+        if got:
+            found.update(got)
+            source = source or path
+    return found, source
+
+
+def effective_bindings(cfg, desk, home: Path | None = None, backend: str | None = None) -> dict[str, str]:
+    """{action: "Alt+Insert"} for the keys that really trigger chttr, in ACTIONS order.
+
+    With the compositor backend that is what Hyprland's or Sway's config binds (an
+    action without a binding there isn't listed); the portal and evdev backends use
+    [hotkeys] from config.toml. Nothing is bound when no backend can catch keys."""
+    hk = getattr(cfg, "hotkeys", cfg)
+    if backend is None and home is not None and hk.backend == "auto" and compositor_bindings(desk.compositor, home)[0]:
+        backend = "compositor"                  # what resolve() decides, but for this home
+    backend = backend or resolve(hk.backend, desk.compositor)
+    if backend == "none":
+        return {}
+    configured = {a: getattr(hk, a, "") for a in ACTIONS if getattr(hk, a, "")}
+    if backend == "compositor":
+        found, _ = compositor_bindings(desk.compositor, home)
+        if found:
+            return {a: found[a] for a in ACTIONS if a in found}
+    return configured
