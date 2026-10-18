@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
+import re
 import shutil
 import subprocess
 import sys
@@ -12,13 +15,39 @@ from pathlib import Path
 from ..config import Config
 from .store import new_meeting_dir, update_meta
 
+log = logging.getLogger("chttr.meeting")
 
-def launch_processing(directory: Path) -> None:
-    """Run `chttr meeting process` in its own session at low priority, so the
-    daemon stays responsive and a daemon restart doesn't kill it."""
-    log_file = (directory / "process.log").open("ab")
-    cmd = ["nice", "-n", "10", sys.executable, "-m", "chttr", "meeting", "process", "--notify", str(directory)]
-    subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log_file, stderr=subprocess.STDOUT, start_new_session=True)
+
+# Passed on to the processing unit when the daemon has them (names only: values,
+# such as an API key, never appear on a command line).
+PASS_ENV = ("CHTTR_CONFIG", "ANTHROPIC_API_KEY", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_RUNTIME_DIR",
+            "WAYLAND_DISPLAY", "DISPLAY", "DBUS_SESSION_BUS_ADDRESS", "PATH")
+
+
+def launch_processing(directory: Path) -> str:
+    """Run `chttr meeting process` at low priority, outside the daemon: in a systemd
+    unit of its own when there is a user manager (restarting chttr.service no longer
+    kills it), else in its own session. Returns how: "systemd-run" or "nice"."""
+    process = [sys.executable, "-m", "chttr", "meeting", "process", "--notify", str(directory)]
+    if shutil.which("systemd-run"):
+        unit = "chttr-process-" + re.sub(r"[^A-Za-z0-9_.-]", "-", directory.name)
+        cmd = ["systemd-run", "--user", "--collect", "--quiet", "--unit", unit, "--property=Nice=10",
+               f"--property=StandardOutput=append:{directory.absolute() / 'process.log'}", "--property=StandardError=inherit"]
+        cmd += [f"--setenv={name}" for name in PASS_ENV if name in os.environ]
+        try:
+            done = subprocess.run(cmd + process, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                  timeout=15, check=False)
+            if done.returncode == 0:
+                log.info("processing %s in %s.service", directory.name, unit)
+                return "systemd-run"
+            log.warning("systemd-run failed (%s); processing in the background instead",
+                        (done.stderr or "").strip() or f"exit {done.returncode}")
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            log.warning("systemd-run failed (%s); processing in the background instead", exc)
+    with (directory / "process.log").open("ab") as log_file:
+        subprocess.Popen(["nice", "-n", "10", *process], stdin=subprocess.DEVNULL, stdout=log_file,
+                         stderr=subprocess.STDOUT, start_new_session=True)
+    return "nice"
 
 
 class Session:

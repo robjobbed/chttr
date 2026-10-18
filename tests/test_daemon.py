@@ -512,3 +512,281 @@ def test_chat_keeps_line_breaks_when_they_are_typed_safely(daemon, monkeypatch):
     monkeypatch.setattr(Dm.P, "backend", lambda cfg: "claude")
     monkeypatch.setattr(Dm.P, "polish", lambda *a, **k: "Hi all,\n\nThe build is green.")
     assert dictate(daemon, "hi all new paragraph the build is green") == "Hi all,\n\nThe build is green."
+
+
+# ---- always on: the model loads in the background, nothing dies quietly -------
+
+class BlockingTranscriber(FakeTranscriber):
+    """A model that takes as long to load as the test says (`gate`), or is missing (`error`)."""
+
+    gate = threading.Event()
+    error: Exception | None = None
+    texts_on_load: tuple[str, ...] = ()
+
+    def __init__(self, cfg):
+        if self.error:
+            raise self.error
+        self.gate.wait(5)
+        super().__init__(cfg)
+        self.texts = list(self.texts_on_load)
+
+
+@pytest.fixture
+def lazy_daemon(daemon, monkeypatch):
+    """Like `chttr daemon`: no model yet. Shares the fixture's fakes and typed list."""
+    class Model(BlockingTranscriber):
+        gate = threading.Event()
+
+    monkeypatch.setattr(Dm, "Transcriber", Model)
+    d = Dm.Daemon(daemon.cfg, load_model=False)
+    d.typed = daemon.typed
+    d.Model = Model
+    return d
+
+
+def wait_for(cond, timeout=3.0):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if cond():
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def test_status_reports_a_ready_model(daemon):
+    assert daemon.handle("status")["model"] == "ready"
+
+
+def test_a_dictation_made_while_the_model_loads_is_typed_when_it_is_ready(lazy_daemon):
+    d = lazy_daemon
+    d.Model.texts_on_load = ("typed after loading",)
+    threading.Thread(target=d._load_model, daemon=True).start()
+    assert wait_for(lambda: d.state == Dm.LOADING)
+    assert d.handle("status")["model"] == "loading"
+    assert d.handle("start")["state"] == Dm.RECORDING          # the key works at once
+    assert d.handle("release")["state"] == Dm.TRANSCRIBING
+    assert wait_for(lambda: "Loading the speech model…" in d.feedback.notes)
+    assert d.typed == []
+    d.Model.gate.set()
+    wait_idle(d)
+    assert d.typed == ["typed after loading"]
+    assert d.handle("status")["model"] == "ready"
+
+
+def test_a_missing_model_is_one_clear_notice_and_no_crash(lazy_daemon):
+    d = lazy_daemon
+    d.Model.error = FileNotFoundError("no Parakeet model in ~/.local/share/chttr/models")
+    d._load_model()
+    assert d.state == Dm.IDLE
+    assert d.handle("status")["model"] == "missing"
+    assert "chttr: the speech model is missing" in d.feedback.notes
+    assert d.handle("start")["state"] == Dm.RECORDING          # still records
+    assert "chttr can't transcribe: speech model missing" in d.feedback.notes
+    d.handle("release")
+    wait_idle(d)
+    assert d.typed == []
+    assert d.feedback.notes[-1] == "chttr error"
+
+
+def test_a_corrupt_model_is_the_same_clear_notice(lazy_daemon):
+    d = lazy_daemon
+    # what onnxruntime raises for a half-downloaded model: a plain Exception, not a RuntimeError
+    d.Model.error = Exception("[ONNXRuntimeError] : 7 : INVALID_PROTOBUF : Load model failed")
+    d._load_model()
+    assert d.state == Dm.IDLE
+    assert d.handle("status")["model"] == "missing"
+    assert "INVALID_PROTOBUF" in d.model_error
+    assert "chttr: the speech model is missing" in d.feedback.notes
+
+
+def test_a_reload_after_a_failed_model_load_does_not_say_missing_while_it_loads(lazy_daemon, monkeypatch, tmp_path):
+    d = lazy_daemon
+    d.Model.error = FileNotFoundError("no model")
+    d._load_model()
+    monkeypatch.setattr(C, "CONFIG_FILE", tmp_path / "config.toml")
+    d.Model.error = None
+    d.Model.gate.clear()
+    d.handle("reload")
+    assert d.model_error == ""
+    d.feedback.notes.clear()
+    d.handle("start")
+    assert "chttr can't transcribe: speech model missing" not in d.feedback.notes
+    d.handle("cancel")
+    d.Model.gate.set()
+    assert wait_for(lambda: d.handle("status")["model"] == "ready")
+
+
+def test_reload_retries_a_model_that_failed_to_load(lazy_daemon, monkeypatch, tmp_path):
+    d = lazy_daemon
+    d.Model.error = FileNotFoundError("no model")
+    d._load_model()
+    monkeypatch.setattr(C, "CONFIG_FILE", tmp_path / "config.toml")
+    d.Model.error = None
+    d.Model.gate.set()
+    reply = d.handle("reload")
+    assert "loading the speech model" in reply["message"]
+    assert wait_for(lambda: d.handle("status")["model"] == "ready")
+    assert d.model_error == ""
+
+
+def test_forever_survives_a_failing_tick(daemon):
+    calls = []
+
+    def tick():
+        calls.append(1)
+        if len(calls) < 3:
+            raise RuntimeError("hiccup")
+        daemon._stop.set()
+
+    daemon._forever("test", tick, 0.001)
+    assert len(calls) == 3
+
+
+def test_the_watchdog_survives_a_recorder_that_raises(daemon):
+    import subprocess
+
+    daemon.transcriber.texts = ["stopped at the limit"]
+    daemon.cfg.audio.max_seconds = 1
+    daemon.handle("toggle")
+    daemon.recorder.elapsed = 5.0
+    real_stop, fails = daemon.recorder.stop, [1]
+
+    def flaky_stop():
+        if fails:
+            fails.pop()
+            raise subprocess.TimeoutExpired("pw-record", 2)
+        return real_stop()
+
+    daemon.recorder.stop = flaky_stop
+    watchdog = threading.Thread(target=daemon._watchdog, daemon=True)
+    watchdog.start()
+    try:
+        wait_idle(daemon)
+        assert daemon.typed == ["stopped at the limit"]          # the second tick still enforced max_seconds
+        assert watchdog.is_alive()
+    finally:
+        daemon._stop.set()
+        watchdog.join(2)
+
+
+def test_a_microphone_that_goes_away_still_types_what_was_said(daemon):
+    daemon.transcriber.texts = ["half a sentence"]
+    daemon.handle("start")
+    daemon.recorder.active = False                               # pw-record quit by itself
+    daemon.recorder.error = "stream error: connection lost"
+    daemon.recorder.chunk_count = 50                             # one second of audio
+    daemon.heard_speech = True
+    daemon._watchdog_tick()
+    wait_idle(daemon)
+    assert daemon.typed == ["half a sentence"]
+    assert "chttr: the microphone went away" in daemon.feedback.notes
+
+
+def test_a_microphone_gone_after_a_silent_pause_is_not_called_silence(daemon):
+    daemon.transcriber.texts = [""]
+    daemon.handle("start")
+    daemon.recorder.active = False
+    daemon.recorder.error = "stream error: connection lost"
+    daemon.recorder.chunk_count = 75                             # 1.5 s, nothing said
+    daemon._watchdog_tick()
+    wait_idle(daemon)
+    assert daemon.typed == []
+    assert daemon.feedback.notes[-1] == "chttr: the microphone went away"
+    assert not any("No speech" in n for n in daemon.feedback.notes)
+
+
+def test_a_microphone_gone_before_a_word_is_not_called_silence(daemon):
+    daemon.handle("start")
+    daemon.recorder.active = False
+    daemon.recorder.error = "connection lost"
+    daemon._watchdog_tick()
+    wait_idle(daemon)
+    assert daemon.typed == []
+    assert daemon.feedback.notes[-1] == "chttr: the microphone went away"
+    assert not any("No speech" in n for n in daemon.feedback.notes)
+
+
+def test_reload_applies_audio_and_feedback_and_says_what_changed(daemon, monkeypatch, tmp_path):
+    path = tmp_path / "config.toml"
+    monkeypatch.setattr(C, "CONFIG_FILE", path)
+    monkeypatch.setattr(Dm, "engine_key", lambda cfg: daemon.transcriber.key)
+    old_feedback = daemon.feedback
+    path.write_text("[audio]\nwhisper_mode = true\n\n[feedback]\nsounds = false\n", encoding="utf-8")
+    reply = daemon.handle("reload")
+    assert reply["ok"] is True
+    assert "audio.whisper_mode" in reply["message"] and "feedback.sounds" in reply["message"]
+    assert "engine." not in reply["message"]
+    assert daemon.transcriber.boost is True
+    assert daemon.transcriber.threshold_db == -50
+    assert daemon.feedback is not old_feedback and daemon.feedback.cfg.sounds is False
+    assert daemon.cfg.audio.whisper_mode is True
+
+
+def test_reload_restarts_hotkeys_only_when_they_change(daemon, monkeypatch, tmp_path):
+    path = tmp_path / "config.toml"
+    monkeypatch.setattr(C, "CONFIG_FILE", path)
+    monkeypatch.setattr(Dm, "engine_key", lambda cfg: daemon.transcriber.key)
+    started = []
+    monkeypatch.setattr(daemon, "_start_hotkeys", lambda: started.append(daemon.cfg.hotkeys.dictate))
+    daemon.hotkeys = old = type("H", (), {"stop": threading.Event()})()
+    path.write_text("[audio]\nwhisper_mode = true\n", encoding="utf-8")
+    daemon.handle("reload")
+    assert started == [] and not old.stop.is_set()
+    path.write_text('[hotkeys]\ndictate = "F9"\n', encoding="utf-8")
+    assert "hotkeys.dictate" in daemon.handle("reload")["message"]
+    assert old.stop.is_set() and started == ["F9"]
+
+
+@pytest.mark.parametrize("text", ['[output]\nmode = "shout"\n', "[audio\nwhisper_mode = true\n"])
+def test_a_broken_config_keeps_the_running_one(daemon, monkeypatch, tmp_path, text):
+    path = tmp_path / "config.toml"
+    monkeypatch.setattr(C, "CONFIG_FILE", path)
+    path.write_text(text, encoding="utf-8")
+    cfg = daemon.cfg
+    reply = daemon.handle("reload")
+    assert reply["ok"] is False and reply["error"].startswith("config.toml: ")
+    assert daemon.cfg is cfg
+
+
+def test_the_log_holds_word_counts_not_your_words(daemon, caplog):
+    import logging
+
+    daemon.transcriber.texts = ["the launch date is the fourteenth", "the launch date is the fourteenth"]
+    with caplog.at_level(logging.INFO, logger="chttr"):
+        daemon.handle("start")
+        daemon.handle("release")
+        wait_idle(daemon)
+    assert daemon.typed == ["the launch date is the fourteenth"]
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("6 words" in m for m in messages)
+    assert not any("launch date" in m for m in messages)
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG, logger="chttr"):            # chttr daemon -v
+        daemon.handle("start")
+        daemon.handle("release")
+        wait_idle(daemon)
+    assert any("launch date" in r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG)
+
+
+def test_the_daemon_answers_on_its_socket_while_the_model_loads(lazy_daemon, monkeypatch):
+    from chttr import client
+
+    d = lazy_daemon
+    monkeypatch.setattr(Dm.signal, "signal", lambda *a: None)       # serve() runs off the main thread here
+    monkeypatch.setattr(Dm.P, "warm", lambda cfg: None)
+    monkeypatch.setattr(d, "_start_hotkeys", lambda: None)
+    monkeypatch.setattr(d, "_calls_tick", lambda watcher: None)
+    server = threading.Thread(target=d.serve, daemon=True)
+    server.start()
+    try:
+        assert wait_for(C.SOCKET_PATH.exists)
+        reply = client.send("status")
+        assert reply["model"] == "loading" and reply["state"] == Dm.LOADING
+        assert C.STATE_FILE.read_text(encoding="utf-8") == "loading"
+        d.Model.gate.set()
+        assert wait_for(lambda: client.send("status")["model"] == "ready")
+        assert client.send("status")["state"] == Dm.IDLE
+    finally:
+        d._stop.set()
+        server.join(3)
+    assert not C.SOCKET_PATH.exists()
