@@ -16,6 +16,17 @@ def _q(s: str) -> str:
     return json.dumps(s, ensure_ascii=False)
 
 
+def _bar(share: float, cells: int = 10) -> str:
+    full = round(share * cells)
+    return "▇" * full + "░" * (cells - full)
+
+
+def talk_shares(speakers: dict[str, Speaker]) -> dict[str, float]:
+    """Each speaker's share of the talking (0..1), for those who spoke."""
+    total = sum(sp.seconds for sp in speakers.values() if sp.seconds > 0)
+    return {sp.label: sp.seconds / total for sp in speakers.values() if sp.seconds > 0} if total else {}
+
+
 def _filename(title: str, when: datetime) -> str:
     safe = " ".join(re.sub(r"[/\\:*?\"<>|\n\r\t]+", " ", title).split())[:80] or "Meeting"
     return f"{when:%Y-%m-%d %H%M} {safe}"
@@ -44,6 +55,10 @@ def render(directory: Path, result: dict, cfg: Config) -> Path:
             lines += [f"  - name: {_q(a['name'])}", f"    email: {_q(a['email'])}",
                       f"    spoke: {'true' if a['email'] in spoke or (a['name'] and a['name'].lower() in spoke) else 'false'}"]
     lines.append("speakers: [" + ", ".join(_q(s.label) for s in speakers.values() if s.seconds) + "]")
+    shares = talk_shares(speakers)
+    if shares:
+        lines.append("talk_time:")
+        lines += [f"  {_q(label)}: {round(share * 100)}" for label, share in shares.items()]
     if notes.get("style"):
         lines.append(f"notes_style: {_q(notes['style'])}")
     lines += ["tags: [meeting]", "---", "", f"# {title}", ""]
@@ -60,9 +75,13 @@ def render(directory: Path, result: dict, cfg: Config) -> Path:
         lines.append("**Also speaking:** " + ", ".join(extra))
     lines.append("")
 
+    lite = notes.get("style") == "lite"
     if notes.get("error"):
-        lines += [f"> Notes could not be written: {notes['error']}", ""]
-    if notes.get("sections"):
+        retry = f" Try again with `chttr meeting style general --meeting {directory.name}`." if lite else ""
+        lines += [f"> Notes could not be written: {str(notes['error']).rstrip('.')}.{retry}", ""]
+    if lite:
+        lines += ["*On-device notes* · add a Claude key (chttr connect claude) or run Ollama for full notes", ""]
+    elif notes.get("sections"):
         how = f"*{notes.get('style_name', 'Notes')} notes*"
         if notes.get("style") == "custom" and notes.get("extra"):
             how = f"*Custom notes: {notes['extra'][:200]}*"
@@ -99,7 +118,9 @@ def render(directory: Path, result: dict, cfg: Config) -> Path:
             continue
         who = sp.label + (f" <{sp.email}>" if sp.email else "")
         detail = f" ({sp.evidence})" if sp.evidence and sp.source in ("claude", "voice") else ""
-        lines.append(f"- {who}: {how.get(sp.source, sp.source)}{detail}, {sp.seconds / 60:.1f} min")
+        share = shares.get(sp.label, 0.0)
+        lines.append(f"- {who}: {how.get(sp.source, sp.source)}{detail}, {sp.seconds / 60:.1f} min"
+                     f" · {share:.0%} {_bar(share)}")
     unsure = [sp.label for sp in speakers.values() if sp.source in ("unknown", "claude") and sp.seconds]
     if unsure:
         lines += ["", f"Wrong or missing name? `chttr meeting rename \"{unsure[0]}\" \"Their Name\" --meeting {directory.name}`"]

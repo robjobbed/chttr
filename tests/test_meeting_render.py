@@ -130,3 +130,28 @@ def test_resolve_finds_meetings_by_prefix(monkeypatch, tmp_path):
     assert store.resolve("2026-10-11").name == "2026-10-11-140000-abc"
     with pytest.raises(SystemExit):
         store.resolve("2026")
+
+
+def test_render_shows_talk_time_as_bars_and_in_the_frontmatter(tmp_path, cfg, result):
+    text = render.render(tmp_path, result, cfg).read_text(encoding="utf-8")
+    assert 'talk_time:\n  "Rob": 37\n  "Dana": 49\n  "Speaker 1": 15\n' in text
+    assert "- Dana <dana@x.com>: Meet captions, 0.7 min · 49% ▇▇▇▇▇░░░░░" in text
+    assert "- Speaker 1: not identified, 0.2 min · 15% ▇░░░░░░░░░" in text
+
+
+def test_render_marks_on_device_notes(tmp_path, cfg, result):
+    from chttr.meeting import lite
+
+    result["notes"] = lite.notes_lite(result)
+    text = render.render(tmp_path, result, cfg).read_text(encoding="utf-8")
+    assert "*On-device notes* · add a Claude key (chttr connect claude) or run Ollama for full notes" in text
+    assert "switch with `chttr meeting style" not in text
+    assert 'notes_style: "lite"' in text
+    assert "## Numbers and dates" in text and "- [ ] **Speaker 1**: I can send the contract." in text
+
+
+def test_notes_prompt_lists_each_speakers_share_of_the_talk(result):
+    from chttr.meeting.styles import _notes_inputs
+
+    _, _, speakers, _, _ = _notes_inputs(result)
+    assert "- Dana: named by Meet's captions (49% of talk time)" in speakers.splitlines()

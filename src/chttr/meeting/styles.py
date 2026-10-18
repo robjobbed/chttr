@@ -12,7 +12,7 @@ from pathlib import Path
 
 from ..config import Config
 from .analysis import _fmt_ts, _turns
-from .render import render
+from .render import render, talk_shares
 from .store import Speaker, Utterance, read_json, update_meta, write_json
 
 log = logging.getLogger("chttr.meeting")
@@ -70,7 +70,9 @@ def _notes_inputs(result: dict) -> tuple[str, str, str, list[str], str]:
     invited = "\n".join(f"- {a['name'] or '(no name)'} <{a['email']}>" + (" (organizer)" if a["organizer"] else "")
                         + (" (the user)" if a["is_me"] else "") + (" (declined)" if a["status"] == "DECLINED" else "")
                         for a in event.get("attendees", []))
+    shares = talk_shares(speakers)
     speakers_desc = "\n".join(f"- {sp.label}: {SOURCE_DESC.get(sp.source, sp.source)}"
+                              f" ({shares.get(sp.label, 0):.0%} of talk time)"
                               for sp in speakers.values() if sp.seconds)
     unidentified = [sp.label for sp in speakers.values() if sp.source == "unknown" and sp.seconds]
     transcript = "\n".join(f"[{_fmt_ts(s)}] {label}: {text}" for label, s, text in _turns(utts))
@@ -153,7 +155,7 @@ def restyle(directory: Path, cfg: Config, style_id: str, extra: str = "", fresh:
     if not result["utterances"]:
         raise SystemExit("this meeting has no transcript to write notes from")
     if not N.available(cfg.polish):
-        raise SystemExit("note styles need Claude: put an Anthropic API key in ~/.config/chttr/anthropic-api-key")
+        raise SystemExit("note styles need Claude or Ollama: add a Claude key (chttr connect claude) or run Ollama")
     write_notes(result, cfg, style_id, extra, fresh=fresh)
     md = render(directory, result, cfg)
     result["markdown"] = str(md)
