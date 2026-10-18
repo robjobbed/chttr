@@ -57,6 +57,10 @@ speech_threshold_db = -38
 # Whisper mode: for dictating quietly (open office, someone asleep). Lowers the
 # speech threshold to -50 dB and boosts quiet recordings before recognition.
 whisper_mode = false
+# Lower the speech threshold to fit the room: 10 dB above the measured noise floor
+# but no lower than 20 dB under your speech, never below -62 dB and never above
+# speech_threshold_db. Quiet laptop mics need this.
+adaptive_threshold = true
 # Double-tap the dictation key to switch to hands-free; tap once more to stop.
 double_tap = true
 ```
@@ -78,6 +82,9 @@ paste_over = 400
 # Typing tool: "auto" (wtype on Hyprland/Sway/niri, ydotool on GNOME/KDE,
 # xdotool on X11), or "wtype" | "ydotool" | "xdotool" | "dotool"
 typer = "auto"
+# In terminals and code editors, ending a dictation with "run it" or "press enter" presses Enter after typing.
+# In a coding agent, where Enter sends the prompt, only after a pause: "Fix the tests. Send it."
+spoken_enter = true
 ```
 
 ## `[polish]`
@@ -87,7 +94,8 @@ typer = "auto"
 # Wispr Flow-style cleanup: fillers removed, punctuation fixed, self-corrections
 # applied, formatting adapted to the focused app. Also powers command mode.
 # backend: "auto"   - Claude if a key is available, else Ollama if it is
-#                     running, else no cleanup
+#                     running, else local cleanup on this machine (fillers,
+#                     spoken punctuation, capitals; no model)
 #          "claude" | "ollama" | "none"
 backend = "auto"
 # Dictation cleanup and command mode. Haiku answers in a few hundred milliseconds,
@@ -97,6 +105,8 @@ cleanup_model = "claude-haiku-5-5"
 model = "claude-opus-5-5"
 effort = "low"
 timeout_seconds = 20
+# Dictation cleanup waits at most this long for the model; then the locally cleaned text is typed.
+cleanup_timeout_seconds = 5
 # Short phrases with no fillers, self-corrections or spoken punctuation ("git
 # status", "sounds good") are typed as recognized, without a model round trip.
 # The longest phrase that can skip cleanup, in words; 0 sends everything.
@@ -117,7 +127,8 @@ screen_context = "local"
 # Optional: file containing an Anthropic API key (chmod 600). Used when
 # ANTHROPIC_API_KEY is not in the daemon's environment.
 api_key_file = "~/.config/chttr/anthropic-api-key"
-# Local alternative (fully offline): https://ollama.com, e.g. `ollama pull llama3.2`
+# Local alternative (fully offline): https://ollama.com, e.g. `ollama pull llama3.2`.
+# qwen2.5:1.5b is fast on a CPU laptop; llama3.2 is more accurate.
 ollama_model = "llama3.2"
 ollama_url = "http://127.0.0.1:11434"
 # Tell the model which app is focused (its window class, e.g. "Slack") so it can
@@ -217,7 +228,7 @@ detect_calls = true
 room_speakers = true
 # Keep the audio (stereo Opus: you left, them right) next to the notes
 keep_audio = false
-# Notes (summary, sections, action items) with the [polish] Claude model (needs a key)
+# Notes (summary, sections, action items) with the [polish] model (Claude or Ollama); without either, on-device notes
 summary = true
 summary_effort = "medium"
 # Note style: "auto" (Claude picks from the meeting), or a style id such as
@@ -235,24 +246,43 @@ style_rules = [
 ]
 # Your name in transcripts; "" = from your calendar, else "Me"
 me = ""
+# Your email address, so you are recognised in calendar invites when the feed is not named after it
+email = ""
 # File with secret iCal addresses, one per line (Google Calendar > Settings >
 # your calendar > "Secret address in iCal format"). Add one with: chttr meeting calendar URL
 calendar_file = "~/.config/chttr/calendar-urls"
 # Safety limit
 max_hours = 4
+# A notification this many minutes before a calendar meeting with what you agreed last time and open action items (0 = off)
+brief_minutes = 5
 
-# Per-app modes. The first mode whose `match` (regex, case-insensitive) matches
-# the focused window's class wins. `style` is extra guidance for the cleanup
-# step; `polish = false` types the raw transcript; `output` and
-# `trailing_space` override the [output] section.
+# Per-app modes. The first mode that matches the focused window wins: `match` is
+# a list of regexes (case-insensitive) for the window's class, `title` a list for
+# its title. With both, both must match (Claude Code in a terminal); with only
+# `title`, any app whose title matches (a Gmail tab in any browser). `style` is
+# extra guidance for the cleanup step; `polish = false` types the raw transcript;
+# `output` and `trailing_space` override the [output] section; `code = true`
+# turns on spoken file names, flags and symbols; `newline` is how line breaks are
+# typed: "enter" or "shift+enter".
 ```
 
 ## `[[modes]]` (per-app modes)
 
 ```toml
 [[modes]]
+name = "agent"
+match = ["alacritty", "kitty", "foot", "wezterm", "ghostty", "xterm", "konsole", "gnome.terminal", "ptyxis", "tilix", "terminator"]
+# Claude Code renames the window to the task at hand with a status glyph in front ("✳ Fix the tests")
+title = ['^[·✢-✽⠀-⣿]\s', '(?<![/.])\b(claude|codex|aider|gemini|opencode)\b(?![/.-])']
+style = "This is a prompt to an AI coding agent in a terminal: complete sentences and paragraphs are fine; keep identifiers, paths and flags exactly as spoken."
+trailing_space = false
+code = true
+# Enter would send the prompt half-written; Shift+Enter starts a new line
+newline = "shift+enter"
+
+[[modes]]
 name = "terminal"
-match = ["alacritty", "kitty", "foot", "wezterm", "ghostty", "xterm", "konsole", "gnome-terminal"]
+match = ["alacritty", "kitty", "foot", "wezterm", "ghostty", "xterm", "konsole", "gnome.terminal", "ptyxis", "tilix", "terminator"]
 style = "This is a terminal. Output a single line of plain text with no trailing period; keep commands, paths and flags exactly as spoken."
 trailing_space = false
 
@@ -266,6 +296,8 @@ trailing_space = false
 match = ["slack", "discord", "whatsapp", "signal", "telegram", "element", "messages", "beeper"]
 name = "chat"
 style = "This is a chat app. Keep it casual and concise; one short message; no sign-off."
+# Line breaks are typed as Shift+Enter so a dictated paragraph never sends the message early
+newline = "shift+enter"
 
 [[modes]]
 name = "email"
@@ -276,4 +308,30 @@ style = "This is an email client. Use complete, well-punctuated sentences and pa
 name = "docs"
 match = ["docs.google", "notion", "obsidian", "libreoffice", "writer", "typora", "logseq"]
 style = "This is a document editor. Use complete sentences and paragraphs; honour dictated headings and lists."
+
+# The same apps in a browser tab, recognised by the app's name in the tab's title
+[[modes]]
+name = "docs"
+match = ["chromium", "chrome", "firefox", "brave", "vivaldi", "zen", "librewolf"]
+title = ['[-–—|] (google docs|notion|confluence|obsidian)\b']
+style = "This is a document editor. Use complete sentences and paragraphs; honour dictated headings and lists."
+
+[[modes]]
+name = "email"
+match = ["chromium", "chrome", "firefox", "brave", "vivaldi", "zen", "librewolf"]
+title = ['[-–—|] (gmail|outlook|proton mail|fastmail)\b', '^inbox\b']
+style = "This is an email client. Use complete, well-punctuated sentences and paragraphs where the user pauses between thoughts."
+
+[[modes]]
+name = "chat"
+match = ["chromium", "chrome", "firefox", "brave", "vivaldi", "zen", "librewolf"]
+title = ['^(\(\d+\) )?(slack|discord|whatsapp|telegram)\b', '[-–—|] (slack|discord|whatsapp|telegram)\b']
+style = "This is a chat app. Keep it casual and concise; one short message; no sign-off."
+newline = "shift+enter"
+
+[[modes]]
+name = "assistant"
+match = ["chromium", "chrome", "firefox", "brave", "vivaldi", "zen", "librewolf"]
+title = ['claude', 'chatgpt', 'gemini', 'copilot']
+style = "This is a chat with an AI assistant: complete sentences; keep code, paths and identifiers exactly as spoken."
 ```
