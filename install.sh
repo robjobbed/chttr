@@ -19,7 +19,8 @@ say() { printf '\033[1m%s\033[0m\n' "$*"; }
 # ---- system packages -----------------------------------------------------------
 session="${XDG_SESSION_TYPE:-}"
 need=()
-command -v pw-record >/dev/null || need+=(pipewire-tools)
+command -v pw-record >/dev/null && command -v pw-dump >/dev/null || need+=(pipewire-tools)
+command -v pactl >/dev/null || need+=(pactl)
 command -v notify-send >/dev/null || need+=(libnotify)
 command -v git >/dev/null || need+=(git)
 if [[ $session == x11 ]]; then
@@ -36,16 +37,16 @@ fi
 
 if ((${#need[@]})); then
   if command -v pacman >/dev/null; then
-    pkgs=$(printf '%s\n' "${need[@]}" | sed 's/^pipewire-tools$/pipewire/' | tr '\n' ' ')
+    pkgs=$(printf '%s\n' "${need[@]}" | sed 's/^pipewire-tools$/pipewire/; s/^pactl$/libpulse/' | tr '\n' ' ')
     cmd="sudo pacman -S --needed $pkgs"
   elif command -v apt-get >/dev/null; then
-    pkgs=$(printf '%s\n' "${need[@]}" | sed 's/^pipewire-tools$/pipewire-bin/; s/^libnotify$/libnotify-bin/' | tr '\n' ' ')
+    pkgs=$(printf '%s\n' "${need[@]}" | sed 's/^pipewire-tools$/pipewire-bin/; s/^libnotify$/libnotify-bin/; s/^pactl$/pulseaudio-utils/' | tr '\n' ' ')
     cmd="sudo apt install $pkgs"
   elif command -v dnf >/dev/null; then
-    pkgs=$(printf '%s\n' "${need[@]}" | sed 's/^pipewire-tools$/pipewire-utils/' | tr '\n' ' ')
+    pkgs=$(printf '%s\n' "${need[@]}" | sed 's/^pipewire-tools$/pipewire-utils/; s/^pactl$/pulseaudio-utils/' | tr '\n' ' ')
     cmd="sudo dnf install $pkgs"
   elif command -v zypper >/dev/null; then
-    pkgs=$(printf '%s\n' "${need[@]}" | sed 's/^pipewire-tools$/pipewire-tools/; s/^libnotify$/libnotify-tools/' | tr '\n' ' ')
+    pkgs=$(printf '%s\n' "${need[@]}" | sed 's/^pipewire-tools$/pipewire-tools/; s/^libnotify$/libnotify-tools/; s/^pactl$/pulseaudio-utils/' | tr '\n' ' ')
     cmd="sudo zypper install $pkgs"
   else
     cmd="(install: ${need[*]})"
@@ -59,6 +60,12 @@ if ((${#need[@]})); then
     echo "Run it, then run this installer again."
     exit 1
   fi
+fi
+
+# The waveform overlay is optional (without it chttr shows notifications instead).
+py=/usr/bin/python3; [[ -x $py ]] || py=python3
+if [[ $session != x11 ]] && ! "$py" -c "import gi; gi.require_version('Gtk','4.0'); gi.require_version('Gtk4LayerShell','1.0')" 2>/dev/null; then
+  echo "recommended for the waveform overlay: python-gobject gtk4-layer-shell (Debian: python3-gi gir1.2-gtk-4.0 gir1.2-gtk4layershell-1.0)"
 fi
 
 # ---- uv ------------------------------------------------------------------------
