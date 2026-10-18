@@ -101,7 +101,7 @@ def test_dictations_newest_first_and_filtered(dictated):
     first = rows[-1]
     assert first == {"id": "0", "ts": first["ts"], "app": "Slack", "mode": "chat", "kind": "dictate", "seconds": 4.0,
                      "output": "type", "raw": "um ping the vendor about the contract",
-                     "text": "Ping the vendor about the contract.", "has_audio": True}
+                     "text": "Ping the vendor about the contract.", "typed": True, "has_audio": True}
     assert [r["has_audio"] for r in rows] == [False, False, False, True]     # gone.wav, ../secret.wav, none
     assert [r["id"] for r in get("/api/dictations", q="VENDOR")[1]] == ["0"]
     assert [r["id"] for r in get("/api/dictations", q="um ping")[1]] == ["0"]    # what chttr heard counts too
@@ -117,6 +117,24 @@ def test_one_dictation_has_the_diff(dictated):
     assert d["diff"] == [["del", "um"], ["equal", "Ping the vendor about the contract."]]
     assert d["keep_audio_days"] == 0
     assert get("/api/dictation/99")[0] == 404
+
+
+def test_commands_and_untyped_dictations_have_no_diff(dictated):
+    with (dictated / "history.jsonl").open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"ts": datetime.now(UTC).isoformat(), "seconds": 2.0, "app": "Slack", "kind": "dictate",
+                             "raw": "polish failed on this one", "text": "", "output": ""}) + "\n")
+        fh.write(json.dumps({"ts": datetime.now(UTC).isoformat(), "seconds": 2.0, "app": "Slack", "kind": "dictate",
+                             "raw": "typing failed", "text": "Typing failed.", "output": ""}) + "\n")
+        fh.write(json.dumps({"ts": "2025-01-01T10:00:00+00:00", "seconds": 1.0, "raw": "old entry", "text": "Old entry."})
+                 + "\n")
+    command = get("/api/dictation/2")[1]                    # raw is the instruction, text the rewrite
+    assert command["kind"] == "command" and command["typed"] and command["diff"] == []
+    failed = get("/api/dictation/4")[1]
+    assert not failed["typed"] and failed["diff"] == [] and failed["text"] == "polish failed on this one"
+    assert get("/api/dictation/5")[1]["typed"] is False
+    old = get("/api/dictation/6")[1]                        # from before chttr recorded the output
+    assert old["typed"] and old["diff"] == [["equal", "Old entry."]]
+    assert [r["typed"] for r in get("/api/dictations", limit=3)[1]] == [True, False, False]
 
 
 def test_audio_is_served_when_kept(dictated):

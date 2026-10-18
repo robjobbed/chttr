@@ -1,97 +1,92 @@
 /* Home and Dictations (home.js, dictations.js). Colours come from app.css's tokens, so both
-   follow the light/dark palette and the Omarchy theme. */
-
-/* Home has no list: one wide pane */
-main.one-pane { grid-template-columns: 1fr; }
-main.one-pane > .list { display: none; }
+   follow the light/dark palette and the Omarchy theme. Every rule is scoped to these two views:
+   app.css owns the shared elements (kbd, buttons, the one-pane layout). */
 
 .home-view { max-width: 1080px; margin: 0 auto; }
 .home-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; }
 .home-head h1 { margin: 0; }
-.highlights { margin: 4px 0 0; }
-kbd {
-  font: 12px var(--mono); padding: 1px 6px; border: 1px solid var(--line); border-bottom-width: 2px;
-  border-radius: 5px; background: var(--panel); color: var(--text); white-space: nowrap;
+.home-view .highlights { margin: 4px 0 0; }
+.home-view code, .dictation-view code {
+  font: 0.92em var(--mono); background: var(--accent-soft); color: var(--text); padding: 1px 5px; border-radius: 4px;
 }
-code { font: 0.92em var(--mono); background: var(--accent-soft); color: var(--text); padding: 1px 5px; border-radius: 4px; }
 
 /* live daemon state */
-.status-pill {
+.home-view .status-pill {
   display: inline-flex; align-items: center; gap: 6px; padding: 3px 12px; border-radius: 999px;
   font-size: 12.5px; font-weight: 600; border: 1px solid var(--line); color: var(--muted); background: var(--panel);
   font-variant-numeric: tabular-nums;
 }
-.status-pill.idle::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--c4, #2e9d5b); }
-.status-pill.recording, .status-pill.meeting { color: var(--danger); border-color: var(--danger); }
-.status-pill.busy { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
-.status-pill.off { border-style: dashed; }
+.home-view .status-pill.idle::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--c4, #2e9d5b); }
+.home-view .status-pill.recording, .home-view .status-pill.meeting { color: var(--danger); border-color: var(--danger); }
+.home-view .status-pill.busy { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+.home-view .status-pill.off { border-style: dashed; }
 @media (prefers-reduced-motion: no-preference) {
-  .status-pill.recording, .status-pill.meeting { animation: chttr-pulse 1.6s ease-in-out infinite; }
+  .home-view .status-pill.recording, .home-view .status-pill.meeting { animation: chttr-pulse 1.6s ease-in-out infinite; }
 }
 @keyframes chttr-pulse { 50% { opacity: .55; } }
 
 /* the four headline numbers */
-.kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; margin: 20px 0 12px; }
-.kpi, .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; }
-.kpi-label { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
-.kpi-value { font-size: 28px; font-weight: 700; letter-spacing: -0.02em; line-height: 1.25; margin-top: 2px;
+.home-view .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; margin: 20px 0 12px; }
+.home-view .kpi, .home-view .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; }
+.home-view .kpi-label { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+.home-view .kpi-value { font-size: 28px; font-weight: 700; letter-spacing: -0.02em; line-height: 1.25; margin-top: 2px;
   font-variant-numeric: tabular-nums; }
-.kpi-sub { font-size: 12.5px; color: var(--muted); }
+.home-view .kpi-sub { font-size: 12.5px; color: var(--muted); }
 
 /* cards */
-.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; }
-.card.wide { grid-column: 1 / -1; }
-.card h2 { margin: 0 0 10px; }
-.card-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
-.card-head h2 { margin-bottom: 10px; }
-button.card { font: inherit; color: inherit; text-align: left; cursor: pointer; }
-button.card:hover, .meeting-card:hover { border-color: var(--accent); }
-.hint-card { border-style: dashed; display: flex; flex-wrap: wrap; align-items: center; gap: 6px 16px; }
-.hint-card h2 { flex-basis: 100%; }
-.hint-card p { margin: 0; flex: 1; min-width: 240px; }
+.home-view .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; }
+.home-view .card.wide { grid-column: 1 / -1; }
+.home-view .card h2 { margin: 0 0 10px; }
+.home-view .card-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.home-view .card-head h2 { margin-bottom: 10px; }
+.home-view button.card { font: inherit; color: inherit; text-align: left; cursor: pointer; }
+.home-view button.card:hover, .home-view .meeting-card:hover { border-color: var(--accent); }
+.home-view .hint-card { border-style: dashed; display: flex; flex-wrap: wrap; align-items: center; gap: 6px 16px; }
+.home-view .hint-card h2 { flex-basis: 100%; }
+.home-view .hint-card p { margin: 0; flex: 1; min-width: 240px; }
 
 /* 30-day strip */
-.strip { display: block; width: 100%; height: 64px; }
-.strip .bar { fill: var(--accent); }
-.strip .bar.zero { fill: var(--line); }
-.strip .bar.today:not(.zero) { fill: var(--c2, var(--accent)); }
-.strip .bar:hover { opacity: .75; }
-.strip-axis { display: flex; justify-content: space-between; font-size: 12px; margin-top: 4px; }
+.home-view .strip { display: block; width: 100%; height: 64px; }
+.home-view .strip .bar { fill: var(--accent); }
+.home-view .strip .bar.zero { fill: var(--line); }
+.home-view .strip .bar.today:not(.zero) { fill: var(--c2, var(--accent)); }
+.home-view .strip .bar:hover { opacity: .75; }
+.home-view .strip-axis { display: flex; justify-content: space-between; font-size: 12px; margin-top: 4px; }
 
 /* top apps */
-.hbars { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
-.hbars li { display: grid; grid-template-columns: minmax(70px, 120px) 1fr auto; align-items: center; gap: 10px; }
-.hbar-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.hbar-track { height: 8px; border-radius: 4px; background: var(--bg); overflow: hidden; }
-.hbar-fill { display: block; height: 100%; border-radius: 4px; background: var(--accent); }
-.hbar-n { font-size: 12.5px; font-variant-numeric: tabular-nums; }
+.home-view .hbars { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.home-view .hbars li { display: grid; grid-template-columns: minmax(70px, 120px) 1fr auto; align-items: center; gap: 10px; }
+.home-view .hbar-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.home-view .hbar-track { height: 8px; border-radius: 4px; background: var(--bg); overflow: hidden; }
+.home-view .hbar-fill { display: block; height: 100%; border-radius: 4px; background: var(--accent); }
+.home-view .hbar-n { font-size: 12.5px; font-variant-numeric: tabular-nums; }
 
 /* recent meetings */
-.meeting-cards { display: grid; gap: 8px; }
-.meeting-card { display: block; width: 100%; text-align: left; font: inherit; color: inherit; cursor: pointer;
+.home-view .meeting-cards { display: grid; gap: 8px; }
+.home-view .meeting-card { display: block; width: 100%; text-align: left; font: inherit; color: inherit; cursor: pointer;
   background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; }
-.meeting-card .title { font-weight: 600; }
-.meeting-card .meta { font-size: 12.5px; color: var(--muted); }
-.meeting-card .people { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.home-view .meeting-card .title { font-weight: 600; }
+.home-view .meeting-card .meta { font-size: 12.5px; color: var(--muted); }
+.home-view .meeting-card .people { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* Dictations */
-.item .two-lines { display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+.dictation-list .two-lines { display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
   margin-top: 0; font-size: 13.5px; }
-.section-label.day { position: sticky; top: 0; background: var(--panel); z-index: 1; border-bottom: 1px solid var(--line); }
-.pad { padding: 0 16px; }
+.dictation-list .section-label.day { position: sticky; top: 0; background: var(--panel); z-index: 1; border-bottom: 1px solid var(--line); }
+.dictation-list .pad { padding: 0 16px; }
+.dictation-list .more { margin: 12px 0 16px; font-size: 12.5px; }
 .dictation-view { max-width: 760px; }
-.dict-text { font-size: 20px; line-height: 1.5; margin: 14px 0 16px; white-space: pre-wrap; overflow-wrap: anywhere; }
-.dict-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
-.secondary { border: 1px solid var(--line); border-radius: 6px; padding: 6px 14px; background: var(--panel); cursor: pointer; }
-.secondary:hover { border-color: var(--accent); color: var(--accent); }
+.dictation-view .dict-text { font-size: 20px; line-height: 1.5; margin: 14px 0 16px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.dictation-view .not-typed { margin: -8px 0 14px; }
+.dictation-view .dict-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
 .dictation-view audio { position: static; margin: 4px 0 8px; }
-.heard { font-size: 16px; line-height: 1.7; margin: 0; overflow-wrap: anywhere; }
-del { color: var(--muted); text-decoration: line-through; text-decoration-thickness: 1px; }
-ins { text-decoration: none; background: var(--accent-soft); color: var(--accent); border-radius: 3px; padding: 0 2px; }
-.legend { font-size: 12.5px; margin-top: 6px; }
+.dictation-view .heard { font-size: 16px; line-height: 1.7; margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+.dictation-view del { color: var(--muted); text-decoration: line-through; text-decoration-thickness: 1px; }
+.dictation-view ins { text-decoration: none; background: var(--accent-soft); color: var(--accent); border-radius: 3px; padding: 0 2px; }
+.dictation-view .legend { font-size: 12.5px; margin-top: 6px; }
 
 @media (max-width: 760px) {
-  .kpi-value { font-size: 22px; }
-  .cards { grid-template-columns: 1fr; }
-  .dict-text { font-size: 18px; }
+  .home-view .kpi-value { font-size: 22px; }
+  .home-view .cards { grid-template-columns: 1fr; }
+  .dictation-view .dict-text { font-size: 18px; }
 }

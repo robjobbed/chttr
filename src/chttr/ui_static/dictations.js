@@ -52,8 +52,11 @@
 
   const changed = (diff) => (diff || []).some(([kind]) => kind === "del" || kind === "ins");
 
+  // How it ended: typed, pasted, copied, or nothing at all (a command or cleanup that failed).
+  const outcome = (e) => (e.typed === false ? "nothing typed" : OUTPUT[e.output] || e.output || "");
+
   function metaLine(e) {
-    const bits = [e.app || "", `${(Number(e.seconds) || 0).toFixed(1)} s`, OUTPUT[e.output] || e.output || ""];
+    const bits = [e.app || "", `${(Number(e.seconds) || 0).toFixed(1)} s`, outcome(e)];
     if (e.kind === "command") bits.unshift("command");
     return bits.filter(Boolean).join(" · ");
   }
@@ -63,12 +66,11 @@
   if (typeof window === "undefined" || typeof document === "undefined") return;
 
   // ---- the view --------------------------------------------------------------------------------
-  const view = { current: null, seq: 0, q: "" };
-  let setupPromise = null;
+  const view = { current: null, seq: 0, q: "", gen: 0 };
 
+  // Only the empty state needs it (for the real hotkey), so it is asked for then, and afresh.
   function getSetup(c) {
-    if (!setupPromise) setupPromise = c.api("/api/setup").catch(() => ({}));
-    return setupPromise;
+    return c.api("/api/setup").catch(() => (c.state && c.state.setup) || {});
   }
 
   function token(c) {
@@ -112,8 +114,10 @@
   }
 
   function row(c, e, route) {
-    return c.el("button", { class: "item dictation" + (route.id === e.id ? " active" : ""), type: "button", id: `dictation-${e.id}`,
-      onclick: () => c.navigate({ view: "dictations", id: e.id, q: view.q || undefined }) },
+    const on = route.id === e.id;
+    // data-id lets app.js move the highlight (and aria-current) when another dictation opens
+    return c.el("button", { class: "item dictation" + (on ? " active" : ""), type: "button", id: `dictation-${e.id}`,
+      "data-id": e.id, "aria-current": on ? "true" : null, onclick: () => c.navigate({ view: "dictations", id: e.id, q: view.q }) },
       c.el("div", { class: "snip two-lines" }, e.text),
       c.el("div", { class: "meta" }, metaLine(e)));
   }
@@ -123,22 +127,27 @@
     view.q = q || "";
     const params = new URLSearchParams({ limit: String(LIMIT) });
     if (view.q) params.set("q", view.q);
-    let entries, setup;
+    let entries;
     try {
-      [entries, setup] = await Promise.all([c.api(`/api/dictations?${params}`), getSetup(c)]);
+      entries = await c.api(`/api/dictations?${params}`);
     } catch (e) {
       if (seq === view.seq) box.replaceChildren(c.el("div", { class: "section-label" }, "Couldn't load dictations"), c.el("p", { class: "meta pad" }, e.message));
       return;
     }
     if (seq !== view.seq) return;               // a newer search already answered
     if (!entries.length) {
+      const setup = view.q ? {} : await getSetup(c);
+      if (seq !== view.seq) return;
       box.replaceChildren(c.el("div", { class: "section-label" }, view.q ? "No matches" : "No dictations yet"),
         view.q ? c.el("p", { class: "meta pad" }, `Nothing you dictated contains “${view.q}”.`) : emptyState(c, setup, ""));
       return;
     }
-    const label = view.q ? `${entries.length}${entries.length >= LIMIT ? "+" : ""} matching “${view.q}”` : null;
+    const more = entries.length >= LIMIT;
+    const label = view.q ? `${entries.length}${more ? "+" : ""} matching “${view.q}”` : null;
     box.replaceChildren(...[label ? c.el("div", { class: "section-label" }, label) : null,
-      ...groupByDay(entries).flatMap((g) => [c.el("div", { class: "section-label day" }, g.label), ...g.items.map((e) => row(c, e, route))])]
+      ...groupByDay(entries).flatMap((g) => [c.el("div", { class: "section-label day" }, g.label), ...g.items.map((e) => row(c, e, route))]),
+      more ? c.el("p", { class: "meta pad more" }, view.q ? `Showing the newest ${LIMIT}. Add a word to narrow it down.`
+        : `Showing your newest ${LIMIT} dictations. Search to find older ones.`) : null]
       .filter(Boolean));
     const active = box.querySelector(".item.active");
     if (active && active.scrollIntoView) active.scrollIntoView({ block: "nearest" });
@@ -146,6 +155,9 @@
 
   function diffBlock(c, d) {
     if (!d.raw || !d.raw.trim()) return null;
+    if (d.typed === false) return null;            // the note under the text says so; there is nothing to compare
+    // a voice command's raw is the instruction, not a draft of what got typed: no diff for it
+    if (d.kind === "command") return [c.el("h2", {}, "You said"), c.el("p", { class: "heard" }, d.raw.trim())];
     const nodes = diffNodesModel(d.diff).map((n) => (n.tag ? c.el(n.tag, {}, n.text) : n.text));
     return [
       c.el("h2", {}, "What chttr heard"),
@@ -177,13 +189,17 @@
   function renderDictation(c, d) {
     const when = d.ts && c.when ? c.when(d.ts) : d.ts;
     const meta = [when, d.app, d.mode && d.mode !== "default" ? `${d.mode} mode` : "", `${d.seconds.toFixed(1)} s`,
-      `${d.words} word${d.words === 1 ? "" : "s"}`, OUTPUT[d.output] || d.output].filter(Boolean).join(" · ");
+      `${d.words} word${d.words === 1 ? "" : "s"}`, outcome(d)].filter(Boolean).join(" · ");
     return c.el("div", { class: "dictation-view" },
       c.el("div", { class: "sub" }, d.kind === "command" ? c.el("span", { class: "chip note" }, "command") : null, c.el("span", {}, meta)),
       c.el("p", { class: "dict-text" }, d.text),
+      d.typed === false ? c.el("p", { class: "meta not-typed" }, [
+        d.kind === "command" ? "Nothing was typed for this one: the command didn't come back with an answer."
+          : "Nothing was typed for this one.",
+        d.text === d.raw ? " Above is what chttr heard." : ""].join("")) : null,
       c.el("div", { class: "dict-actions" },
         c.el("button", { class: "primary", type: "button", title: "Copy (c)", onclick: () => copyCurrent(c) }, "Copy"),
-        d.kind !== "command" ? c.el("button", { class: "secondary", type: "button", onclick: () => fixInLingo(c, d) }, "Fix a word in Lingo") : null),
+        d.kind !== "command" ? c.el("button", { class: "button", type: "button", onclick: () => fixInLingo(c, d) }, "Fix a word in Lingo") : null),
       audioBlock(c, d),
       ...[diffBlock(c, d)].flat().filter(Boolean));
   }
@@ -217,6 +233,14 @@
     register.done = true;
     c.registerView("dictations", {
       title: "Dictations",
+      placeholder: "Search your dictations…",
+      searchLabel: "Search dictations",
+      // search() fills the list itself, so app.js only rebuilds it when the route asks for different
+      // words than the list shows (Back after a search, a link); opening a dictation keeps it.
+      listKey(route) {
+        if (((route && route.q) || "") !== view.q) view.gen++;
+        return String(view.gen);
+      },
       list(route) {
         const box = c.el("div", { class: "dictation-list", "aria-busy": "true" }, c.el("div", { class: "section-label" }, "Loading…"));
         fillList(c, box, route || {}, (route && route.q) || "").finally(() => box.removeAttribute("aria-busy"));

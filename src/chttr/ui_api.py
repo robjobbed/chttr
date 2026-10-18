@@ -57,8 +57,11 @@ def route(path: str, q: dict, cfg: C.Config | None = None) -> tuple[int, bytes, 
         if f is None:
             return _error(404, "no audio kept for this dictation")
         return 200, f.read_bytes(), "audio/wav"
-    return _json({**_row(entry), "diff": H.word_diff(entry.get("raw", ""), entry.get("text", "")),
-                  "words": len(str(entry.get("text") or entry.get("raw") or "").split()),
+    row = _row(entry)
+    # the diff only means something for a dictation chttr typed: a voice command's raw is the
+    # instruction, and a failed one stored no text
+    diff = H.word_diff(row["raw"], row["text"]) if row["typed"] and row["kind"] != "command" else []
+    return _json({**row, "diff": diff, "words": len(row["text"].split()),
                   "keep_audio_days": _keep_audio_days(cfg)})
 
 
@@ -82,11 +85,17 @@ def _audio_file(entry: dict):
     return f
 
 
+def _typed(e: dict) -> bool:
+    """Whether chttr typed, pasted or copied anything. A command or cleanup that failed still lands in
+    the history (with no text), and so does a dictation it couldn't deliver (with no output)."""
+    return bool(str(e.get("text") or "").strip()) and e.get("output", "type") != ""
+
+
 def _row(e: dict) -> dict:
     return {"id": e["id"], "ts": e.get("ts", ""), "app": e.get("app", ""), "mode": e.get("mode", ""),
             "kind": e.get("kind", "dictate"), "seconds": float(e.get("seconds") or 0), "output": e.get("output", ""),
             "raw": str(e.get("raw") or ""), "text": str(e.get("text") or e.get("raw") or ""),
-            "has_audio": _audio_file(e) is not None}
+            "typed": _typed(e), "has_audio": _audio_file(e) is not None}
 
 
 def _entry(raw_id: str) -> dict | None:

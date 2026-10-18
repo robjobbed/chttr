@@ -96,7 +96,7 @@ def test_saved_minutes_never_goes_negative():
 def test_stats_says_no_time_saved_instead_of_a_negative_number():
     slow = [{"ts": datetime.now(UTC).isoformat(), "seconds": 30, "text": "um so yeah"}]
     out = history.stats(slow)
-    assert "time saved   0 s (no time saved yet)" in out
+    assert "time saved   none yet (speaking was slower than typing)" in out
     assert "-" not in out.split("time saved", 1)[1].splitlines()[0]
     quick = [{"ts": datetime.now(UTC).isoformat(), "seconds": 3, "text": " ".join(["word"] * 10)}]
     assert "time saved   12 s" in history.stats(quick)                             # 15 s typing - 3 s talking

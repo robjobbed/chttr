@@ -165,7 +165,6 @@ class Handler(BaseHTTPRequestHandler):
 
                 return self._json([{"id": s.id, "name": s.name, "description": s.description}
                                    for s in load_styles().values()])
-            # other packages: extra API routes dispatch here
             r = ui_api.route(path, q, self.cfg)
             if r is not None:
                 return self._send(r[0], r[1], r[2])

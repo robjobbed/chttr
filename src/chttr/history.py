@@ -135,10 +135,10 @@ def stats(entries: list[dict], days: int = 7) -> str:
     saved = _saved(s["words"], sum(float(e.get("seconds") or 0) for e in entries))
     if saved >= 1:
         saved_line = f"time saved   {saved:.0f} min"
-    elif round(saved * 60) > 0:
+    elif saved > 0:
         saved_line = f"time saved   {saved * 60:.0f} s"
     else:                        # slower than typing so far: say so instead of a negative number
-        saved_line = "time saved   0 s (no time saved yet)"
+        saved_line = "time saved   none yet (speaking was slower than typing)"
     lines = [
         f"dictations   {s['dictations']}",
         f"words        {s['words']}",

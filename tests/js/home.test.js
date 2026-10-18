@@ -127,3 +127,179 @@ for (const [file, name] of [["home.js", "home"], ["dictations.js", "dictations"]
     assert.deepEqual(Object.keys(views), [name]);
   });
 }
+
+// ---- the views themselves, against a tiny fake DOM and a fake app.js -----------------------------
+// Just enough of a DOM for the views: nodes with children, attributes and isConnected.
+function fakeDom() {
+  class Node {
+    constructor(tag) { Object.assign(this, { tag, children: [], parent: null, attrs: {}, className: "", hidden: false, _text: "" }); }
+    get isConnected() { let n = this; while (n.parent) n = n.parent; return n === root; }
+    append(...kids) { for (const k of kids.flat(Infinity)) if (k !== null && k !== undefined && k !== false) { if (typeof k === "object") k.parent = this; this.children.push(k); } }
+    replaceChildren(...kids) { this.children.forEach((k) => { if (typeof k === "object") k.parent = null; }); this.children = []; this.append(...kids); }
+    remove() { if (this.parent) this.parent.children = this.parent.children.filter((k) => k !== this); this.parent = null; }
+    setAttribute(k, v) { this.attrs[k] = String(v); }
+    removeAttribute(k) { delete this.attrs[k]; }
+    set textContent(v) { this.children = [String(v)]; }
+    get textContent() { return this.children.map((k) => (typeof k === "object" ? k.textContent : k)).join(""); }
+    querySelector() { return null; }
+    all() { return [this, ...this.children.filter((k) => typeof k === "object").flatMap((k) => k.all())]; }
+  }
+  const root = new Node("body");
+  const el = (tag, attrs = {}, ...children) => {
+    const n = new Node(tag);
+    for (const [k, v] of Object.entries(attrs || {})) {
+      if (v === undefined || v === null || v === false) continue;
+      if (k === "class") n.className = v;
+      else if (k.startsWith("on")) n[k] = v;
+      else n.setAttribute(k, v === true ? "" : v);
+    }
+    n.append(...children);
+    return n;
+  };
+  const document = { hidden: false, body: root, createElementNS: (ns, tag) => new Node(tag), getElementById: () => null, querySelector: () => null };
+  return { root, el, document };
+}
+
+// Fake timers: run them by hand.
+function fakeTimers() {
+  let next = 1;
+  const intervals = new Map(), timeouts = new Map();
+  return {
+    intervals, timeouts,
+    setInterval: (fn) => { intervals.set(next, fn); return next++; },
+    clearInterval: (id) => { intervals.delete(id); },
+    setTimeout: (fn) => { timeouts.set(next, fn); return next++; },
+    clearTimeout: (id) => { timeouts.delete(id); },
+    runTimeouts() { const fns = [...timeouts.values()]; timeouts.clear(); fns.forEach((fn) => fn()); },
+    runIntervals() { [...intervals.values()].forEach((fn) => fn()); },
+  };
+}
+
+const flush = () => new Promise((r) => setImmediate(r));
+
+function boot(file, answers) {
+  const dom = fakeDom(), timers = fakeTimers(), calls = [], views = {};
+  const chttr = {
+    el: dom.el, state: { setup: null }, toast: () => {}, navigate: () => {}, openMeeting: () => {},
+    registerView: (n, v) => { views[n] = v; },
+    api: async (p) => {
+      calls.push(p);
+      const path = p.split("?")[0];
+      if (!(path in answers)) throw new Error("not found");
+      return typeof answers[path] === "function" ? answers[path](p) : answers[path];
+    },
+  };
+  const context = { console, URLSearchParams, window: { chttr, addEventListener: () => {} }, document: dom.document,
+    navigator: {}, sessionStorage: { setItem() {} }, location: { hash: "" },
+    setInterval: timers.setInterval, clearInterval: timers.clearInterval, setTimeout: timers.setTimeout, clearTimeout: timers.clearTimeout };
+  vm.runInNewContext(fs.readFileSync(path.join(STATIC, file), "utf8"), context, { filename: file });
+  return { dom, timers, calls, views };
+}
+
+const DASHBOARD = { history: { dictations: 0, words: 0, per_day: [], top_apps: [] }, meetings: { recent: [], open_actions: 0 } };
+
+test("Home's status pill polls once it is on screen and stops once it is gone", async () => {
+  let status = { daemon: true, state: "idle", meeting: null };
+  const { dom, timers, calls, views } = boot("home.js", { "/api/dashboard": DASHBOARD, "/api/setup": {}, "/api/status": () => status });
+  const statusCalls = () => calls.filter((p) => p === "/api/status").length;
+  const page = await views.home.detail({});
+  const pill = page.all().find((n) => /status-pill/.test(n.className));
+  assert.equal(statusCalls(), 0);
+  timers.runTimeouts();                                   // the first tick, before app.js attached the page: waits
+  await flush();
+  assert.equal(statusCalls(), 0);
+  assert.equal(timers.intervals.size, 1);
+
+  dom.root.append(page);                                  // app.js puts it on screen, then calls mounted()
+  views.home.mounted({});
+  await flush();
+  assert.equal(statusCalls(), 1);
+  assert.equal(pill.textContent, "Idle");
+  assert.equal(pill.className, "status-pill idle");
+
+  status = { daemon: true, state: "recording", meeting: null };
+  timers.runIntervals();
+  await flush();
+  assert.equal(statusCalls(), 2);
+  assert.equal(pill.textContent, "● Recording 00:00");
+  status = { daemon: false, state: "idle", meeting: null };
+  timers.runIntervals();
+  await flush();
+  assert.equal(pill.textContent, "Daemon not running");
+
+  page.remove();                                          // another view replaced Home
+  timers.runIntervals();
+  await flush();
+  assert.equal(statusCalls(), 3);
+  assert.equal(timers.intervals.size, 0);
+});
+
+test("a Home page that never makes it on screen stops polling by itself", async () => {
+  const { timers, calls, views } = boot("home.js", { "/api/dashboard": DASHBOARD, "/api/setup": {}, "/api/status": { daemon: true, state: "idle" } });
+  await views.home.detail({});
+  for (let i = 0; i < 10; i++) timers.runIntervals();
+  await flush();
+  assert.equal(timers.intervals.size, 0);
+  assert.equal(calls.filter((p) => p === "/api/status").length, 0);
+});
+
+test("Home asks for /api/setup on every visit, so a new Claude key shows without a reload", async () => {
+  let backend = "none";
+  const { calls, views } = boot("home.js", { "/api/dashboard": DASHBOARD, "/api/setup": () => ({ cleanup_backend: backend }), "/api/status": {} });
+  const cleanupCard = (page) => page.all().some((n) => n.tag === "h2" && n.textContent === "Cleanup");
+  assert.equal(cleanupCard(await views.home.detail({})), true);
+  backend = "claude";
+  assert.equal(cleanupCard(await views.home.detail({})), false);
+  assert.equal(calls.filter((p) => p === "/api/setup").length, 2);
+});
+
+const ENTRIES = [
+  { id: "2", ts: new Date().toISOString(), app: "foot", kind: "command", seconds: 1, output: "paste", raw: "make it shorter", text: "Short.", typed: true, has_audio: false },
+  { id: "1", ts: new Date().toISOString(), app: "Slack", kind: "dictate", seconds: 2, output: "", raw: "polish failed", text: "polish failed", typed: false, has_audio: false },
+  { id: "0", ts: new Date().toISOString(), app: "Slack", kind: "dictate", seconds: 4, output: "type", raw: "um ping the vendor", text: "Ping the vendor.", typed: true, has_audio: false },
+];
+
+test("Dictations: searches dictations, rows carry data-id for app.js's highlight", async () => {
+  const { views } = boot("dictations.js", { "/api/dictations": ENTRIES, "/api/setup": {} });
+  const v = views.dictations;
+  assert.equal(v.placeholder, "Search your dictations…");
+  assert.equal(v.searchLabel, "Search dictations");
+  const box = v.list({ id: "0", q: "" });
+  await flush();
+  const rows = box.all().filter((n) => n.attrs["data-id"] !== undefined);
+  assert.deepEqual(rows.map((n) => n.attrs["data-id"]), ["2", "1", "0"]);
+  assert.equal(rows[2].attrs["aria-current"], "true");
+  assert.match(rows[1].textContent, /nothing typed/);
+  // opening another dictation with the same search keeps the list; different words rebuild it
+  const key = v.listKey({ q: "" });
+  assert.equal(v.listKey({ q: "", id: "2" }), key);
+  assert.notEqual(v.listKey({ q: "vendor" }), key);
+});
+
+test("Dictations: the heard-vs-typed diff only for dictations chttr typed", async () => {
+  const byId = Object.fromEntries(ENTRIES.map((e) => [e.id, e]));
+  const detail = { ...byId["0"], words: 3, diff: [["del", "um"], ["equal", "Ping the vendor."]] };
+  const { views } = boot("dictations.js", {
+    "/api/dictation/0": detail,
+    "/api/dictation/1": { ...byId["1"], words: 2, diff: [] },
+    "/api/dictation/2": { ...byId["2"], words: 1, diff: [] },
+  });
+  const show = async (id) => {
+    const nodes = (await views.dictations.detail({ id })).all();
+    return { tags: nodes.map((n) => n.tag), text: nodes[0].textContent };
+  };
+  const typed = await show("0");
+  assert.ok(typed.tags.includes("del"));
+  assert.match(typed.text, /What chttr heard/);
+  assert.match(typed.text, /typed/);
+
+  const command = await show("2");
+  assert.ok(!command.tags.includes("del") && !command.tags.includes("ins"));
+  assert.match(command.text, /You said\s*make it shorter/);
+  assert.doesNotMatch(command.text, /dropped by cleanup/);
+
+  const failed = await show("1");
+  assert.ok(!failed.tags.includes("del"));
+  assert.match(failed.text, /Nothing was typed for this one/);
+  assert.doesNotMatch(failed.text, /What chttr heard|· typed/);
+});

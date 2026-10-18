@@ -85,17 +85,12 @@
 
   // ---- the view --------------------------------------------------------------------------------
   const SVG = "http://www.w3.org/2000/svg";
-  let setupPromise = null;
   let pollTimer = null;
+  let kickPill = null;              // the current pill's first poll, for view.mounted()
 
+  // Asked afresh on every render, so `chttr connect claude` or a new hotkey shows without a reload.
   function getSetup(c) {
-    if (!setupPromise) setupPromise = c.api("/api/setup").catch(() => ({}));
-    return setupPromise;
-  }
-
-  function onePane(on) {
-    const main = document.querySelector("main");
-    if (main) main.classList.toggle("one-pane", on);
+    return c.api("/api/setup").catch(() => (c.state && c.state.setup) || {});
   }
 
   async function copyText(text) {
@@ -214,18 +209,33 @@
   }
 
   // ---- live status pill --------------------------------------------------------------------------
+  // The pill is built before app.js puts the Home page on screen, so a tick that finds it detached
+  // waits for it. It stops polling once the pill has been shown and then replaced, or when it never
+  // shows up at all (a newer render won).
   function statusPill(c) {
-    const pill = c.el("span", { class: "status-pill idle", title: "What chttr is doing right now" }, "…");   // not a live region: it ticks every 2 s
-    let since = null, last = "";
+    const pill = c.el("span", { class: "status-pill", title: "What chttr is doing right now" }, "Checking…");   // not a live region: it ticks every 2 s
+    let since = null, last = "", seen = false, misses = 0, busy = false, polled = false, timer = null;
+    const stop = () => {
+      clearInterval(timer);
+      if (pollTimer === timer) pollTimer = null;
+      if (kickPill === kick) kickPill = null;
+    };
     const tick = async () => {
-      if (!pill.isConnected) { clearInterval(pollTimer); pollTimer = null; return; }
-      if (document.hidden) return;
+      if (pill.isConnected) seen = true;
+      else {
+        if (seen || ++misses > 5) stop();
+        return;
+      }
+      if (busy || document.hidden) return;
+      busy = polled = true;
       let st;
       try {
         st = await c.api("/api/status");
       } catch (e) {
-        if (/not found/i.test(e.message)) { pill.hidden = true; clearInterval(pollTimer); pollTimer = null; return; }
+        if (/not found/i.test(e.message)) { pill.hidden = true; stop(); return; }   // a server without /api/status
         st = { daemon: false };
+      } finally {
+        busy = false;
       }
       if (st && st.state === "recording" && !st.meeting) since = since || Date.now();
       else since = null;
@@ -233,14 +243,15 @@
       pill.className = `status-pill ${cls}`;
       if (text !== last) pill.textContent = last = text;
     };
+    const kick = () => { if (!polled) tick(); };     // the first poll, as soon as the pill is on screen
     clearInterval(pollTimer);
-    pollTimer = setInterval(tick, POLL_MS);
-    tick();
+    pollTimer = timer = setInterval(tick, POLL_MS);
+    kickPill = kick;
+    setTimeout(kick, 0);
     return pill;
   }
 
   async function renderHome(c) {
-    onePane(true);
     const [data, setup] = await Promise.all([c.api("/api/dashboard"), getSetup(c)]);
     const h = data.history || {};
     const typingWpm = data.typing_wpm || TYPING_WPM;
@@ -265,17 +276,10 @@
     register.done = true;
     c.registerView("home", {
       title: "Home",
-      list() {
-        onePane(true);
-        return null;
-      },
+      list() { return null; },                       // no list: app.js hides the left pane
       detail() { return renderHome(c); },
+      mounted() { if (kickPill) kickPill(); },
     });
-    // Leaving Home gives the list pane back: any other view fills #list, Home leaves it empty.
-    const list = document.getElementById("list");
-    if (list && typeof MutationObserver !== "undefined") {
-      new MutationObserver(() => { if (list.children.length) onePane(false); }).observe(list, { childList: true });
-    }
   }
 
   if (window.chttr) register();
