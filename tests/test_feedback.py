@@ -146,12 +146,42 @@ def test_omarchy_is_detected_once(fb, monkeypatch):
     assert fb.omarchy is True
 
 
-def test_errors_are_not_replaced_by_the_next_typed_toast(fb, monkeypatch):
+def notified(monkeypatch) -> list[list[str]]:
     sent: list[list[str]] = []
     monkeypatch.setattr(F.subprocess, "Popen", lambda cmd, **kw: sent.append(cmd))
-    fb.notify("chttr: can't record", "no mic", urgency="critical")
+    return sent
+
+
+def ids(sent: list[list[str]]) -> list[str]:
+    return [cmd[cmd.index("-r") + 1] for cmd in sent]
+
+
+def test_errors_are_not_replaced_by_the_next_typed_toast(fb, monkeypatch):
+    sent = notified(monkeypatch)
+    fb.notify("Transcribing…", urgency="low", timeout_ms=0)       # never expires on its own
+    fb.notify("chttr: can't record", "no mic", urgency="critical", timeout_ms=8000)
     fb.notify("Typed", urgency="low")
+    fb.notify("Transcribing…", urgency="low", timeout_ms=0)
     fb.notify("No speech detected: mic is silent", urgency="normal")
-    ids = [cmd[cmd.index("-r") + 1] for cmd in sent]
-    assert ids[0] != ids[1]
-    assert ids[2] == ids[0]
+    fb.notify("Typed", urgency="low")
+    got = ids(sent)
+    assert got[1] == got[0]              # the error replaces the sticky "Transcribing…"
+    assert got[2] != got[1]              # "Typed" shows beside the error, not over it
+    assert got[3] == got[2]
+    assert got[4] == got[3]              # the warning replaces "Transcribing…" too
+    assert got[5] not in (got[1], got[4])    # and neither error is covered
+
+
+def test_an_expired_error_frees_its_id(fb, monkeypatch):
+    sent = notified(monkeypatch)
+    clock = {"now": 100.0}
+    monkeypatch.setattr(F.time, "monotonic", lambda: clock["now"])
+    fb.notify("chttr: error", urgency="critical", timeout_ms=8000)
+    clock["now"] += 1
+    fb.notify("Warning", urgency="normal", timeout_ms=3000)
+    clock["now"] += 10                   # both have expired: the warning first (at 104)
+    fb.notify("Another warning", urgency="normal", timeout_ms=3000)
+    fb.notify("Typed", urgency="low")
+    got = ids(sent)
+    assert len(set(got[:3])) == 3
+    assert got[3] == got[1]              # progress takes the id that has been free longest

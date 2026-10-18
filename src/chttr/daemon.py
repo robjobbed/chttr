@@ -322,6 +322,10 @@ class Daemon:
                 self.feedback.notify("That call has ended", "Nothing was recorded.", timeout_ms=3000)
                 return {"ok": False, "state": self.state, "error": "that Meet call has ended"}
             source = opts.get("source") if opts.get("source") in ("manual", "app") else "manual"
+            if source == "app" and not self.meeting and not self._app_call_live():
+                # an old toast clicked from history: nothing would ever stop this recording
+                self.feedback.notify("That call has ended", "Nothing was recorded.", timeout_ms=3000)
+                return {"ok": False, "state": self.state, "error": "that call has ended"}
             return self._meeting_start(source, str(opts.get("title") or ""))
         if arg == "stop":
             return self._meeting_stop()
@@ -450,6 +454,16 @@ class Daemon:
             return event.title if event else ""
         except Exception:  # noqa: BLE001
             return ""
+
+    def _app_call_live(self) -> bool:
+        """Does a call app still hold the mic? (A failed check counts as no.)"""
+        from . import calls as K
+
+        try:
+            return K.current_call(K.snapshot(), meet_call_active=self.call is not None) is not None
+        except Exception:
+            log.debug("call check failed", exc_info=True)
+            return False
 
     @staticmethod
     def _chttr_argv() -> list[str]:

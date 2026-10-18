@@ -7,6 +7,7 @@ import math
 import shutil
 import struct
 import subprocess
+import time
 import wave
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -14,8 +15,11 @@ from pathlib import Path
 from .config import FeedbackCfg
 
 log = logging.getLogger("chttr.feedback")
-_NOTIFY_ID = "92110"       # progress toasts ("Transcribing…", "Typed") replace each other
-_ALERT_ID = "92111"        # errors and warnings: the next "Typed" toast must not overwrite them
+# Replace ids. Progress toasts ("Transcribing…", "Typed") replace each other on one id.
+# An error or warning takes that id over (so it replaces a "Transcribing…" that would
+# otherwise never expire), and progress moves to a free id: the next "Typed" shows
+# beside the error instead of over it.
+_NOTIFY_IDS = ("92110", "92111", "92112")
 
 Action = tuple[str, list[str]]     # (button label, argv to run when it's picked)
 
@@ -24,6 +28,8 @@ class Feedback:
     def __init__(self, cfg: FeedbackCfg, runtime_dir: Path) -> None:
         self.cfg = cfg
         self.omarchy: bool | None = None       # None: look for omarchy-notification-send on first use
+        self._progress_id = _NOTIFY_IDS[0]
+        self._alert_until: dict[str, float] = {}     # replace id -> when the alert on it expires
         self.sounds = {
             "start": runtime_dir / "start.wav",
             "stop": runtime_dir / "stop.wav",
@@ -48,7 +54,11 @@ class Feedback:
     def notify(self, title: str, body: str = "", *, urgency: str = "low", timeout_ms: int = 3000) -> None:
         if not self.cfg.notifications:
             return
-        replace = _NOTIFY_ID if urgency == "low" else _ALERT_ID
+        replace = self._progress_id
+        if urgency != "low":
+            self._alert_until[replace] = time.monotonic() + (timeout_ms or 8000) / 1000
+            self._progress_id = min((i for i in _NOTIFY_IDS if i != replace),
+                                    key=lambda i: self._alert_until.get(i, 0.0))
         cmd = ["notify-send", "-a", "chttr", "-r", replace, "-u", urgency, "-t", str(timeout_ms), title]
         if body:
             cmd.append(body)

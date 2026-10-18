@@ -80,4 +80,20 @@ def test_installed_ollama_is_offered_too(menu, monkeypatch):
     monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/ollama" if name == "ollama" else None)
     labels, terminal = menu(pick_label=OLLAMA)
     assert labels[:2] == [CLEANUP, OLLAMA]
-    assert terminal == ["ollama serve"]
+    [script] = terminal
+    assert script.startswith("setsid -f ollama serve")      # outlives the terminal window
+    assert "ollama pull llama3.2" in script                   # the model cleanup asks for
+
+
+def test_claude_chosen_without_a_key_offers_the_key(menu, monkeypatch):
+    monkeypatch.setattr(P, "_claude_configured", lambda polish: False)
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/ollama" if name == "ollama" else None)
+    cfg = C.Config()
+    cfg.polish.backend = "claude"
+    labels, terminal = menu(cfg)
+    assert labels[0] == CLEANUP
+    assert OLLAMA not in labels            # backend = "claude" would never pick Ollama up
+    assert terminal == ["chttr connect claude"]
+    monkeypatch.setattr(P, "_claude_configured", lambda polish: True)
+    labels, _ = menu(cfg, pick_label="nothing")
+    assert CLEANUP not in labels

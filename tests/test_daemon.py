@@ -305,12 +305,40 @@ def test_ask_to_record_meet_call_names_the_call(daemon, monkeypatch):
     assert offer["primary"][1][-4:] == ["meeting", "start", "--call", "abc-defg-hij"]
 
 
-def test_meeting_start_takes_title_and_source_as_json(daemon, fake_sessions):
+def fake_mic(monkeypatch, app):
+    from chttr import calls as K
+
+    monkeypatch.setattr(K, "snapshot", lambda *a, **k: [])
+    monkeypatch.setattr(K, "current_call", lambda users, meet_call_active: app)
+
+
+def test_meeting_start_takes_title_and_source_as_json(daemon, fake_sessions, monkeypatch):
+    fake_mic(monkeypatch, "Zoom")
     reply = daemon.handle('meeting start {"title": "Zoom call", "source": "app"}')
     assert reply["ok"], reply
     [session] = fake_sessions
     assert (session.title, session.source) == ("Zoom call", "app")   # case kept
     assert daemon.meeting is session
+
+
+def test_record_click_after_the_app_call_ended_records_nothing(daemon, fake_sessions, monkeypatch):
+    # Omarchy keeps old toasts clickable in its history; nothing would stop this recording
+    fake_mic(monkeypatch, None)
+    reply = daemon.handle('meeting start {"title": "Zoom call", "source": "app"}')
+    assert not reply["ok"] and reply["error"] == "that call has ended"
+    assert not fake_sessions and daemon.meeting is None
+    assert "That call has ended" in daemon.feedback.notes
+
+
+def test_record_click_counts_a_failed_mic_check_as_no_call(daemon, fake_sessions, monkeypatch):
+    from chttr import calls as K
+
+    def broken(*a, **k):
+        raise RuntimeError("pw-dump went away")
+
+    monkeypatch.setattr(K, "snapshot", broken)
+    assert not daemon.handle('meeting start {"title": "Zoom call", "source": "app"}')["ok"]
+    assert not fake_sessions
 
 
 def test_meeting_start_alone_still_records_by_hand(daemon, fake_sessions):

@@ -769,6 +769,18 @@ def cmd_setup(args: argparse.Namespace) -> int:
                do_bindings=not args.no_keybindings, do_meet=not args.no_meet)
 
 
+def _ollama_script(polish) -> str:
+    """Start Ollama so it outlives the terminal, then pull the cleanup model (a 404 otherwise)."""
+    import shlex
+
+    model = shlex.quote(polish.ollama_model)
+    return ("setsid -f ollama serve >/dev/null 2>&1; "
+            "for _ in $(seq 40); do ollama list >/dev/null 2>&1 && break; sleep 0.25; done; "
+            f"ollama pull {model} && echo && "
+            "echo 'Ollama is running: chttr cleans up your dictation offline now.' && "
+            "echo 'It stops when you log out. To start it at boot: sudo systemctl enable --now ollama'")
+
+
 def _terminal(command: str) -> None:
     from .desktop import open_terminal
 
@@ -822,11 +834,12 @@ def cmd_menu(args: argparse.Namespace) -> int:
     notes = [Path(m["markdown"]) for d in reversed(meeting_dirs())
              if (m := read_json(d / "meta.json", {}) or {}).get("markdown") and Path(m["markdown"]).exists()]
     items: list[tuple[str, Callable[[], object]]] = []
-    if cfg.polish.backend != "none" and cfg.polish.level != "none" and P.backend(cfg.polish) == "none":
+    no_key = cfg.polish.backend == "claude" and not P._claude_configured(cfg.polish)
+    if cfg.polish.backend != "none" and cfg.polish.level != "none" and (P.backend(cfg.polish) == "none" or no_key):
         # cleanup is on but has nothing to run on: `chttr connect claude` is the guided key entry
         items.append(("󰚩  Turn on Claude cleanup…", lambda: _terminal("chttr connect claude")))
-        if shutil.which("ollama"):
-            items.append(("󰚩  Use Ollama for cleanup (offline)", lambda: _terminal("ollama serve")))
+        if shutil.which("ollama") and cfg.polish.backend == "auto":
+            items.append(("󰚩  Use Ollama for cleanup (offline)", lambda: _terminal(_ollama_script(cfg.polish))))
     if status is None:
         items.append(("󰑓  Start the chttr daemon", lambda: subprocess.run(["systemctl", "--user", "restart", "chttr"])))
     elif status.get("recording"):
