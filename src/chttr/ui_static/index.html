@@ -3,28 +3,35 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>chttr · meetings</title>
+  <meta name="color-scheme" content="light dark">
+  <title>chttr</title>
   <link rel="stylesheet" href="static/app.css">
 </head>
 <body>
   <header class="top">
     <div class="brand">chttr</div>
-    <form id="search" class="search" autocomplete="off">
-      <input id="q" type="search" placeholder="Search every meeting… (try a name, a number, a decision)" aria-label="Search meetings">
+    <form id="search" class="search" role="search" autocomplete="off">
+      <input id="q" type="search" placeholder="Search every meeting… speaker:dana after:2026-10-01" aria-label="Search meetings" aria-keyshortcuts="/ s">
+      <kbd class="key-hint" aria-hidden="true">/</kbd>
     </form>
-    <nav class="tabs" role="tablist">
-      <button class="tab active" data-view="meetings" role="tab">Meetings</button>
-      <button class="tab" data-view="actions" role="tab">Action items</button>
-      <button class="tab" data-view="lingo" role="tab" title="Fix how chttr spells your words">Lingo</button>
+    <nav class="tabs" role="tablist" aria-label="Views">
+      <button class="tab" data-view="meetings" role="tab" id="tab-meetings">Meetings</button>
+      <button class="tab" data-view="actions" role="tab" id="tab-actions">Action items</button>
+      <button class="tab" data-view="lingo" role="tab" id="tab-lingo" title="Fix how chttr spells your words">Lingo</button>
     </nav>
+    <button id="help-button" class="help-button" type="button" aria-label="Keyboard shortcuts" aria-keyshortcuts="?" title="Keyboard shortcuts (?)">?</button>
   </header>
-  <main class="layout">
+  <div id="banner" class="banner" hidden></div>
+  <main id="layout" class="layout">
     <aside id="list" class="list" aria-label="Meetings"></aside>
-    <section id="detail" class="detail" aria-live="polite">
-      <div class="empty">Pick a meeting, or search across all of them.</div>
+    <section id="detail" class="detail" role="tabpanel" tabindex="-1">
+      <div class="empty">Loading…</div>
     </section>
   </main>
-  <div id="toast" class="toast" role="status" hidden></div>
+  <dialog id="help" class="help" aria-labelledby="help-title"></dialog>
+  <div id="toast" class="toast" hidden></div>
+  <div id="status" role="status" aria-live="polite" class="sr-only"></div>
+  <script src="static/lib.js"></script>
   <script src="static/app.js"></script>
 </body>
 </html>

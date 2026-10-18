@@ -345,9 +345,20 @@ def cmd_mcp(args: argparse.Namespace) -> int:
 
 
 def cmd_ui(args: argparse.Namespace) -> int:
-    from .ui import serve
+    from urllib.parse import quote
 
-    serve(port=args.port, open_browser=not args.no_browser, cfg=C.load_config())
+    from . import library as L
+    from .ui import route_for_citation, serve
+
+    view = ""
+    if args.open:
+        view = route_for_citation(args.open, L.meetings(limit=1000)) or ""
+        if not view:
+            title = args.open.strip(" []").split(",")[0].strip()
+            print(f"chttr: no meeting matches {args.open!r}; searching for {title!r} instead", file=sys.stderr)
+            view = f"meetings?q={quote(title)}"
+    serve(port=args.port, open_browser=not args.no_browser, cfg=C.load_config(), view=view,
+          idle_timeout=args.idle_timeout)
     return 0
 
 
@@ -1026,9 +1037,11 @@ def cmd_menu(args: argparse.Namespace) -> int:
         ("󰉋  Meeting notes folder", lambda: (meetings_dir.mkdir(parents=True, exist_ok=True),
                                             subprocess.Popen(["xdg-open", str(meetings_dir)], start_new_session=True))),
         ("󰋚  Dictation history", lambda: subprocess.Popen([sys.argv[0], "history"], start_new_session=True)),
+        ("󰈙  Meeting library", lambda: subprocess.Popen(
+            [sys.argv[0], "ui", "--idle-timeout", "900"], start_new_session=True, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)),
         ("󰗊  Lingo: fix how words are spelled", lambda: subprocess.Popen(
             [sys.argv[0], "lingo"], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)),
-        ("󰄨  Stats", lambda: _terminal("chttr stats")),
         ("󰒓  Edit settings", lambda: DT.open_editor(str(C.CONFIG_FILE))),
         ("󰓦  Check setup (doctor)", lambda: _terminal("chttr doctor")),
         ("󰜉  Restart the daemon", lambda: subprocess.run(["systemctl", "--user", "restart", "chttr"])),
@@ -1129,6 +1142,10 @@ def build_parser() -> argparse.ArgumentParser:
     ui = sub.add_parser("ui", help="the meeting library in your browser (search, transcripts, renames)")
     ui.add_argument("--port", type=int, default=0, help="port on 127.0.0.1 (default: any free one)")
     ui.add_argument("--no-browser", action="store_true", help="only print the link")
+    ui.add_argument("--idle-timeout", type=float, default=0, metavar="SECONDS",
+                    help="stop once the page has been closed this long (default 0 = run until Ctrl+C)")
+    ui.add_argument("--open", metavar="CITATION",
+                    help='open at a `chttr ask` citation, e.g. "Pricing review, 2026-10-01, 00:02:32"')
     ui.set_defaults(func=cmd_ui)
 
     li = sub.add_parser("lingo", help="fix how chttr spells your words: pick them from past dictations, in your browser")

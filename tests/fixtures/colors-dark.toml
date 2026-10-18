@@ -1,0 +1,18 @@
+# A dark theme in the classic Omarchy format: no mode, terminal colours only
+accent = "#7aa2f7"
+cursor = "#c0caf5"
+foreground = "#a9b1d6"
+background = "#1a1b26"
+selection_foreground = "#c0caf5"
+selection_background = "#7aa2f7"
+
+color0 = "#32344a"
+color1 = "#f7768e"
+color2 = "#9ece6a"
+color3 = "#e0af68"
+color4 = "#7aa2f7"
+color5 = "#ad8ee6"
+color6 = "#449dab"
+color7 = "#787c99"
+color8 = "#444b6a"
+color11 = "#ff9e64"

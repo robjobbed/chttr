@@ -94,3 +94,70 @@ def test_sync_is_incremental_and_forgets_deleted_meetings(lib):
         L.sync(conn)
         assert [r["id"] for r in conn.execute("SELECT id FROM meetings")] == ["2026-10-01-140000"]
         assert not conn.execute("SELECT 1 FROM lines_fts WHERE meeting_id = '2026-10-08-140000'").fetchall()
+
+
+def test_fts_query_prefix_matches_the_last_word_only_from_three_characters():
+    assert L.fts_query("revised contr", prefix_last=True) == '"revised" "contr"*'
+    assert L.fts_query("budget co", prefix_last=True) == '"budget" "co"'
+    assert L.fts_query("budget contr", any_word=True, prefix_last=True) == '"budget" OR "contr"*'
+    assert L.fts_query("", prefix_last=True) == ""
+
+
+def test_prefix_search_finds_words_as_you_type(lib):
+    assert {h.speaker for h in L.search("contr", prefix_last=True) if h.kind == "line"} == {"Ali"}
+    assert not [h for h in L.search("conta", prefix_last=True) if h.kind == "line"]
+    assert not L.search("contr")                              # without prefix_last a fragment is just a word
+
+
+def test_parse_query_reads_filters_out_of_the_search_box():
+    assert L.parse_query("budget speaker:dana after:2026-10-01") == ("budget", "dana", "2026-10-01", "")
+    assert L.parse_query('from:"Dana Lee" before:2026-10-31 the plan') == ("the plan", "Dana Lee", "", "2026-10-31")
+    assert L.parse_query("on:2026-10-08 launch") == ("launch", "", "2026-10-08", "2026-10-08")
+    assert L.parse_query("after:2026-1 budget") == ("budget", "", "", "")   # half-typed dates are ignored
+    assert L.parse_query("after:2026-02-30") == ("", "", "", "")
+    assert L.parse_query("email:dana@x.com") == ("email:dana@x.com", "", "", "")
+    words, _, after, before = L.parse_query("on:today")
+    assert words == "" and after == before == datetime.now().astimezone().date().isoformat()
+
+
+def test_search_parses_filters_when_none_are_given(lib):
+    assert {h.speaker for h in L.search("budget speaker:rob")} == {"Rob"}
+    assert {h.meeting_id for h in L.search("budget after:2026-10-05")} == {"2026-10-08-140000"}
+    # explicit filters win; the text is then searched as it is
+    assert {h.speaker for h in L.search("budget", speaker="dana")} == {"Dana"}
+
+
+def test_filters_without_words_browse(lib):
+    hits = L.search("speaker:dana")
+    assert [(h.meeting_id, h.start) for h in hits] == [("2026-10-08-140000", 5.0), ("2026-10-01-140000", 10.0)]
+    assert [h.title for h in L.search("on:2026-10-01")] == ["Pricing review"]
+    assert L.search("") == []
+
+
+def test_search_with_facets_counts_lines_per_meeting(lib):
+    hits, facets = L.search_with_facets("budget")
+    assert {f["meeting_id"]: f["count"] for f in facets} == {"2026-10-01-140000": 1, "2026-10-08-140000": 1}
+    assert facets[0]["title"] in ("Pricing review", "Launch sync")
+    hits, facets = L.search_with_facets("budget", meeting_id="2026-10-08-140000")
+    assert {h.meeting_id for h in hits} == {"2026-10-08-140000"} and len(facets) == 2   # facets stay, to switch
+
+
+def test_turns_join_one_speakers_lines_within_three_seconds():
+    lines = [{"start": 0, "end": 2, "speaker": "Dana", "text": "Hi."},
+             {"start": 3.5, "end": 5, "speaker": "Dana", "text": "Shall we start?"},     # 1.5 s gap: same turn
+             {"start": 9, "end": 10, "speaker": "Dana", "text": "Hello?"},               # 4 s gap: new turn
+             {"start": 10.5, "end": 12, "speaker": "Ali", "text": "Yes."},
+             {"start": 12.2, "speaker": "Dana", "text": "Good."}]                        # no end: a moment
+    turns = L.turns(lines)
+    assert [(t["speaker"], t["start"], t["end"], t["text"]) for t in turns] == [
+        ("Dana", 0, 5, "Hi. Shall we start?"), ("Dana", 9, 10, "Hello?"), ("Ali", 10.5, 12, "Yes."),
+        ("Dana", 12.2, 12.2, "Good.")]
+    assert [x["text"] for x in turns[0]["lines"]] == ["Hi.", "Shall we start?"]
+    assert len(L.turns(lines, gap=10)) == 3 and L.turns([]) == []
+
+
+def test_meeting_has_turns_and_talk_seconds(lib):
+    m = L.meeting("2026-10-01-140000")
+    assert [t["speaker"] for t in m["turns"]] == ["Dana", "Ali"]
+    assert m["talk_seconds"] == {"Dana": 60.0, "Ali": 60.0}
+    assert m["transcript"][0]["end"] == 13

@@ -15,7 +15,7 @@ import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from . import config as C
@@ -166,11 +166,54 @@ def _sync_dictations(conn: sqlite3.Connection) -> None:
     conn.execute("INSERT OR REPLACE INTO state VALUES ('history_size', ?)", (size,))
 
 
-def fts_query(text: str, any_word: bool = False) -> str:
+def fts_query(text: str, any_word: bool = False, prefix_last: bool = False) -> str:
     """A safe FTS5 query from free text: every word quoted (no operator injection),
-    all required by default, any of them with any_word."""
+    all required by default, any of them with any_word. With prefix_last the last
+    word also matches longer words ("contr" finds "contract"), for search as you type;
+    only from 3 characters, so "co" doesn't match half the transcript."""
     words = [w for w in re.findall(r"[\w'’-]+", text.lower()) if len(w) > 1 or w.isdigit()]
-    return (" OR " if any_word else " ").join(f'"{w}"' for w in words)
+    parts = [f'"{w}"' for w in words]
+    if prefix_last and parts and len(words[-1]) >= 3:
+        parts[-1] += "*"
+    return (" OR " if any_word else " ").join(parts)
+
+
+_FILTER = re.compile(r'(?<!\S)(speaker|from|after|before|on):(?:"([^"]*)"?|(\S*))', re.IGNORECASE)
+
+
+def _filter_date(value: str) -> str:
+    """YYYY-MM-DD (or today / yesterday) -> ISO date; "" for anything else, so a date
+    that is still being typed is ignored rather than searched for as words."""
+    value = value.strip().lower()
+    if value in ("today", "yesterday"):
+        day = datetime.now().astimezone().date()
+        return (day - timedelta(days=1) if value == "yesterday" else day).isoformat()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        return ""
+    try:
+        return date.fromisoformat(value).isoformat()
+    except ValueError:
+        return ""
+
+
+def parse_query(text: str) -> tuple[str, str, str, str]:
+    """Search box text -> (words, speaker, after, before).
+    `speaker:dana` (or `from:`, `speaker:"Dana Lee"`), `after:2026-10-01`, `before:…` and
+    `on:…` (that day) are filters; everything else is the words to search for.
+    Mirrored by parseQuery in ui_static/lib.js."""
+    speaker = after = before = ""
+    for m in _FILTER.finditer(text):
+        key, value = m.group(1).lower(), (m.group(2) if m.group(2) is not None else m.group(3)).strip()
+        if key in ("speaker", "from"):
+            speaker = value
+        elif key == "on":
+            after = before = _filter_date(value)
+        elif key == "after":
+            after = _filter_date(value)
+        else:
+            before = _filter_date(value)
+    words = " ".join(_FILTER.sub(" ", text).split())
+    return words, speaker, after, before
 
 
 def _when(started: float) -> str:
@@ -178,22 +221,38 @@ def _when(started: float) -> str:
 
 
 def search(query: str, limit: int = 20, speaker: str = "", after: str = "", before: str = "",
-           include_dictations: bool = False, conn: sqlite3.Connection | None = None) -> list[Hit]:
+           include_dictations: bool = False, conn: sqlite3.Connection | None = None,
+           prefix_last: bool = False, meeting_id: str = "") -> list[Hit]:
     """Ranked transcript lines and notes matching `query` (all words, else any word).
-    `after` / `before` are ISO dates (YYYY-MM-DD)."""
+    `after` / `before` are ISO dates (YYYY-MM-DD). Without explicit filters, `query` is
+    read as search box text: `speaker:dana budget after:2026-10-01` (see parse_query)."""
+    return search_with_facets(query, limit, speaker, after, before, include_dictations, conn, prefix_last,
+                              meeting_id, facets_too=False)[0]
+
+
+def search_with_facets(query: str, limit: int = 20, speaker: str = "", after: str = "", before: str = "",
+                       include_dictations: bool = False, conn: sqlite3.Connection | None = None,
+                       prefix_last: bool = False, meeting_id: str = "",
+                       facets_too: bool = True) -> tuple[list[Hit], list[dict]]:
+    """`search`, plus how many lines matched in each meeting (for narrowing a search)."""
     if conn is None:
         with connect() as c:
             sync(c)
-            return search(query, limit, speaker, after, before, include_dictations, c)
-    hits: list[Hit] = []
+            return search_with_facets(query, limit, speaker, after, before, include_dictations, c, prefix_last,
+                                      meeting_id, facets_too)
+    if not (speaker or after or before):
+        query, speaker, after, before = parse_query(query)
+    lo, hi = _date_bounds(after, before)
+    if not fts_query(query):
+        if not (speaker or after or before or meeting_id):
+            return [], []
+        return _browse(conn, limit, speaker, lo, hi, meeting_id), []
     for any_word in (False, True):
-        q = fts_query(query, any_word)
-        if not q:
-            return []
-        hits = _search(conn, q, limit, speaker, after, before, include_dictations)
+        q = fts_query(query, any_word, prefix_last)
+        hits = _search(conn, q, limit, speaker, lo, hi, include_dictations, meeting_id)
         if hits:
-            break
-    return hits
+            return hits, facets(conn, q, lo, hi, speaker) if facets_too else []
+    return [], []
 
 
 def _date_bounds(after: str, before: str) -> tuple[float, float]:
@@ -202,31 +261,79 @@ def _date_bounds(after: str, before: str) -> tuple[float, float]:
     return lo, hi
 
 
-def _search(conn: sqlite3.Connection, q: str, limit: int, speaker: str, after: str, before: str,
-            include_dictations: bool) -> list[Hit]:
-    lo, hi = _date_bounds(after, before)
+def _search(conn: sqlite3.Connection, q: str, limit: int, speaker: str, lo: float, hi: float,
+            include_dictations: bool, meeting_id: str = "") -> list[Hit]:
     hits = []
     rows = conn.execute(
         "SELECT f.meeting_id, f.start, f.speaker, snippet(lines_fts, 0, '**', '**', '…', 24) AS snip, "
         "bm25(lines_fts) AS score, m.title, m.started FROM lines_fts f JOIN meetings m ON m.id = f.meeting_id "
         "WHERE lines_fts MATCH ? AND m.started BETWEEN ? AND ? AND (? = '' OR f.speaker LIKE ?) "
-        "ORDER BY score LIMIT ?", (q, lo, hi, speaker, f"%{speaker}%", limit)).fetchall()
+        "AND (? = '' OR f.meeting_id = ?) ORDER BY score LIMIT ?",
+        (q, lo, hi, speaker, f"%{speaker}%", meeting_id, meeting_id, limit)).fetchall()
     hits += [Hit("line", r["meeting_id"], r["title"], _when(r["started"]), float(r["start"]), r["speaker"],
                  r["snip"], float(r["score"])) for r in rows]
     if not speaker:
         rows = conn.execute(
             "SELECT f.meeting_id, snippet(notes_fts, 1, '**', '**', '…', 24) AS snip, bm25(notes_fts) AS score, "
             "m.title, m.started FROM notes_fts f JOIN meetings m ON m.id = f.meeting_id "
-            "WHERE notes_fts MATCH ? AND m.started BETWEEN ? AND ? ORDER BY score LIMIT ?",
-            (q, lo, hi, max(3, limit // 4))).fetchall()
+            "WHERE notes_fts MATCH ? AND m.started BETWEEN ? AND ? AND (? = '' OR f.meeting_id = ?) "
+            "ORDER BY score LIMIT ?",
+            (q, lo, hi, meeting_id, meeting_id, max(3, limit // 4))).fetchall()
         hits += [Hit("notes", r["meeting_id"], r["title"], _when(r["started"]), 0.0, "", r["snip"],
                      float(r["score"]) - 0.5) for r in rows]
-    if include_dictations:
+    if include_dictations and not meeting_id:
         rows = conn.execute("SELECT text, app, ts, bm25(dictations_fts) AS score FROM dictations_fts "
                             "WHERE dictations_fts MATCH ? ORDER BY score LIMIT ?", (q, limit)).fetchall()
         hits += [Hit("dictation", "", r["app"], r["ts"], 0.0, "", r["text"][:300], float(r["score"]))
                  for r in rows]
     return sorted(hits, key=lambda h: h.score)[:limit]
+
+
+def facets(conn: sqlite3.Connection, q: str, lo: float, hi: float, speaker: str = "") -> list[dict]:
+    """Matching transcript lines per meeting, most first: [{meeting_id, title, when, count}]."""
+    rows = conn.execute(
+        "SELECT f.meeting_id, m.title, m.started, count(*) AS n FROM lines_fts f JOIN meetings m ON m.id = f.meeting_id "
+        "WHERE lines_fts MATCH ? AND m.started BETWEEN ? AND ? AND (? = '' OR f.speaker LIKE ?) "
+        "GROUP BY f.meeting_id ORDER BY n DESC, m.started DESC", (q, lo, hi, speaker, f"%{speaker}%")).fetchall()
+    return [{"meeting_id": r["meeting_id"], "title": r["title"], "when": _when(r["started"]), "count": r["n"]}
+            for r in rows]
+
+
+def _browse(conn: sqlite3.Connection, limit: int, speaker: str, lo: float, hi: float, meeting_id: str) -> list[Hit]:
+    """Filters without words (`speaker:dana`, `on:2026-10-01`): that speaker's lines, newest
+    meeting first; or, for dates alone, the meetings in that range."""
+    if not speaker and not meeting_id:
+        rows = conn.execute("SELECT id, title, started, summary FROM meetings WHERE started BETWEEN ? AND ? "
+                            "ORDER BY started DESC LIMIT ?", (lo, hi, limit)).fetchall()
+        return [Hit("notes", r["id"], r["title"], _when(r["started"]), 0.0, "", r["summary"] or "", 0.0)
+                for r in rows]
+    rows = conn.execute(
+        "SELECT l.meeting_id, l.start, l.speaker, l.text, m.title, m.started FROM lines l "
+        "JOIN meetings m ON m.id = l.meeting_id WHERE m.started BETWEEN ? AND ? AND (? = '' OR l.speaker LIKE ?) "
+        "AND (? = '' OR l.meeting_id = ?) ORDER BY m.started DESC, l.start LIMIT ?",
+        (lo, hi, speaker, f"%{speaker}%", meeting_id, meeting_id, limit)).fetchall()
+    return [Hit("line", r["meeting_id"], r["title"], _when(r["started"]), float(r["start"]), r["speaker"],
+                r["text"][:300], 0.0) for r in rows]
+
+
+def turns(transcript_lines: list[dict], gap: float = 3.0) -> list[dict]:
+    """Consecutive lines by the same speaker, less than `gap` seconds apart, read as one turn:
+    [{speaker, start, end, text, lines: [{start, end, text}]}]. Mirrored by turnsFromLines in
+    ui_static/lib.js."""
+    out: list[dict] = []
+    for u in transcript_lines:
+        start = float(u.get("start", 0))
+        end = float(u.get("end") or start)
+        line = {"start": start, "end": max(end, start), "text": str(u.get("text", ""))}
+        last = out[-1] if out else None
+        if last and last["speaker"] == u.get("speaker", "") and start - last["end"] < gap:
+            last["lines"].append(line)
+            last["end"] = max(last["end"], line["end"])
+            last["text"] += " " + line["text"]
+        else:
+            out.append({"speaker": u.get("speaker", ""), "start": start, "end": line["end"], "text": line["text"],
+                        "lines": [line]})
+    return out
 
 
 def meetings(limit: int = 50, conn: sqlite3.Connection | None = None) -> list[dict]:
@@ -253,13 +360,16 @@ def meeting(meeting_id: str, conn: sqlite3.Connection | None = None) -> dict | N
         return None
     notes = result.get("notes") or {}
     title = (result.get("event") or {}).get("title") or notes.get("title") or result["meta"].get("title") or "Meeting"
+    transcript = [{"start": u["start"], "end": u.get("end", u["start"]), "speaker": u.get("speaker", ""),
+                   "text": u.get("text", "")} for u in result.get("utterances", []) if u.get("text")]
     return {"id": directory.name, "title": title, "when": _when(float(result["meta"].get("started", 0))),
             "minutes": round(result.get("duration", 0) / 60), "notes": notes,
             "speakers": {k: {"source": v.get("source"), "email": v.get("email", ""),
                              "minutes": round(v.get("seconds", 0) / 60, 1)}
                          for k, v in result.get("speakers", {}).items() if v.get("seconds")},
-            "transcript": [{"start": u["start"], "speaker": u.get("speaker", ""), "text": u.get("text", "")}
-                           for u in result.get("utterances", []) if u.get("text")],
+            "talk_seconds": {k: round(float(v.get("seconds", 0)), 1)
+                             for k, v in result.get("speakers", {}).items() if v.get("seconds")},
+            "transcript": transcript, "turns": turns(transcript),
             "markdown": result.get("markdown", ""), "event": result.get("event")}
 
 
