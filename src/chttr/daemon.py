@@ -930,6 +930,7 @@ class Daemon:
         if dataclasses.asdict(old.hotkeys) != dataclasses.asdict(cfg.hotkeys) and self.hotkeys is not None:
             self.hotkeys.stop.set()
             self._start_hotkeys()
+        self._write_state(self.state)           # the bar's tooltip names the new keys now, not in a minute
         log.info("%s", message)
         return {"ok": True, "state": self.state, "message": message}
 

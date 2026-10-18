@@ -1189,7 +1189,7 @@ def build_parser() -> argparse.ArgumentParser:
         s.add_argument("--json", action="store_true", help="print the daemon reply as JSON")
         s.set_defaults(func=cmd_send, command=name)
 
-    st = sub.add_parser("status", help="print the daemon state (idle/recording/transcribing)")
+    st = sub.add_parser("status", help="print the daemon state (idle, recording, transcribing, loading or off)")
     st.add_argument("--follow", action="store_true", help="stream state changes until interrupted")
     st.add_argument("--json", action="store_true", help="bar-friendly JSON (text/alt/class/tooltip)")
     st.set_defaults(func=cmd_status)

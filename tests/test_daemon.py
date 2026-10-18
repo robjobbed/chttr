@@ -1768,3 +1768,15 @@ def test_state_json_stays_true_while_idle(daemon, monkeypatch):
         done.set()
         for tick in ticks:
             tick.set()
+
+
+def test_a_reload_updates_the_bar_at_once(daemon, monkeypatch, tmp_path):
+    import json
+
+    path = tmp_path / "config.toml"
+    monkeypatch.setattr(C, "CONFIG_FILE", path)
+    monkeypatch.setattr(Dm, "engine_key", lambda cfg: daemon.transcriber.key)
+    monkeypatch.setattr(daemon, "_start_hotkeys", lambda: None)
+    path.write_text('[hotkeys]\ndictate = "F9"\n', encoding="utf-8")
+    assert daemon.handle("reload")["ok"] is True
+    assert json.loads(C.STATE_JSON.read_text(encoding="utf-8"))["hotkeys"]["dictate"] == "F9"
