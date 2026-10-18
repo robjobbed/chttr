@@ -1,6 +1,8 @@
 #!/bin/bash
-# Feed for the bar widget: one JSON line per state change. Until setup has
-# installed the chttr command, report "setup" and wait for it.
+# Feed for the bar widget: one JSON line per state change (text, alt, class,
+# tooltip, meeting_seconds, cleanup, hotkey), and one a second while a meeting
+# is recorded so its timer ticks. "off" means the daemon isn't running. Until
+# setup has installed the chttr command, report "setup" and wait for it.
 exe="$HOME/.local/bin/chttr"
 if [[ ! -x $exe ]]; then
   echo '{"alt":"setup","class":"setup"}'

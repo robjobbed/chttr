@@ -8,6 +8,7 @@ import socket
 import threading
 import time
 from argparse import Namespace
+from pathlib import Path
 
 import pytest
 
@@ -289,3 +290,24 @@ def test_status_never_raises_daemon_not_running(monkeypatch, capsys):
 
     monkeypatch.setattr(cli, "_current_state", boom)
     assert json.loads(status(capsys, json_out=True))["alt"] == "off"
+
+
+# ---- the Omarchy widget -----------------------------------------------------
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_manifest_declares_the_widget_settings():
+    widget = json.loads((ROOT / "manifest.json").read_text(encoding="utf-8"))["barWidget"]
+    schema = {entry["key"]: entry for entry in widget["schema"]}
+    assert schema["showMeetingTimer"]["type"] == "boolean" and schema["showMeetingTimer"]["defaultValue"] is True
+    assert schema["rightClick"]["options"] == ["meeting", "handsfree"]
+    assert widget["defaults"] == {"showMeetingTimer": True, "rightClick": "meeting"}
+
+
+def test_widget_reads_the_settings_and_uses_the_bars_font():
+    qml = (ROOT / "BarWidget.qml").read_text(encoding="utf-8")
+    assert 'setting("showMeetingTimer"' in qml and 'setting("rightClick"' in qml
+    assert "JetBrainsMono" not in qml                   # the bar's own font, like first-party widgets
+    assert "property string state" not in qml           # Item.state drives QML States; never shadow it
