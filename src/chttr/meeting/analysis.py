@@ -51,9 +51,12 @@ def _is_echo(mic: Utterance, them: list[Utterance]) -> bool:
     if not near:
         return False
     mw = _words(mic.text)
-    if len(mw) < 2:
-        return True     # a word or two of mic sound while they talk: crosstalk, not a turn
     tw = _words(" ".join(u.text for u in near))
+    if len(mw) < 2:
+        # "Yes." right after their question is an answer. A lone word is echo only when
+        # it is heard while they talk and they said that word.
+        during = any(_overlap(mic.start, mic.end, u.start, u.end) > 0 for u in near)
+        return during and bool(mw) and mw[0] in tw
     matched = sum(b.size for b in difflib.SequenceMatcher(None, mw, tw, autojunk=False).get_matching_blocks())
     return matched / len(mw) >= ECHO_OVERLAP
 

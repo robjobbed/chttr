@@ -38,10 +38,18 @@ def test_echo_is_detected_by_word_overlap():
     assert not _is_echo(reply, them)
 
 
-def test_a_word_of_crosstalk_while_they_talk_counts_as_echo():
-    them = [Utterance(10.0, 14.0, "them", "and the budget is fine")]
-    assert _is_echo(Utterance(11.0, 11.4, "mic", "yeah"), them)
-    assert not _is_echo(Utterance(30.0, 30.4, "mic", "yeah"), them)     # nobody else talking: a real turn
+def test_a_lone_word_is_echo_only_when_they_said_it_at_that_moment():
+    them = [Utterance(10.0, 14.0, "them", "yeah exactly and the budget is fine")]
+    assert _is_echo(Utterance(10.1, 10.5, "mic", "yeah"), them)          # their "yeah" leaking back
+    assert not _is_echo(Utterance(11.0, 11.4, "mic", "right"), them)     # you, agreeing while they talk
+    assert not _is_echo(Utterance(30.0, 30.4, "mic", "yeah"), them)      # nobody else talking: a real turn
+
+
+def test_a_short_answer_right_after_a_question_is_kept():
+    them = [Utterance(10.0, 11.2, "them", "Ship Friday?")]
+    assert not _is_echo(Utterance(11.5, 11.9, "mic", "Yes."), them)
+    assert not _is_echo(Utterance(11.4, 12.0, "mic", "Agreed."), them)
+    assert not _is_echo(Utterance(11.6, 12.0, "mic", "Friday."), them)   # their word, but after they stopped
 
 
 def test_caption_votes_respect_the_lag_window():
