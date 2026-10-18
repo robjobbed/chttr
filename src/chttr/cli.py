@@ -453,6 +453,14 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+def cmd_uninstall(args: argparse.Namespace) -> int:
+    from .install import uninstall
+
+    print("chttr uninstall", flush=True)
+    uninstall(purge=args.purge, yes=args.yes, say=lambda line: print(f"  {line}", flush=True))
+    return 0
+
+
 def _mic_check(cfg, seconds: float = 4.0) -> bool:
     """Record a few seconds, show the level and what the recognizer heard."""
     from .recorder import Recorder
@@ -1023,6 +1031,11 @@ def build_parser() -> argparse.ArgumentParser:
     se.add_argument("--no-keybindings", action="store_true")
     se.add_argument("--no-meet", action="store_true", help="skip the Google Meet extension")
     se.set_defaults(func=cmd_setup)
+
+    un = sub.add_parser("uninstall", help="remove the service, keybindings and Meet extension that setup added")
+    un.add_argument("--purge", action="store_true", help="also delete history, meeting data, models and settings")
+    un.add_argument("-y", "--yes", action="store_true", help="don't ask before --purge deletes anything")
+    un.set_defaults(func=cmd_uninstall)
 
     mn = sub.add_parser("menu", help="the bar widget's menu")
     mn.set_defaults(func=cmd_menu)
