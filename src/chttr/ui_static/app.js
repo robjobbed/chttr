@@ -220,7 +220,9 @@
       if (on) $("#detail").setAttribute("aria-labelledby", t.id);
     });
     const search = $("#search");
-    search.hidden = Boolean(view.noSearch);
+    // hidden but still taking its room, so the tabs don't jump when a view has no search
+    search.style.visibility = view.noSearch ? "hidden" : "";
+    search.toggleAttribute("inert", Boolean(view.noSearch));
     const q = $("#q");
     q.placeholder = view.placeholder || "Search every meeting… speaker:dana after:2026-10-01";
     q.setAttribute("aria-label", view.searchLabel || "Search meetings");
@@ -369,7 +371,9 @@
     if (button) button.disabled = true;
     try {
       await api("/api/daemon/meeting-start", { method: "POST" });
-      toast(`Recording the meeting. Stop it with ${hotkey("meeting", "Super+Alt+Insert")} or from the chttr menu.`, { ms: 6000 });
+      const key = hotkey("meeting", "");
+      toast(key ? `Recording the meeting. Stop it with ${key} or from the chttr menu.` : "Recording the meeting. Stop it from the chttr menu.",
+        { ms: 6000 });
     } catch (e) {
       toast(e.message, true);
     }
@@ -496,16 +500,17 @@
   // ---- meetings view: detail ------------------------------------------------------------------
   function meetingsEmpty() {
     const s = state.setup || {};
-    const ways = el("ul", {},
+    const key = hotkey("meeting", "");
+    const ways = el("ul", {}, [
       el("li", {}, s.detect_calls === false
         ? "Turn on detect_calls in [meeting] settings, and chttr offers to record your calls."
         : "Join a Google Meet, Zoom or Teams call: chttr asks whether to record it."),
-      el("li", {}, "Press ", el("kbd", {}, hotkey("meeting", "Super+Alt+Insert")), " to start and stop recording any meeting."),
-      el("li", {}, "Or run ", el("kbd", {}, "chttr meeting start"), " in a terminal."));
+      key ? el("li", {}, "Press ", el("kbd", {}, key), " to start and stop recording any meeting.") : null,
+      el("li", {}, "Or run ", el("kbd", {}, "chttr meeting start"), " in a terminal.")].filter(Boolean));
     const actions = s.daemon === false
       ? [{ label: "Start chttr", primary: true, run: startDaemon }]
       : [{ label: "Record now", primary: true, run: recordNow }];
-    return emptyState({ icon: "●", title: "No meetings yet", body: el("div", {}, el("p", {}, "Three ways to record one:"), ways), actions });
+    return emptyState({ icon: "●", title: "No meetings yet", body: el("div", {}, el("p", {}, key ? "Three ways to record one:" : "Two ways to record one:"), ways), actions });
   }
 
   async function loadMeeting(id) {
@@ -1075,7 +1080,9 @@
       return lingo.recent.length
         ? el("p", { class: "meta" }, "Pick a dictation on the left.")
         : emptyState({ icon: "✎", title: "Dictate something first",
-          body: el("p", {}, "Hold ", el("kbd", {}, hotkey("dictate", "Insert")), ", talk, and let go. Your dictations show up here, ready to fix.") });
+          body: hotkey("dictate", "")
+            ? el("p", {}, "Hold ", el("kbd", {}, hotkey("dictate", "")), ", talk, and let go. Your dictations show up here, ready to fix.")
+            : "Bind a dictation key (see: chttr keys), talk, and let go. Your dictations show up here, ready to fix." });
     }
     const d = lingo.recent[lingo.pick];
     const words = tokens(d.heard).map((w, i) => {
@@ -1200,7 +1207,7 @@
 
   const lingoView = {
     title: "Lingo",
-    backLabel: "Dictations",
+    backLabel: "Pick a dictation",
     detailFirst: true,
     noSearch: true,
     listLabel: () => "Recent dictations",
@@ -1211,13 +1218,15 @@
     },
     detailKey: () => "",
     async detail() {
-      Object.assign(lingo, await api("/api/lingo"));
-      // the Dictations view hands over the dictation to fix by its timestamp
+      // the Dictations view hands over the dictation to fix by its timestamp; one older than
+      // the recent ones Lingo lists is added to the end
       const want = store.get("chttrLingoPick", sessionStorage);
+      Object.assign(lingo, await api(want ? `/api/lingo?ts=${encodeURIComponent(want)}` : "/api/lingo"));
       if (want) {
         store.del("chttrLingoPick", sessionStorage);
         const i = lingo.recent.findIndex((d) => d.ts === want);
         if (i >= 0) Object.assign(lingo, { pick: i, from: -1, to: -1, draft: "" });
+        else toast("That dictation isn't in your history any more. Add its word under “Add a spelling” below.", { ms: 6000 });
       }
       if (lingo.pick === null && lingo.recent.length) lingo.pick = 0;
       if (lingo.pick !== null && lingo.pick >= lingo.recent.length) lingo.pick = lingo.recent.length ? 0 : null;
@@ -1229,7 +1238,8 @@
   // ---- keyboard -------------------------------------------------------------------------------
   const KEYS = [
     ["Anywhere", [["/ or s", "Search"], ["Esc", "Clear the search, close a box"], ["j k or ↓ ↑", "Move through the list"], ["Enter", "Open"],
-      ["g then h m a l d", "Home, Meetings, Action items, Lingo, Dictations"], ["?", "These keys"]]],
+      ["g then h m d a l", "Home, Meetings, Dictations, Action items, Lingo"], ["?", "These keys"]]],
+    ["Dictations", [["c", "Copy the open dictation"]]],
     ["Reading a meeting", [["Space", "Play or pause"], ["← →", "Back or forward 5 seconds"], ["Shift ← →", "30 seconds"],
       ["[ ]", "Previous or next turn"], [", .", "Slower or faster (0.75× to 2×)"], ["f or Ctrl+F", "Find in the transcript"], ["r", "Rename a speaker"]]],
   ];
@@ -1274,7 +1284,7 @@
     if (!pressesControl && view.onKey && view.onKey(e)) { e.preventDefault(); return; }
     switch (e.key) {
       case "/": case "s":
-        if (!$("#search").hidden) { e.preventDefault(); $("#q").focus(); $("#q").select(); }
+        if (!$("#search").inert) { e.preventDefault(); $("#q").focus(); $("#q").select(); }
         return;
       case "j": case "ArrowDown":
         if (moveFocus(1)) e.preventDefault();
@@ -1315,7 +1325,7 @@
     started = true;
     if (!TOKEN) {
       $("#detail").replaceChildren(emptyState({ icon: "!", title: "This page needs its link",
-        body: el("p", {}, "Open it from the chttr menu (Meeting library), or with ", el("kbd", {}, "chttr ui"), ", which prints the link.") }));
+        body: el("p", {}, "Open it from the chttr menu (Open chttr), or with ", el("kbd", {}, "chttr ui"), ", which prints the link.") }));
       return;
     }
     setupTabs();

@@ -198,9 +198,11 @@ that it lands on the clipboard with a notification.
 
 The bar widget shows what chttr is doing: a slashed microphone when it's off
 (click to start it), an hourglass while the model loads or it transcribes, a
-red dot and timer during a meeting, a small dot when cleanup is off. Left click
-opens chttr's menu (record a meeting, last notes, history, the meeting library,
-settings), right click starts or stops a meeting recording.
+red dot and timer during a meeting, a dimmed microphone when the speech model
+didn't load, and a small dot when only local cleanup is available (no Claude
+key or Ollama). Left click opens chttr's menu (record a meeting, last notes,
+history, chttr in your browser, settings), right click starts or stops a
+meeting recording.
 
 ### Claude cleanup
 

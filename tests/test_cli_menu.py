@@ -59,7 +59,7 @@ def test_working_cleanup_hides_it(menu, monkeypatch):
     monkeypatch.setattr(P, "backend", lambda cfg: "claude")
     labels, terminal = menu(pick_label="nothing")
     assert CLEANUP not in labels and OLLAMA not in labels
-    assert labels[0] == "󰑓  Start the chttr daemon"
+    assert labels[0] == "󰑓  Start chttr"
     assert terminal == []
 
 

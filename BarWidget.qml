@@ -6,8 +6,9 @@ import qs.Commons as Commons
 import qs.Ui
 
 // chttr in the bar: whether chttr is running, loading its speech model, listening,
-// transcribing or recording a meeting (with a running timer), and a small dot when
-// cleanup is off. Left click opens chttr's menu (or starts chttr when it's off);
+// transcribing or recording a meeting (with a running timer), whether the speech
+// model failed to load, and a small dot when only local cleanup is available (no
+// Claude key or Ollama). Left click opens chttr's menu (or starts chttr when it's off);
 // right click starts or stops a meeting recording, or hands-free dictation if the
 // widget's "Right click" setting says so. Before setup, a click runs bin/setup.
 BarWidget {
@@ -126,7 +127,7 @@ BarWidget {
           if (root.chttrState === "transcribing") return "\u{F051F}"   // timer sand
           if (root.chttrState === "loading") return "\u{F051F}"
           if (root.chttrState === "meeting") return "\u{F044A}"        // record
-          if (!root.running) return "\u{F036D}"                        // microphone off
+          if (!root.running || root.chttrState === "error") return "\u{F036D}"   // microphone off (or no speech model)
           return "\u{F036C}"
         }
         active: root.chttrState === "recording" || root.chttrState === "meeting"
@@ -145,7 +146,7 @@ BarWidget {
         onRunningChanged: if (!running) glyphSlot.opacity = 1
       }
 
-      // Cleanup is off (no Claude key, no Ollama): a small dot at the glyph's corner.
+      // Only local cleanup (no Claude key, no Ollama): a small dot at the glyph's corner.
       Rectangle {
         readonly property real size: Math.max(3, Math.round(Style.spaceReal(4)))
         visible: root.running && root.cleanup === "none"

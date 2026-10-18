@@ -620,9 +620,16 @@ def ensure_data_dir() -> Path:
 
 
 def open_private(path: Path, append: bool = True):
-    """Open a text file for writing that only you can read (created 0600)."""
+    """Open a text file for writing that only you can read: 0600, also when an older file
+    was more open (tightened before anything is written to it)."""
     flags = os.O_WRONLY | os.O_CREAT | (os.O_APPEND if append else os.O_TRUNC)
-    return os.fdopen(os.open(path, flags, 0o600), "a" if append else "w", encoding="utf-8")
+    fd = os.open(path, flags, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+    except OSError:
+        os.close(fd)
+        raise
+    return os.fdopen(fd, "a" if append else "w", encoding="utf-8")
 
 
 def too_open(path: Path) -> bool:

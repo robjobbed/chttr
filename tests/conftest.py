@@ -96,3 +96,25 @@ def _sandboxed_calendar() -> None:
 
 
 _sandboxed_calendar()
+
+
+def _sandboxed_compositor_config() -> None:
+    """chttr reads its key bindings from ~/.config/hypr and ~/.config/sway, which the XDG
+    variables above don't move either: while HOME is still your own, those reads see an
+    empty home instead. Tests that set HOME, or pass `home=`, read what they made."""
+    from chttr import hotkeys
+
+    real_home, empty = Path.home(), _ROOT / "home"
+    real_files, real_has = hotkeys.binding_files, hotkeys.compositor_has_bindings
+
+    def binding_files(compositor, home=None):
+        return real_files(compositor, empty if home is None and Path.home() == real_home else home)
+
+    def compositor_has_bindings(compositor):
+        return False if Path.home() == real_home else real_has(compositor)
+
+    hotkeys.binding_files = binding_files
+    hotkeys.compositor_has_bindings = compositor_has_bindings
+
+
+_sandboxed_compositor_config()

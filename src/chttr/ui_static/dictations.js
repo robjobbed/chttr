@@ -108,9 +108,14 @@
   }
 
   function emptyState(c, setup, q) {
-    if (q) return c.el("div", { class: "empty" }, `No dictations match “${q}”.`);
-    const key = (setup.hotkeys && setup.hotkeys.dictate) || "Insert";
-    return c.el("div", { class: "empty" }, "Hold ", c.el("kbd", {}, key), " and talk. Dictations show up here.");
+    if (q) {
+      return c.emptyState({ icon: "∅", title: `Nothing you dictated contains “${q}”`,
+        body: "Try another word. Search looks at what chttr typed and what it heard." });
+    }
+    const key = setup.hotkeys && setup.hotkeys.dictate;
+    return c.emptyState({ icon: "●", title: "No dictations yet",
+      body: key ? c.el("p", {}, "Hold ", c.el("kbd", {}, key), ", talk, and let go. Every dictation shows up here, with what chttr heard.")
+        : "Bind a dictation key (see: chttr keys), talk, and let go. Every dictation shows up here." });
   }
 
   function row(c, e, route) {
@@ -135,11 +140,8 @@
       return;
     }
     if (seq !== view.seq) return;               // a newer search already answered
-    if (!entries.length) {
-      const setup = view.q ? {} : await getSetup(c);
-      if (seq !== view.seq) return;
-      box.replaceChildren(c.el("div", { class: "section-label" }, view.q ? "No matches" : "No dictations yet"),
-        view.q ? c.el("p", { class: "meta pad" }, `Nothing you dictated contains “${view.q}”.`) : emptyState(c, setup, ""));
+    if (!entries.length) {                      // the detail pane says what to do
+      box.replaceChildren(c.el("div", { class: "section-label" }, view.q ? "No matches" : "No dictations yet"));
       return;
     }
     const more = entries.length >= LIMIT;

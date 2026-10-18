@@ -226,10 +226,13 @@ def _journal_tail(lines: int = 8) -> None:
 
 def notify(title: str, body: str = "", *, urgency: str = "normal", timeout_ms: int = 6000) -> None:
     """A desktop notification from a short-lived command (Omarchy's styled one when present)."""
+    from .feedback import as_text
+
     if shutil.which("omarchy-notification-send"):
         cmd = ["omarchy-notification-send", "--app-name", "chttr", "-g", GLYPH, "-u", urgency, "-t", str(timeout_ms)]
+        title, body = as_text(title), as_text(body)
     else:
-        cmd = ["notify-send", "-a", "chttr", "-u", urgency, "-t", str(timeout_ms)]
+        cmd = ["notify-send", "-a", "chttr", "-u", urgency, "-t", str(timeout_ms), "--"]
     try:
         subprocess.run([*cmd, title, *([body] if body else [])], capture_output=True, check=False, timeout=5)
     except (OSError, subprocess.TimeoutExpired):
@@ -335,6 +338,7 @@ def card(exe: str, cfg, desk=None, meet_installed: bool = True) -> dict[str, str
     from . import hotkeys as H
     from . import polish as P
     from .desktop import detect
+    from .gcal import read_urls
 
     keys = H.effective_bindings(cfg, desk or detect())
     print()
@@ -346,8 +350,9 @@ def card(exe: str, cfg, desk=None, meet_installed: bool = True) -> dict[str, str
     notes = {"claude": "Claude", "ollama": "Ollama"}.get(backend, "on-device")
     _say(f"Cleanup: {cleanup}")
     _say(f"Notes: {notes}")
-    _say("Meeting attendees: chttr meeting calendar '<secret iCal address>' "
-         "(Google Calendar > Settings > your calendar)")
+    if not read_urls(cfg.meeting.calendar_file):
+        _say("Meeting attendees: chttr meeting calendar '<secret iCal address>' "
+             "(Google Calendar > Settings > your calendar)")
     if meet_installed:
         _say("Speaker names in Meet: restart Chromium once so it loads the chttr extension")
     _say("Check anything: chttr doctor")
@@ -397,7 +402,8 @@ def run(do_models: bool = True, do_service: bool = True, do_bindings: bool = Tru
         print("Not quite ready: fix the PROBLEM lines above, then run chttr setup again.")
         return 1
     if not do_service:
-        print(f"Set up. Start the daemon (systemctl --user start chttr, or: chttr daemon), then {ready_message(keys)}")
+        msg = ready_message(keys)
+        print(f"Set up. Start chttr (systemctl --user start chttr, or: chttr daemon), then {msg[:1].lower()}{msg[1:]}")
         return 0
     print(f"Ready. Hold {keys['dictate']} and talk; let go to type.")
     notify("chttr is ready", ready_message(keys), timeout_ms=12000)
@@ -557,18 +563,39 @@ def _inside(path: Path, folder: Path) -> bool:
     return path == folder or folder in path.parents
 
 
+# What chttr keeps in ~/.config/chttr and ~/.local/share/chttr. A folder of chttr's that
+# links somewhere holding anything else (a shared disk) loses only these.
+OWNED = frozenset({
+    "config.toml", "dictionary.toml", "note-styles.toml", "secrets.json", "anthropic-api-key", "calendar-urls",
+    "history.jsonl", "history-audio", "meetings", "models", "voices.json", "library.sqlite", "library.sqlite-wal",
+    "library.sqlite-shm", "library.sqlite-journal", "calendar-cache", "src", "native-host", "hinted-cleanup"})
+
+
+def _remove(path: Path) -> None:
+    shutil.rmtree(path) if path.is_dir() and not path.is_symlink() else path.unlink()
+
+
 def _delete_root(root: Path, notes: Path) -> str:
     """Delete one of chttr's folders, sparing the meeting notes when they live in it.
     Paths are compared resolved, so a notes folder reached through a symlink into
     chttr's data counts as inside it, and a data folder moved to another disk and
-    linked back is deleted where it really is (then the link)."""
+    linked back is deleted where it really is (then the link), unless that folder
+    holds more than chttr's files: then only chttr's go."""
     target, notes_r, link = root.resolve(), notes.resolve(), root.is_symlink()
     try:
+        others = sorted(c for c in target.iterdir() if c.name not in OWNED) if link and target.is_dir() else []
+        if others:
+            for child in target.iterdir():
+                if child.name in OWNED and not _inside(notes_r, child.resolve()):
+                    _remove(child)
+            root.unlink()
+            return (f"data: deleted chttr's files in {_home(target)}, which {_home(root)} linked to, and the link; "
+                    f"left the {len(others)} other item{'' if len(others) == 1 else 's'} there alone")
         if _inside(notes_r, target):
             for child in target.iterdir():
                 if _inside(notes_r, child.resolve()):
                     continue
-                shutil.rmtree(child) if child.is_dir() and not child.is_symlink() else child.unlink()
+                _remove(child)
             return f"data: deleted {_home(root)} except your meeting notes in {_home(notes)}"
         if target.is_dir():
             shutil.rmtree(target)
@@ -589,11 +616,14 @@ def _purge(yes: bool, ask) -> list[str]:
         notes = Path(C.load_config(C.CONFIG_FILE).meeting.dir).expanduser()
     except (OSError, ValueError):
         notes = Path(C.MeetingCfg().dir).expanduser()
+    def where(root: Path) -> str:
+        return f"{_home(root)} (a link to {_home(root.resolve())})" if root.is_symlink() else _home(root)
+
     if not yes:
         code = " (and the chttr code installed there)" if (C.DATA_DIR / "src").exists() else ""
         try:
             answer = ask(f"Delete history, meeting data, voices, the library index and the models in "
-                         f"{_home(C.DATA_DIR)}{code}, and your settings in {_home(C.CONFIG_DIR)}? [y/N] ")
+                         f"{where(C.DATA_DIR)}{code}, and your settings in {where(C.CONFIG_DIR)}? [y/N] ")
         except (EOFError, KeyboardInterrupt):
             answer = ""
         if not answer.strip().lower().startswith("y"):

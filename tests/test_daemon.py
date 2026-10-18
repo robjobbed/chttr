@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import threading
 import time
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -461,7 +462,7 @@ def test_an_unreachable_model_costs_one_notice_and_no_waiting(daemon, monkeypatc
     assert dictate(daemon, "um and then run the whole test suite again") == "and then run the whole test suite again"
     assert len(calls) == 1                                     # the breaker skipped the second request
     assert daemon.feedback.notes.count("Cleanup offline") == 1
-    assert "chttr: cleanup unavailable" not in daemon.feedback.notes
+    assert "Cleanup unavailable" not in daemon.feedback.notes
     offline.succeeded()                                        # back online: the next outage is announced again
     assert daemon.polish_warned is False
 
@@ -495,7 +496,7 @@ def test_a_slow_answer_does_not_silence_the_next_outage(daemon, monkeypatch, off
     dictate(daemon, "um so ship it today then")             # it worked again
     dictate(daemon, "um so ship it today then")             # a real outage: announced
     notes = [n for n in notes if "leanup" in n[0]]
-    assert notes == [("chttr: cleanup unavailable", "Ollama took longer than 10 s"),       # no class name
+    assert notes == [("Cleanup unavailable", "Ollama took longer than 10 s. Typed locally cleaned text instead."),  # no class name
                      ("Cleanup offline", "Typing locally cleaned text until Claude answers again.")]
 
 
@@ -577,13 +578,14 @@ def test_a_missing_model_is_one_clear_notice_and_no_crash(lazy_daemon):
     d._load_model()
     assert d.state == Dm.IDLE
     assert d.handle("status")["model"] == "missing"
-    assert "chttr: the speech model is missing" in d.feedback.notes
+    assert "chttr can't load the speech model" in d.feedback.notes
     assert d.handle("start")["state"] == Dm.RECORDING          # still records
-    assert "chttr can't transcribe: speech model missing" in d.feedback.notes
+    assert d.feedback.notes[-1] == "chttr can't transcribe"
     d.handle("release")
     wait_idle(d)
     assert d.typed == []
-    assert d.feedback.notes[-1] == "chttr error"
+    assert d.feedback.notes.count("chttr can't transcribe") == 1    # said once, at the press
+    assert d.feedback.notes[-1] == "chttr can't transcribe"         # no raw error after it
 
 
 def test_a_corrupt_model_is_the_same_clear_notice(lazy_daemon):
@@ -594,7 +596,7 @@ def test_a_corrupt_model_is_the_same_clear_notice(lazy_daemon):
     assert d.state == Dm.IDLE
     assert d.handle("status")["model"] == "missing"
     assert "INVALID_PROTOBUF" in d.model_error
-    assert "chttr: the speech model is missing" in d.feedback.notes
+    assert "chttr can't load the speech model" in d.feedback.notes
 
 
 def test_a_reload_after_a_failed_model_load_does_not_say_missing_while_it_loads(lazy_daemon, monkeypatch, tmp_path):
@@ -608,7 +610,7 @@ def test_a_reload_after_a_failed_model_load_does_not_say_missing_while_it_loads(
     assert d.model_error == ""
     d.feedback.notes.clear()
     d.handle("start")
-    assert "chttr can't transcribe: speech model missing" not in d.feedback.notes
+    assert "chttr can't transcribe" not in d.feedback.notes
     d.handle("cancel")
     d.Model.gate.set()
     assert wait_for(lambda: d.handle("status")["model"] == "ready")
@@ -1794,3 +1796,142 @@ def test_a_prompt_to_a_coding_agent_keeps_its_full_stop_without_a_model(daemon, 
     assert daemon.cfg.mode_for(*Dm.focused_window()).name == "agent"
     assert dictate(daemon, "um check the parser and run pytest dash dash verbose period") \
         == "Check the parser and run pytest --verbose."
+
+
+def test_the_bar_names_the_keys_that_are_really_bound(daemon, monkeypatch):
+    """On Hyprland the keys live in bindings.lua; [hotkeys] in config.toml doesn't move them."""
+    import json
+
+    from chttr import hotkeys as H
+
+    monkeypatch.setattr(H, "effective_bindings", lambda cfg, desk, backend=None, home=None: {"dictate": "F9"})
+    daemon._note_keys()
+    daemon._write_state(daemon.state)
+    assert json.loads(C.STATE_JSON.read_text(encoding="utf-8"))["hotkeys"] == {"dictate": "F9"}
+    monkeypatch.setattr(H, "effective_bindings", lambda *a, **k: (_ for _ in ()).throw(OSError("unreadable")))
+    daemon._note_keys()
+    daemon._write_state(daemon.state)
+    assert json.loads(C.STATE_JSON.read_text(encoding="utf-8"))["hotkeys"]["dictate"] == "Insert"   # config.toml's
+
+
+def test_state_json_says_when_the_model_did_not_load(lazy_daemon):
+    import json
+
+    d = lazy_daemon
+    assert json.loads(C.STATE_JSON.read_text(encoding="utf-8"))["model"] == "loading"
+    d.Model.error = FileNotFoundError("no model")
+    d._load_model()
+    info = json.loads(C.STATE_JSON.read_text(encoding="utf-8"))
+    assert info["state"] == "idle" and info["model"] == "missing"
+    assert d.handle("meeting status")["model"] == "missing"
+
+
+def test_a_reload_while_the_model_loads_reaches_the_model(lazy_daemon, monkeypatch, tmp_path):
+    d = lazy_daemon
+    path = tmp_path / "config.toml"
+    monkeypatch.setattr(C, "CONFIG_FILE", path)
+    loading = threading.Thread(target=d._load_model, daemon=True)
+    loading.start()
+    assert wait_for(lambda: d.state == Dm.LOADING)
+    path.write_text("[audio]\nspeech_threshold_db = -50\nwhisper_mode = true\n", encoding="utf-8")
+    reply = d.handle("reload")
+    assert "takes these settings when it is ready" in reply["message"]
+    d.Model.gate.set()
+    loading.join(5)
+    assert d.transcriber.threshold_db == -50 and d.transcriber.boost is True
+
+
+def test_a_reload_to_another_engine_while_loading_loads_that_one(lazy_daemon, monkeypatch, tmp_path):
+    d = lazy_daemon
+    built = []
+
+    class Model(d.Model):
+        def __init__(self, cfg):
+            built.append(cfg.engine.name)
+            super().__init__(cfg)
+
+    monkeypatch.setattr(Dm, "Transcriber", Model)
+    path = tmp_path / "config.toml"
+    monkeypatch.setattr(C, "CONFIG_FILE", path)
+    loading = threading.Thread(target=d._load_model, daemon=True)
+    loading.start()
+    assert wait_for(lambda: built == ["parakeet"])
+    path.write_text('[engine]\nname = "whisper"\n', encoding="utf-8")
+    d.handle("reload")
+    d.Model.gate.set()
+    loading.join(5)
+    assert built == ["parakeet", "whisper"] and d.handle("status")["model"] == "ready"
+
+
+def test_a_line_break_in_a_terminal_is_never_an_enter(daemon, monkeypatch):
+    """Only "run it" presses Enter in a terminal: a model's or a spoken line break would run the line."""
+    monkeypatch.setattr(Dm.P, "backend", lambda cfg: "claude")
+    monkeypatch.setattr(Dm.P, "polish", lambda *a, **k: "ls\nrm -rf x")
+    typed = dictate(daemon, "um list the files and then remove the x folder please")
+    assert "\n" not in typed and typed.startswith("ls rm -rf x")
+
+
+def test_a_line_break_in_a_coding_agent_stays_a_new_line(daemon, monkeypatch):
+    monkeypatch.setattr(Dm, "focused_window", lambda: ("com.mitchellh.ghostty", "✳ Fix the parser tests"))
+    monkeypatch.setattr(Dm.P, "backend", lambda cfg: "claude")
+    monkeypatch.setattr(Dm.P, "polish", lambda *a, **k: "First fix the parser.\nThen run the tests.")
+    assert dictate(daemon, "um first fix the parser and then run all of the tests") == \
+        "First fix the parser.\nThen run the tests."             # typed as Shift+Enter there
+
+
+def test_the_desktop_is_looked_at_again_once_wayland_shows_up(pill, monkeypatch):
+    """The real current_desktop() caches its answer; a daemon started before Hyprland asks again."""
+    import functools
+
+    from chttr import desktop as DT
+
+    env = {"XDG_SESSION_TYPE": "tty"}
+    monkeypatch.setattr(Dm, "current_desktop", functools.cache(lambda: DT.detect(dict(env))))
+    pill._overlay_warm()
+    assert FakeOverlayProc.spawned == [] and not Dm.current_desktop().wayland
+    env.update(XDG_SESSION_TYPE="wayland", HYPRLAND_INSTANCE_SIGNATURE="abc")
+    pill.desktop_checked_at -= Dm.OVERLAY_RESPAWN
+    pill_dictate(pill, "hello")
+    assert len(FakeOverlayProc.spawned) == 1 and Dm.current_desktop().compositor == "hyprland"
+
+
+def test_stopping_a_meeting_does_not_wait_for_systemd_run(daemon, monkeypatch):
+    gate, launched = threading.Event(), []
+
+    def slow_launch(directory):
+        gate.wait(5)
+        launched.append(directory)
+
+    class Meeting:
+        dir, title, code, source = Path("/tmp/m"), "", "", "manual"
+        recorder = type("R", (), {"started": 0.0})()
+
+        def stop(self):
+            return 600.0
+
+    monkeypatch.setattr(Dm, "launch_processing", slow_launch)
+    daemon.meeting = Meeting()
+    t0 = time.monotonic()
+    assert daemon.handle("meeting stop")["message"].startswith("recorded")
+    assert time.monotonic() - t0 < 1 and launched == []
+    gate.set()
+    daemon.launcher.join(5)
+    assert launched == [Path("/tmp/m")]
+
+
+def test_dictation_audio_past_keep_audio_days_goes_on_reload(daemon, monkeypatch, tmp_path):
+    import os
+
+    C.HISTORY_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+    old = C.HISTORY_AUDIO_DIR / "20260101-000000-000000.wav"
+    new = C.HISTORY_AUDIO_DIR / "20261018-000000-000000.wav"
+    for f in (old, new):
+        f.write_bytes(b"RIFF")
+    os.utime(old, (time.time() - 10 * 86400,) * 2)
+    path = tmp_path / "config.toml"
+    monkeypatch.setattr(C, "CONFIG_FILE", path)
+    monkeypatch.setattr(Dm, "engine_key", lambda cfg: daemon.transcriber.key)
+    path.write_text("[history]\nkeep_audio_days = 3\n", encoding="utf-8")
+    daemon.handle("reload")
+    assert not old.exists() and new.exists()
+    new.unlink()

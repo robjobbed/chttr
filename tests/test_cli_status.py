@@ -196,10 +196,19 @@ def test_a_key_turned_off_is_not_mentioned():
     assert data["tooltip"] == "chttr: ready · right click: record a meeting"
 
 
-def test_cleanup_off_says_so():
-    data = json.loads(cli._status_json("idle", {"hotkeys": {"dictate": "F9"}, "cleanup": "none"}))
-    assert data["tooltip"] == "chttr: cleanup is off (local rules) · hold F9 to dictate"
+def test_local_cleanup_only_keeps_the_usual_hints():
+    data = json.loads(cli._status_json("idle", {"hotkeys": {"dictate": "F9", "command": "Alt+F9"}, "cleanup": "none"}))
+    assert data["tooltip"] == ("chttr: hold F9 to dictate · Alt+F9: command mode · right click: record a meeting"
+                               " · local cleanup only (chttr connect claude for Claude)")
     assert data["cleanup"] == "none"
+
+
+def test_a_model_that_did_not_load_shows_as_an_error():
+    data = json.loads(cli._status_json("idle", {"hotkeys": {"dictate": "F9"}, "model": "missing"}))
+    assert data["class"] == data["alt"] == "error"
+    assert data["tooltip"] == "chttr: the speech model didn't load · run chttr setup"
+    assert json.loads(cli._status_json("idle", {"model": "loading"}))["class"] == "idle"
+    assert json.loads(cli._status_json("recording", {"model": "missing"}))["class"] == "recording"
 
 
 def test_recording_tooltips_follow_the_kind():

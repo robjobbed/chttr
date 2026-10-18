@@ -35,9 +35,8 @@ def save(key: str, cfg) -> Path:
     key = check(key)
     target = path(cfg)
     target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with C.open_private(target, append=False) as fh:
+    with C.open_private(target, append=False) as fh:     # an older, more open file is tightened first
         fh.write(key + "\n")
-    os.chmod(target, 0o600)                 # an older file may have been created more open
     return target
 
 

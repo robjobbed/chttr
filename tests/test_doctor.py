@@ -547,5 +547,7 @@ def test_meet_extension_and_info_checks(cfg, monkeypatch, tmp_path):
     assert D.meet_extension(cfg, m.env).detail == "not installed (chttr meeting install)"
     m.files.add(str(profile / "NativeMessagingHosts" / f"{native_host.HOST_NAME}.json"))
     assert D.meet_extension(cfg, m.env).detail == "registered for chromium"
-    assert D.meetings(cfg, m.env).detail.startswith("notes to ")
+    cfg.meeting.dir = str(D.Path.home() / "Documents/Meetings")
+    assert D.meetings(cfg, m.env).detail == "notes to ~/Documents/Meetings; auto = ask"
+    assert D.calendar(cfg, m.env).detail == "none yet (add one: chttr meeting calendar URL)"
     assert D.modes(cfg, m.env).detail == "agent, terminal, code, chat, email, docs, assistant"   # each once

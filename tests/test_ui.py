@@ -387,3 +387,48 @@ def test_route_for_citation():
     assert U.route_for_citation("Board, with commas, 2026-10-08, 00:00:05", meetings) == "meeting/2026-10-08-140000?t=5"
     assert U.route_for_citation("Pricing review, 2026-10-02, 00:00:01", meetings) is None
     assert U.route_for_citation("just some words", meetings) is None
+
+
+def test_setup_names_the_keys_that_are_really_bound(server, no_daemon, monkeypatch):
+    """On Hyprland the keys live in bindings.lua: the page says F9, not config.toml's Insert."""
+    from chttr import hotkeys as H
+
+    monkeypatch.setattr(U, "_keys_cache", (0.0, None, {}))
+    monkeypatch.setattr(H, "effective_bindings", lambda cfg, desk, **kw: {"dictate": "F9", "command": "Alt+F9"})
+    s = json.loads(get(server + "/api/setup", TOKEN)[1])
+    assert s["hotkeys"] == {"dictate": "F9", "hands_free": "", "meeting": "", "history": "", "command": "Alt+F9"}
+
+
+def test_status_passes_on_a_model_that_did_not_load(monkeypatch):
+    monkeypatch.setattr(U, "_daemon_status", lambda timeout=0.5: {"state": "idle", "meeting": None, "model": "missing"})
+    assert U.status_info() == {"state": "idle", "meeting": None, "daemon": True, "model": "missing"}
+
+
+def test_csv_cells_never_become_spreadsheet_formulas(lib, monkeypatch):  # noqa: F811
+    import csv
+    import io
+
+    from chttr import library as L
+    from tests.test_library import make_meeting
+
+    make_meeting(lib / "meetings", "2026-10-09-140000", 1760000000, "Vendor call",
+                 [("=1+1", 3, "@SUM(A1) is what they said"), ("Dana", 9, "- a bullet, then a plain line")])
+    L.sync()
+    body, _, _ = U.export("2026-10-09-140000", "csv")
+    rows = list(csv.reader(io.StringIO(body.decode("utf-8-sig"))))
+    assert rows[1][2:] == ["'=1+1", "'@SUM(A1) is what they said"]
+    assert rows[2][2:] == ["Dana", "'- a bullet, then a plain line"]
+    assert U._cell("Dana") == "Dana" and U._cell("+44 20") == "'+44 20"
+
+
+def test_lingo_can_open_a_dictation_older_than_its_list(server, lingo_files, monkeypatch):
+    from chttr import history
+
+    entries = [{"ts": f"2026-10-01T10:{i:02}:00+00:00", "kind": "dictate", "raw": f"dictation {i}", "text": f"dictation {i}"}
+               for i in range(U.LINGO_RECENT + 5)]
+    history.C.HISTORY_FILE.write_text("".join(json.dumps(e) + "\n" for e in entries))
+    old = entries[2]["ts"]
+    state = json.loads(get(server + "/api/lingo", TOKEN)[1])
+    assert len(state["recent"]) == U.LINGO_RECENT and old not in [d["ts"] for d in state["recent"]]
+    state = json.loads(get(server + f"/api/lingo?ts={old.replace('+', '%2B')}", TOKEN)[1])
+    assert len(state["recent"]) == U.LINGO_RECENT + 1 and state["recent"][-1]["heard"] == "dictation 2"

@@ -24,6 +24,12 @@ _NOTIFY_IDS = ("92110", "92111", "92112")
 Action = tuple[str, list[str]]     # (button label, argv to run when it's picked)
 
 
+def as_text(text: str) -> str:
+    """Text that omarchy-notification-send, which has no `--`, can't take for an option:
+    a calendar invite titled "-u critical" or "--app-name=Bank" stays a title."""
+    return "\u2060" + text if text.startswith("-") else text
+
+
 class Feedback:
     def __init__(self, cfg: FeedbackCfg, runtime_dir: Path) -> None:
         self.cfg = cfg
@@ -59,7 +65,8 @@ class Feedback:
             self._alert_until[replace] = time.monotonic() + (timeout_ms or 8000) / 1000
             self._progress_id = min((i for i in _NOTIFY_IDS if i != replace),
                                     key=lambda i: self._alert_until.get(i, 0.0))
-        cmd = ["notify-send", "-a", "chttr", "-r", replace, "-u", urgency, "-t", str(timeout_ms), title]
+        # `--`: whatever the title says (a calendar event's name), it isn't an option
+        cmd = ["notify-send", "-a", "chttr", "-r", replace, "-u", urgency, "-t", str(timeout_ms), "--", title]
         if body:
             cmd.append(body)
         try:
@@ -87,7 +94,8 @@ class Feedback:
             cmd = ["omarchy-notification-send", "--app-name", "chttr", "-u", urgency, "-t", str(timeout_ms)]
             cmd += ["-g", glyph] if glyph else []
             try:
-                done = runner([*cmd, title, text, "--exec", *argv], capture_output=True, text=True, timeout=10)
+                done = runner([*cmd, as_text(title), as_text(text), "--exec", *argv], capture_output=True, text=True,
+                              timeout=10)
                 if done.returncode == 0:
                     return None
                 log.warning("omarchy-notification-send failed: %s", (done.stderr or "").strip())
@@ -99,7 +107,7 @@ class Feedback:
         for i, (other, _) in enumerate(others):
             cmd += ["-A", f"{i}={other}"]
         try:
-            out = runner([*cmd, "--wait", title, text], capture_output=True, text=True,
+            out = runner([*cmd, "--wait", "--", title, text], capture_output=True, text=True,
                          timeout=timeout_ms / 1000 + 60).stdout.strip()
         except (OSError, subprocess.TimeoutExpired) as exc:
             log.info("no answer to %r: %s", title, exc)

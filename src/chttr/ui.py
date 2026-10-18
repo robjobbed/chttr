@@ -1,4 +1,4 @@
-"""`chttr ui`: the meeting library in your browser.
+"""`chttr ui`: chttr in your browser (home, dictations, meetings, action items, Lingo).
 
 A small local web app on 127.0.0.1 (a random port; every request needs the
 secret token in the URL chttr opens, and the Host header must match, so other
@@ -55,12 +55,19 @@ def _lingo_text(value: object, limit: int = LINGO_MAX) -> str:
     return text
 
 
-def lingo_state() -> dict:
+def lingo_state(ts: str = "") -> dict:
+    """The words in Lingo and the latest dictations. `ts` is a dictation to fix that may be
+    older than those (the Dictations tab lists far more): it is added at the end."""
     from .history import load
 
-    recent = [{"ts": e.get("ts", ""), "app": e.get("app", ""), "heard": str(e.get("raw") or e.get("text") or ""),
-               "typed": str(e.get("text") or "")}
-              for e in reversed(load()[-LINGO_RECENT:]) if e.get("kind", "dictate") == "dictate"]
+    def entry(e: dict) -> dict:
+        return {"ts": e.get("ts", ""), "app": e.get("app", ""), "heard": str(e.get("raw") or e.get("text") or ""),
+                "typed": str(e.get("text") or "")}
+
+    history = load()
+    recent = [entry(e) for e in reversed(history[-LINGO_RECENT:]) if e.get("kind", "dictate") == "dictate"]
+    if ts and not any(d["ts"] == ts for d in recent):
+        recent += [entry(e) for e in history[:-LINGO_RECENT] if e.get("ts") == ts][:1]
     return {"words": Dictionary.load().words(), "recent": recent}
 
 
@@ -132,12 +139,32 @@ def _extension_installed() -> bool:
     return any((config_dir / "NativeMessagingHosts" / f"{HOST_NAME}.json").exists() for _, config_dir, _ in BROWSERS)
 
 
+_keys_cache: tuple[float, object, dict] = (0.0, None, {})
+
+
+def _bound_keys(cfg: C.Config) -> dict[str, str]:
+    """The keys that really trigger chttr ("" for one nothing catches): on Hyprland and Sway
+    the compositor's bindings, which [hotkeys] in config.toml doesn't change. Finding the
+    backend can ask D-Bus, so the answer stands for 10 s."""
+    global _keys_cache
+    from . import hotkeys as H
+    from .desktop import detect
+
+    at, hk, keys = _keys_cache
+    if hk is not cfg.hotkeys or time.monotonic() - at > 10:
+        try:
+            bound = H.effective_bindings(cfg, detect())
+        except Exception:  # noqa: BLE001 - a status line must not break the page
+            bound = {a: getattr(cfg.hotkeys, a, "") for a in H.ACTIONS}
+        keys = {a: bound.get(a, "") for a in ("dictate", "hands_free", "meeting", "history", "command")}
+        _keys_cache = (time.monotonic(), cfg.hotkeys, keys)
+    return dict(keys)
+
+
 def setup_info(cfg: C.Config) -> dict:
-    hk = cfg.hotkeys
     return {"daemon": _daemon_status() is not None, "cleanup_backend": _cleanup_backend(cfg),
             "notes_available": _notes_available(cfg),
-            "hotkeys": {"dictate": hk.dictate, "hands_free": hk.hands_free, "meeting": hk.meeting,
-                        "history": hk.history, "command": hk.command},
+            "hotkeys": _bound_keys(cfg),
             "detect_calls": cfg.meeting.detect_calls, "extension_installed": _extension_installed(),
             "meetings_dir": str(Path(cfg.meeting.dir).expanduser()), "typer": cfg.output.typer}
 
@@ -157,7 +184,8 @@ def status_info() -> dict:
     if reply is None:
         return {"state": client.read_state(), "meeting": None, "daemon": False}
     meeting = reply.get("meeting") if isinstance(reply.get("meeting"), dict) else None
-    return {"state": str(reply.get("state") or client.read_state()), "meeting": meeting, "daemon": True}
+    return {"state": str(reply.get("state") or client.read_state()), "meeting": meeting, "daemon": True,
+            "model": str(reply.get("model") or "")}
 
 
 # ---- export -----------------------------------------------------------------------------------
@@ -165,6 +193,13 @@ def status_info() -> dict:
 def _filename(title: str, when: str, ext: str) -> str:
     stem = " ".join(re.sub(r"[^\w .,()&+-]", " ", f"{when[:10]} {title}").split()) or "meeting"
     return f"{stem[:80]}.{ext}"
+
+
+def _cell(value: object) -> str:
+    """A CSV cell a spreadsheet won't run: speaker names come from other people's Meet
+    names and invites, and "=HYPERLINK(...)" there would be a formula."""
+    text = str(value)
+    return "'" + text if text[:1] in ("=", "+", "-", "@", "\t", "\r") else text
 
 
 def export(meeting_id: str, fmt: str) -> tuple[bytes, str, str] | None:
@@ -188,7 +223,8 @@ def export(meeting_id: str, fmt: str) -> tuple[bytes, str, str] | None:
         w = csv.writer(out)
         w.writerow(["start", "end", "speaker", "text"])
         for u in m["transcript"]:
-            w.writerow([f"{float(u['start']):.2f}", f"{float(u.get('end') or u['start']):.2f}", u["speaker"], u["text"]])
+            w.writerow([f"{float(u['start']):.2f}", f"{float(u.get('end') or u['start']):.2f}",
+                        _cell(u["speaker"]), _cell(u["text"])])
         return out.getvalue().encode("utf-8-sig"), "text/csv; charset=utf-8", _filename(m["title"], m["when"], "csv")
     raise LookupError(fmt)
 
@@ -291,7 +327,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/ping":
                 return self._json({"ok": True})
             if path == "/api/lingo":
-                return self._json(lingo_state())
+                return self._json(lingo_state(q.get("ts", "")))
             if path == "/api/meetings":
                 return self._json(L.meetings(limit=500))
             if path == "/api/search":
@@ -492,7 +528,7 @@ def serve(port: int = 0, open_browser: bool = True, cfg: C.Config | None = None,
     Handler.last_request = time.monotonic()
     url = f"http://{host}/#{token}" + (f"/{view}" if view else "")
     L.sync()
-    name = re.split(r"[/?]", view)[0] if view else "library"
+    name = re.split(r"[/?]", view)[0] if view else "ui"
     print(f"chttr {name}: {url}\n(Ctrl+C to stop)", flush=True)
     if open_browser:
         threading.Thread(target=_open, args=(url,), daemon=True).start()

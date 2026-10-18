@@ -46,7 +46,7 @@
       { key: "words", label: "Words dictated", value: words.toLocaleString("en-US"),
         sub: plural(Number(s.dictations) || 0, "dictation") },
       { key: "speed", label: "Speaking speed", value: wpm ? `${wpm} wpm` : "–",
-        sub: wpm ? `vs ~${typingWpm} typing${wpm > typingWpm ? ` · ${(wpm / typingWpm).toFixed(1)}× faster` : ""}` : "Dictate something to see it" },
+        sub: wpm ? `vs ~${typingWpm} wpm typing${wpm > typingWpm ? ` · ${(wpm / typingWpm).toFixed(1)}× faster` : ""}` : "Dictate something to see it" },
       { key: "saved", label: "Time saved", value: saved > 0 ? fmtMinutes(saved) : "None yet",
         sub: saved > 0 ? `against typing at ${typingWpm} wpm` : "Longer dictations save the most" },
       { key: "streak", label: "Streak", value: streakLabel(s.streak_days),
@@ -67,7 +67,7 @@
 
   // The status pill: {cls, text} from /api/status. `since` is when we first saw this recording.
   function statusLabel(status, since = null, now = Date.now()) {
-    if (!status || status.daemon === false) return { cls: "off", text: "Daemon not running" };
+    if (!status || status.daemon === false) return { cls: "off", text: "chttr isn't running" };
     const meeting = status.meeting;
     if (meeting) {
       const secs = Number(meeting.seconds) || 0;
@@ -76,6 +76,7 @@
     if (status.state === "recording") return { cls: "recording", text: `● Recording ${fmtClock(since ? (now - since) / 1000 : 0)}` };
     if (status.state === "transcribing") return { cls: "busy", text: "Transcribing" };
     if (status.state === "loading") return { cls: "busy", text: "Loading the speech model" };
+    if (status.model === "missing") return { cls: "off", text: "No speech model (run chttr setup)" };
     return { cls: "idle", text: "Idle" };
   }
 
@@ -195,7 +196,8 @@
     const cmd = "chttr connect claude";
     return c.el("div", { class: "card wide hint-card" },
       c.el("h2", {}, "Cleanup"),
-      c.el("p", {}, "Dictation is cleaned up locally. Add a Claude key for Wispr-style cleanup: ", c.el("code", {}, cmd)),
+      c.el("p", {}, "Dictation is cleaned up on this machine. Add a Claude key and chttr also fixes grammar, self-corrections and names: ",
+        c.el("code", {}, cmd)),
       c.el("button", { class: "primary", type: "button",
         onclick: async () => c.toast((await copyText(cmd)) ? "Copied. Paste it into a terminal." : "Couldn't copy; select the command instead.", false) },
       "Copy command"));

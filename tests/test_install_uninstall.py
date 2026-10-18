@@ -248,6 +248,25 @@ def test_purge_follows_a_data_dir_moved_elsewhere_and_linked_back(home, ran):
     assert done[-1].startswith("finish with: ")                         # the last steps still show
 
 
+def test_purge_through_a_link_into_a_shared_folder_deletes_only_chttrs_files(home, ran):
+    shared = home / "disk2"
+    (shared / "models").mkdir(parents=True)
+    (shared / "history.jsonl").write_text("{}\n")
+    (shared / "photos").mkdir()
+    (shared / "photos/cat.jpg").write_bytes(b"jpg")
+    C.DATA_DIR.parent.mkdir(parents=True)
+    C.DATA_DIR.symlink_to(shared)
+    asked = []
+    I.uninstall(purge=True, ask=lambda q: asked.append(q) or "n")
+    assert "~/.local/share/chttr (a link to ~/disk2)" in asked[0]
+    done = I.uninstall(purge=True, yes=True)
+    assert (shared / "photos/cat.jpg").read_bytes() == b"jpg"
+    assert not (shared / "models").exists() and not (shared / "history.jsonl").exists()
+    assert not C.DATA_DIR.is_symlink()
+    assert ("data: deleted chttr's files in ~/disk2, which ~/.local/share/chttr linked to, and the link; "
+            "left the 1 other item there alone") in done
+
+
 def test_purge_reports_what_it_couldnt_delete_and_carries_on(home, ran, monkeypatch):
     C.CONFIG_DIR.mkdir(parents=True)
     C.DATA_DIR.mkdir(parents=True)

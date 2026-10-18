@@ -67,7 +67,7 @@ def test_menu_has_the_meeting_library_after_dictation_history(monkeypatch):
     monkeypatch.setattr(DT, "menu", menu)
     assert cli.cmd_menu(None) == 0
     labels = [r.split("  ", 1)[-1] for r in shown["rows"]]
-    assert labels[labels.index("Dictation history") + 1] == "Meeting library"
+    assert labels[labels.index("Dictation history") + 1] == "Open chttr (home, dictations, meetings)"
     assert "Stats" not in labels
 
 
@@ -78,7 +78,7 @@ def test_menu_meeting_library_starts_ui_with_an_idle_timeout(monkeypatch):
 
     started = []
     monkeypatch.setattr(cli, "send", lambda cmd, timeout=5.0: (_ for _ in ()).throw(cli.DaemonNotRunning("no")))
-    monkeypatch.setattr(DT, "menu", lambda prompt, rows, **kw: next(r for r in rows if r.endswith("Meeting library")))
+    monkeypatch.setattr(DT, "menu", lambda prompt, rows, **kw: next(r for r in rows if r.endswith("Open chttr (home, dictations, meetings)")))
     monkeypatch.setattr(subprocess, "Popen", lambda argv, **kw: started.append(argv))
     cli.cmd_menu(None)
     assert started and started[0][1:] == ["ui", "--idle-timeout", "900"]

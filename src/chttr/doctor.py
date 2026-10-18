@@ -200,7 +200,7 @@ LABELS = {"engine": "engine", "cleanup": "cleanup", "api_key_perms": "api key", 
           "window_info": "window info", "menus": "menus", "hotkeys": "hotkeys", "audio_tools": "audio",
           "overlay": "overlay", "screen_context": "screen ctx", "disk": "disk", "modes": "modes",
           "integrations": "send notes", "meetings": "meetings", "calendar": "calendar",
-          "meet_extension": "meet ext"}
+          "meet_extension": "meet ext", "config": "config.toml"}
 
 
 def _home(path: Path | str) -> str:
@@ -542,14 +542,15 @@ def integrations(cfg, env: Env) -> Check:
 
 
 def meetings(cfg, env: Env) -> Check:
-    return Check("meetings", True, f"notes to {cfg.meeting.dir}; auto = {cfg.meeting.auto}")
+    return Check("meetings", True, f"notes to {_home(Path(cfg.meeting.dir).expanduser())}; auto = {cfg.meeting.auto}")
 
 
 def calendar(cfg, env: Env) -> Check:
     from .gcal import read_urls
 
     n = len(read_urls(cfg.meeting.calendar_file))
-    return Check("calendar", True, f"{n} iCal address(es)" + ("" if n else "  (chttr meeting calendar URL)"))
+    return Check("calendar", True, f"{n} iCal address{'' if n == 1 else 'es'}" if n
+                 else "none yet (add one: chttr meeting calendar URL)")
 
 
 def meet_extension(cfg, env: Env) -> Check:
@@ -570,6 +571,12 @@ def _safe(check: Callable, cfg, env: Env) -> Check | None:
         return check(cfg, env)
     except Exception as exc:  # noqa: BLE001 - one broken check must not hide the rest
         return Check(check.__name__, False, f"the check itself failed: {type(exc).__name__}: {exc}")
+
+
+def config_file(error: str) -> Check:
+    """config.toml didn't load: say what's wrong first, since the rest ran on the defaults."""
+    return Check("config", False, f"{error}; chttr is using the defaults until it is fixed",
+                 fix=f"$EDITOR {_home(C.CONFIG_FILE)}")
 
 
 def run_all(cfg, env: Env | None = None) -> list[Check]:

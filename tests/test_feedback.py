@@ -86,7 +86,7 @@ def test_generic_click_runs_the_primary_action(fb, popen):
     [cmd] = run.calls
     assert cmd[0] == "notify-send"
     assert "default=Record" in cmd and "0=Not now" in cmd
-    assert cmd[-3:] == ["--wait", "Record?", "Dana\nClick to record."]
+    assert cmd[-4:] == ["--wait", "--", "Record?", "Dana\nClick to record."]
     assert run.kwargs[0]["timeout"] == 120000 / 1000 + 60
     assert popen == [["chttr", "meeting", "start"]]
 
@@ -185,3 +185,17 @@ def test_an_expired_error_frees_its_id(fb, monkeypatch):
     got = ids(sent)
     assert len(set(got[:3])) == 3
     assert got[3] == got[1]              # progress takes the id that has been free longest
+
+
+def test_a_title_that_looks_like_an_option_stays_a_title(fb, monkeypatch):
+    """A calendar event named "-1:1 sync" or "--app-name=Bank" is someone else's text."""
+    ran = []
+    monkeypatch.setattr(F.subprocess, "Popen", lambda argv, **kw: ran.append(argv))
+    fb.notify("-1:1 sync in 5 min", "--app-name=Bank")
+    [cmd] = ran
+    assert cmd[cmd.index("--") + 1:] == ["-1:1 sync in 5 min", "--app-name=Bank"]
+    fb.omarchy = True
+    run = Runner()
+    fb.offer("-u critical", "Dana", RECORD, runner=run)
+    [cmd] = run.calls
+    assert cmd[cmd.index("--exec") - 2] == "\u2060-u critical" and "-u critical" not in cmd

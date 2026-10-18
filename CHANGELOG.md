@@ -131,8 +131,8 @@ bar, overlay and notifications that tell you what is going on.
   per-meeting facets. Transcripts read as turns in speaker colours, with
   talk-time bars, follow-along playback, find-in-transcript, inline speaker
   renames and export to Markdown, JSON and CSV. Every view has a real empty
-  state, and a banner offers to start chttr when it isn't running. "Meeting
-  library" is in the chttr menu, in place of Stats.
+  state, and a banner offers to start chttr when it isn't running. "Open
+  chttr" is in the chttr menu, in place of Stats.
 - Lingo (`chttr lingo`, the Lingo tab in `chttr ui`, and **Lingo: fix how words
   are spelled** in the chttr menu): pick the words that came out wrong in a past
   dictation, type the right spelling, and chttr uses it from the next dictation
@@ -142,7 +142,9 @@ bar, overlay and notifications that tell you what is going on.
 - The bar widget tells you what's going on: a dimmed, slashed microphone when
   chttr is off (click it to start chttr), an hourglass while the speech model
   loads, a pulse while it transcribes, a red dot with a live timer while a
-  meeting is recorded, and a small dot when cleanup is off. Its tooltip names
+  meeting is recorded, a dimmed microphone when the speech model didn't load,
+  and a small dot when only local cleanup is available (no Claude key or
+  Ollama). Its tooltip names
   the keys you've set up ("hold F9 to dictate · Alt+F9: command mode") and
   stays current while chttr sits idle. Settings: "Show the meeting timer", and
   "Right click" to record a meeting (the default) or start hands-free
@@ -191,11 +193,17 @@ bar, overlay and notifications that tell you what is going on.
   notification instead of a silent restart loop: chttr keeps running (with the
   defaults, for a bad config) and tells you to run `chttr setup` when the
   model is missing or can't be loaded. The service stops retrying after four
-  quick failures, so `systemctl --user status chttr` shows the problem.
+  quick failures, so `systemctl --user status chttr` shows the problem. With a
+  broken `config.toml`, `chttr doctor` names the mistake first and runs every
+  check on the defaults, and the chttr menu, `chttr ui` and `chttr lingo` still
+  open. Without a speech model the bar shows a dimmed microphone and Home says
+  "No speech model (run chttr setup)".
 - `chttr reload` applies audio (whisper mode, speech threshold, device),
   feedback (sounds, notifications, the overlay) and hotkey changes, says which
   settings changed, and keeps the running config when the file has an error.
-  After a model failed to load, `chttr reload` tries loading it again.
+  After a model failed to load, `chttr reload` tries loading it again. A reload
+  while the model is still loading reaches it once it is ready, engine
+  included.
 - The log holds timings and word counts, not your words: dictations, cleanup
   results, commands and corrected words are only logged with
   `chttr daemon -v`.
@@ -337,6 +345,26 @@ bar, overlay and notifications that tell you what is going on.
   read elsewhere. Searching as you type no longer flashes "Nothing matches"
   after the first letters. Switching meetings during playback stops the old
   recording.
+- In a terminal, a line break in what chttr types (from the model, or a spoken
+  "new line") is typed as a space: Enter would run the line, and only "run it"
+  presses Enter there.
+- The bar's tooltip and `chttr ui` name the keys that are really bound (your
+  Hyprland or Sway bindings), the same ones `chttr keys` lists, instead of
+  `[hotkeys]` from `config.toml`. Without a dictation key they say how to bind
+  one.
+- Dictation audio older than `[history] keep_audio_days` is deleted while
+  chttr runs and on `chttr reload`, not only when the daemon starts.
+- Stopping a meeting no longer holds up the dictation key while the notes
+  processing starts, and `chttr meeting stop` reports a daemon that doesn't
+  answer instead of failing with a traceback.
+- `chttr uninstall --purge` names the folder a linked data or config folder
+  points to, and when that folder holds anything besides chttr's files, deletes
+  only chttr's own.
+- A meeting's CSV export can't carry spreadsheet formulas in speaker names or
+  lines, and a calendar event whose title starts with a dash still shows its
+  pre-meeting brief, as text.
+- `chttr connect claude` tightens an older, more open key file before writing
+  the new key to it.
 - The dictation history menu on Omarchy drew each dictation in the icon column,
   on top of its label, so the list couldn't be read. Rows now have an icon, the
   dictation as the label and the time and app underneath.

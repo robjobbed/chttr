@@ -131,7 +131,7 @@ def notify_done(md: Path, summary_line: str, offer: list[str] | None = None, on_
     if len(offer) > 1:
         actions += ["-A", "send:all=Send everywhere"]
     try:
-        out = subprocess.run(["notify-send", "-a", "chttr", *actions, "-t", "120000", "--wait", title, summary_line],
+        out = subprocess.run(["notify-send", "-a", "chttr", *actions, "-t", "120000", "--wait", "--", title, summary_line],
                              capture_output=True, text=True, timeout=180)
         choice = out.stdout.strip()
         if choice == "open":

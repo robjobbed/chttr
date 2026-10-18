@@ -250,7 +250,19 @@ def test_run_without_the_service_does_not_claim_ready(setup_steps, capsys):
     assert install.run(do_service=False) == 0
     out = capsys.readouterr().out
     assert "Ready." not in out and "systemctl --user start chttr" in out
+    assert out.rstrip().endswith("or: chttr daemon), then hold Insert and talk; let go to type. "
+                                 "Alt+Insert: say what to do with selected text.")
     assert setup_steps == []
+
+
+def test_the_calendar_tip_is_only_for_those_without_one(setup_steps, monkeypatch, capsys):
+    from chttr import gcal
+
+    assert install.run() == 0
+    assert "Meeting attendees: chttr meeting calendar" in capsys.readouterr().out
+    monkeypatch.setattr(gcal, "read_urls", lambda path: ["https://calendar.example/private.ics"])
+    assert install.run() == 0
+    assert "Meeting attendees" not in capsys.readouterr().out
 
 
 def test_run_turns_on_what_screen_context_needs(setup_steps, monkeypatch, capsys):
@@ -299,7 +311,7 @@ def test_notify_prefers_omarchy(monkeypatch):
     assert calls == [
         ["omarchy-notification-send", "--app-name", "chttr", "-g", "\U000f036c", "-u", "normal", "-t", "12000",
          "chttr is ready", "Hold Insert"],
-        ["notify-send", "-a", "chttr", "-u", "normal", "-t", "12000", "chttr is ready", "Hold Insert"],
+        ["notify-send", "-a", "chttr", "-u", "normal", "-t", "12000", "--", "chttr is ready", "Hold Insert"],
     ]
 
 

@@ -26,7 +26,7 @@ test("kpiRows: words, speed against typing, time saved, streak", () => {
   assert.deepEqual(rows.map((r) => r.label), ["Words dictated", "Speaking speed", "Time saved", "Streak"]);
   assert.deepEqual(rows.map((r) => r.value), ["4,210", "132 wpm", "1 h 13 min", "4 days"]);
   assert.equal(rows[0].sub, "31 dictations");
-  assert.equal(rows[1].sub, "vs ~40 typing · 3.3× faster");
+  assert.equal(rows[1].sub, "vs ~40 wpm typing · 3.3× faster");
   assert.equal(rows[3].sub, "Best day: Oct 10 · 900 words");
 });
 
@@ -53,7 +53,9 @@ test("barHeights: proportional, a sliver for small days, zero for empty days", (
 });
 
 test("statusLabel", () => {
-  assert.deepEqual(home.statusLabel({ daemon: false }), { cls: "off", text: "Daemon not running" });
+  assert.deepEqual(home.statusLabel({ daemon: false }), { cls: "off", text: "chttr isn't running" });
+  assert.deepEqual(home.statusLabel({ daemon: true, state: "idle", model: "missing" }),
+    { cls: "off", text: "No speech model (run chttr setup)" });
   assert.equal(home.statusLabel({ daemon: true, state: "idle" }).text, "Idle");
   assert.equal(home.statusLabel({ daemon: true, state: "transcribing" }).text, "Transcribing");
   assert.equal(home.statusLabel({ daemon: true, state: "recording" }, 1000, 43000).text, "● Recording 00:42");
@@ -225,7 +227,7 @@ test("Home's status pill polls once it is on screen and stops once it is gone", 
   status = { daemon: false, state: "idle", meeting: null };
   timers.runIntervals();
   await flush();
-  assert.equal(pill.textContent, "Daemon not running");
+  assert.equal(pill.textContent, "chttr isn't running");
 
   page.remove();                                          // another view replaced Home
   timers.runIntervals();

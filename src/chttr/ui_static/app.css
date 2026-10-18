@@ -225,13 +225,13 @@ th { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: v
 .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); z-index: 10; display: flex; gap: 12px; align-items: center;
   background: var(--text); color: var(--bg); padding: 8px 14px; border-radius: 8px; font-size: 13px; box-shadow: var(--shadow);
   max-width: calc(100vw - 32px); }
-.toast.error { background: var(--danger); color: #fff; }
+.toast.error { background: var(--danger); color: var(--bg); }    /* --bg is always the far end from a theme's red */
 .toast button { border: 0; background: none; color: inherit; font-weight: 700; cursor: pointer; text-decoration: underline; padding: 0; }
 
 dialog.help { border: 1px solid var(--line); border-radius: 12px; background: var(--panel); color: var(--text); padding: 20px 24px;
   box-shadow: var(--shadow); max-width: min(640px, calc(100vw - 32px)); }
 dialog.help::backdrop { background: rgba(0, 0, 0, .35); }
-dialog.help h2 { margin-top: 0; }
+dialog.help h2 { margin-top: 0; font-size: 18px; text-transform: none; letter-spacing: -0.01em; color: var(--text); }
 dialog.help h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 16px 0 6px; }
 dialog.help dl { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; margin: 0; }
 dialog.help dt { text-align: right; }
@@ -253,6 +253,7 @@ dialog.help .close { float: right; }
   .turn .t { padding: 0; }
   .top { flex-wrap: wrap; gap: 8px 12px; }
   .search { order: 3; flex-basis: 100%; max-width: none; }
+  .search[inert] { display: none; }    /* on its own row here: nothing shifts when it goes */
   .tabs { margin-left: auto; overflow-x: auto; }
   .player { top: -16px; }
 }

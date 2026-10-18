@@ -16,7 +16,7 @@ from . import config as C
 from .client import DaemonNotRunning, daemon_alive, daemon_listening, read_state, read_state_json, send
 
 ICONS = {"idle": "", "recording": "󰍬", "transcribing": "󰔟", "meeting": "󰑊",
-         "off": "󰍭", "loading": "󰔟"}
+         "off": "󰍭", "loading": "󰔟", "error": "󰍭"}
 
 
 def _with_meeting(state: str) -> str:
@@ -32,6 +32,8 @@ def _status_json(state: str, info: dict | None = None) -> str:
     state = _with_meeting(state)
     if state not in ICONS:
         state = "idle"
+    if state == "idle" and info.get("model") == "missing":
+        state = "error"                     # running, but it can't transcribe
     keys = info.get("hotkeys")
     if not isinstance(keys, dict):
         keys = {k: v for k, v in vars(C.HotkeysCfg()).items() if k != "backend"}
@@ -64,6 +66,8 @@ def _status_json(state: str, info: dict | None = None) -> str:
         bits = ["chttr is off", "click to start"]
     elif state == "loading":
         bits = ["chttr: loading the speech model"]
+    elif state == "error":
+        bits = ["chttr: the speech model didn't load", "run chttr setup"]
     elif state == "recording":
         kind = info.get("kind")
         if kind == "command":
@@ -80,12 +84,12 @@ def _status_json(state: str, info: dict | None = None) -> str:
         what = f"\u201c{title}\u201d" if title else "a meeting"
         bits = [f"chttr: recording {what}" + (f" ({clock(seconds)})" if seconds is not None else ""),
                 "right click to stop"]
-    elif cleanup == "none":
-        bits = ["chttr: cleanup is off (local rules)"] + ([f"hold {dictate} to dictate"] if dictate else [])
     else:
         bits = [f"chttr: hold {dictate} to dictate" if dictate else "chttr: ready"]
         bits += [f"{command}: command mode"] if command else []
         bits += ["right click: record a meeting"]
+        if cleanup == "none":
+            bits.append("local cleanup only (chttr connect claude for Claude)")
     text = ICONS[state] + (f" {clock(seconds)}" if state == "meeting" and seconds is not None else "")
     return json.dumps({"text": text, "alt": state, "class": state, "tooltip": " \u00b7 ".join(bits),
                        "meeting_seconds": seconds, "cleanup": cleanup, "hotkey": dictate})
@@ -120,6 +124,15 @@ def _current_state() -> tuple[str, dict]:
         state = read_state()
         return (state if state in ICONS and state not in ("off", "meeting") else "idle"), info
     return "off", info
+
+
+def _config_or_defaults() -> tuple[C.Config, str]:
+    """config.toml, or the defaults and what's wrong with it: the commands that help you
+    fix a broken config (doctor, the menu, the ui) must not die on it."""
+    try:
+        return C.load_config(), ""
+    except (ValueError, OSError) as exc:      # tomllib.TOMLDecodeError is a ValueError
+        return C.Config(modes=C._default_modes()), str(exc)
 
 
 def cmd_daemon(args: argparse.Namespace) -> int:
@@ -456,8 +469,10 @@ def cmd_ui(args: argparse.Namespace) -> int:
             title = args.open.strip(" []").split(",")[0].strip()
             print(f"chttr: no meeting matches {args.open!r}; searching for {title!r} instead", file=sys.stderr)
             view = f"meetings?q={quote(title)}"
-    serve(port=args.port, open_browser=not args.no_browser, cfg=C.load_config(), view=view,
-          idle_timeout=args.idle_timeout)
+    cfg, err = _config_or_defaults()
+    if err:
+        print(f"config.toml: {err}; using the defaults", file=sys.stderr)
+    serve(port=args.port, open_browser=not args.no_browser, cfg=cfg, view=view, idle_timeout=args.idle_timeout)
     return 0
 
 
@@ -465,8 +480,10 @@ def cmd_lingo(args: argparse.Namespace) -> int:
     """Lingo: fix how chttr spells your words, in the browser."""
     from .ui import serve
 
-    serve(port=args.port, open_browser=not args.no_browser, cfg=C.load_config(), view="lingo",
-          idle_timeout=args.idle_timeout)
+    cfg, err = _config_or_defaults()
+    if err:
+        print(f"config.toml: {err}; using the defaults", file=sys.stderr)
+    serve(port=args.port, open_browser=not args.no_browser, cfg=cfg, view="lingo", idle_timeout=args.idle_timeout)
     return 0
 
 
@@ -631,9 +648,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     from . import doctor
 
-    cfg = C.load_config()
+    cfg, err = _config_or_defaults()
+    first = [doctor.config_file(err)] if err else []        # the rest ran on the defaults
     env = doctor.Env()
-    checks = doctor.run_all(cfg, env)
+    checks = first + doctor.run_all(cfg, env)
     if args.fix:
         fixable = [c for c in checks if not c.ok and c.auto and c.fix]
         out = sys.stderr if args.json else sys.stdout
@@ -648,7 +666,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             print(line, file=out, flush=True)
         print(file=out)
         env.cache.clear()
-        checks = doctor.run_all(cfg, env)
+        checks = first + doctor.run_all(cfg, env)
     ok = all(c.ok for c in checks)
     if args.json:
         print(json.dumps([asdict(c) for c in checks], indent=2))
@@ -737,6 +755,9 @@ def _send_or_exit(command: str) -> dict:
     except DaemonNotRunning as exc:
         print(exc, file=sys.stderr)
         raise SystemExit(2) from None
+    except (OSError, ValueError) as exc:     # TimeoutError is an OSError
+        print(f"chttr didn't answer ({exc or type(exc).__name__}); see: chttr doctor", file=sys.stderr)
+        raise SystemExit(1) from None
 
 
 def cmd_meeting_control(args: argparse.Namespace) -> int:
@@ -833,7 +854,7 @@ def _send_and_tell(destination: str, directory: Path, cfg, meeting: dict | None 
     try:
         result = I.send(destination, meeting, hubspot_tasks=cfg.integrations.hubspot_tasks)
         logging.info("%s: %s", destination, result)
-        subprocess.run(["notify-send", "-a", "chttr", "-t", "4000", f"Meeting notes {result}", meeting.get("title", "")],
+        subprocess.run(["notify-send", "-a", "chttr", "-t", "4000", "--", f"Meeting notes {result}", meeting.get("title", "")],
                        check=False)
         return result
     except I.SendError as exc:
@@ -1103,7 +1124,7 @@ def cmd_menu(args: argparse.Namespace) -> int:
         status = send("meeting status")
     except DaemonNotRunning:
         status = None
-    cfg = C.load_config()
+    cfg, _ = _config_or_defaults()          # a broken config is when Edit settings and doctor are needed most
     notes = [Path(m["markdown"]) for d in reversed(meeting_dirs())
              if (m := read_json(d / "meta.json", {}) or {}).get("markdown") and Path(m["markdown"]).exists()]
     items: list[tuple[str, Callable[[], object]]] = []
@@ -1114,7 +1135,7 @@ def cmd_menu(args: argparse.Namespace) -> int:
         if shutil.which("ollama") and cfg.polish.backend == "auto":
             items.append(("󰚩  Use Ollama for cleanup (offline)", lambda: _terminal(_ollama_script(cfg.polish))))
     if status is None:
-        items.append(("󰑓  Start the chttr daemon", lambda: subprocess.run(["systemctl", "--user", "restart", "chttr"])))
+        items.append(("󰑓  Start chttr", lambda: subprocess.run(["systemctl", "--user", "restart", "chttr"])))
     elif status.get("recording"):
         items.append(("󰓛  Stop recording the meeting", lambda: send("meeting stop")))
     else:
@@ -1136,14 +1157,14 @@ def cmd_menu(args: argparse.Namespace) -> int:
         ("󰉋  Meeting notes folder", lambda: (meetings_dir.mkdir(parents=True, exist_ok=True),
                                             subprocess.Popen(["xdg-open", str(meetings_dir)], start_new_session=True))),
         ("󰋚  Dictation history", lambda: subprocess.Popen([sys.argv[0], "history"], start_new_session=True)),
-        ("󰈙  Meeting library", lambda: subprocess.Popen(
+        ("󰈙  Open chttr (home, dictations, meetings)", lambda: subprocess.Popen(
             [sys.argv[0], "ui", "--idle-timeout", "900"], start_new_session=True, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL)),
         ("󰗊  Lingo: fix how words are spelled", lambda: subprocess.Popen(
             [sys.argv[0], "lingo"], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)),
         ("󰒓  Edit settings", lambda: DT.open_editor(str(C.CONFIG_FILE))),
         ("󰓦  Check setup (doctor)", lambda: _terminal("chttr doctor")),
-        ("󰜉  Restart the daemon", lambda: subprocess.run(["systemctl", "--user", "restart", "chttr"])),
+        ("󰜉  Restart chttr", lambda: subprocess.run(["systemctl", "--user", "restart", "chttr"])),
     ]
     try:
         choice = DT.menu("chttr", [label for label, _ in items])
@@ -1167,7 +1188,7 @@ def cmd_config(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="chttr", description="Wispr Flow-style voice dictation for Omarchy.")
+    p = argparse.ArgumentParser(prog="chttr", description="Voice dictation and meeting notes for Linux.")
     p.add_argument("--version", action="version", version=f"chttr {__version__}")
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -1238,7 +1259,7 @@ def build_parser() -> argparse.ArgumentParser:
     mc = sub.add_parser("mcp", help="serve your meetings to Claude Code / Claude Desktop (MCP, stdio)")
     mc.set_defaults(func=cmd_mcp)
 
-    ui = sub.add_parser("ui", help="the meeting library in your browser (search, transcripts, renames)")
+    ui = sub.add_parser("ui", help="chttr in your browser: home, dictations, meetings, action items and Lingo")
     ui.add_argument("--port", type=int, default=0, help="port on 127.0.0.1 (default: any free one)")
     ui.add_argument("--no-browser", action="store_true", help="only print the link")
     ui.add_argument("--idle-timeout", type=float, default=0, metavar="SECONDS",

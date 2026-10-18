@@ -7,6 +7,7 @@ import gc
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import socket
@@ -61,6 +62,7 @@ ATSPI_RETRY = 600                       # seconds before it tries the accessibil
 TAP = 0.35                              # recordings shorter than this are taps, not dictations
 OVERLAY_RESPAWN = 30.0                  # seconds between attempts to restart an overlay that died
 CALL_TIMEOUT = 90                       # no word from the Meet tab for this long: the call is over
+PRUNE_EVERY = 3600                      # seconds between checks for dictation audio past keep_audio_days
 MODEL_WAIT = 120                        # a dictation made while the model loads waits this long for it
 
 
@@ -98,6 +100,7 @@ class Daemon:
         # meetings
         self.meeting: Session | None = None
         self.call: dict | None = None           # the Meet call the extension says we're in
+        self.launcher: threading.Thread | None = None   # starting the last meeting's processing
         self.dictation_started = 0.0
         # A key press reads the focused window (and the selection, in command mode)
         # outside the lock; a release that arrives meanwhile is remembered here.
@@ -110,6 +113,8 @@ class Daemon:
         self.next_delivery = 0
         self.delivery = threading.Condition()
         self.hotkeys = None
+        self.hotkeys_backend: str | None = None
+        self.bound_keys: dict[str, str] | None = None   # what really triggers chttr (see _note_keys)
         self.last_tap = 0.0
         self.atspi_misses = 0
         self.atspi_retry_at = 0.0
@@ -156,19 +161,48 @@ class Daemon:
                 self._write_state(LOADING)
         t0 = time.monotonic()
         try:
-            transcriber = Transcriber(self.cfg)
-            with self.lock:
-                self.transcriber, self.model_error = transcriber, ""
+            cfg = self.cfg
+            while True:
+                transcriber = Transcriber(cfg)
+                with self.lock:
+                    # `chttr reload` while it loaded only replaced self.cfg: apply that now
+                    if engine_key(self.cfg) == engine_key(cfg):
+                        self._tune(transcriber, self.cfg)
+                        self.transcriber, self.model_error = transcriber, ""
+                        break
+                    cfg = self.cfg
+                log.info("the engine changed while the speech model loaded; loading %s instead", cfg.engine.name)
+                del transcriber
+                gc.collect()
             log.info("speech model loaded in %.1fs", time.monotonic() - t0)
         except Exception as exc:  # noqa: BLE001 - onnxruntime raises plain Exceptions for a corrupt model
             log.error("the speech model could not be loaded: %s", exc)
             self.model_error = str(exc)
-            self.feedback.notify("chttr: the speech model is missing", f"{exc}\nRun: chttr setup",
+            self.feedback.notify("chttr can't load the speech model", f"{exc}\nRun chttr setup to download it again.",
                                  urgency="critical", timeout_ms=0)
         finally:
             self.model_ready.set()
             with self.lock:
                 self._refresh_state()
+
+    @staticmethod
+    def _tune(transcriber: Transcriber, cfg: Config) -> None:
+        """The settings a loaded model takes without loading again."""
+        transcriber.threshold_db = cfg.audio.threshold_db
+        transcriber.boost = cfg.audio.whisper_mode
+        if hasattr(transcriber, "adaptive"):
+            transcriber.adaptive = getattr(cfg.audio, "adaptive_threshold", True)
+
+    def _note_keys(self) -> None:
+        """The keys that really trigger chttr, for the bar's tooltip: on Hyprland and Sway
+        the compositor's bindings, which [hotkeys] in config.toml doesn't change."""
+        from . import hotkeys as H
+
+        try:
+            self.bound_keys = H.effective_bindings(self.cfg, current_desktop(), backend=self.hotkeys_backend)
+        except Exception:                   # a tooltip never takes the daemon down
+            log.debug("could not read the bound keys", exc_info=True)
+            self.bound_keys = None
 
     def _model_status(self) -> str:
         if self.transcriber is not None:
@@ -190,6 +224,13 @@ class Daemon:
 
         def snapshot() -> dict:
             m = getattr(self, "meeting", None)
+            keys = getattr(self, "bound_keys", None)
+            if keys is None:                    # not read yet: what config.toml says
+                keys = {k: v for k, v in vars(self.cfg.hotkeys).items() if k != "backend"}
+            try:
+                model = self._model_status()
+            except AttributeError:              # still being built
+                model = "loading"
             since = getattr(self, "_state_since", None)
             if not since or since[0] != self.state:
                 since = self._state_since = (self.state, time.time())
@@ -197,8 +238,7 @@ class Daemon:
                     "since": since[1], "pid": os.getpid(),
                     "meeting": {"title": m.title, "code": m.code, "started": m.recorder.started} if m else None,
                     "cleanup": cache["backend"],
-                    "hotkeys": {k: v for k, v in vars(self.cfg.hotkeys).items() if k != "backend"},
-                    "model": "loading" if self.state == "loading" else "ready"}
+                    "hotkeys": keys, "model": model}
 
         def dump(only_if_changed: bool = False) -> None:
             info = snapshot()
@@ -263,6 +303,7 @@ class Daemon:
     # The overlay stays resident: started hidden with the daemon (or at the first key
     # press), shown on press, moved through transcribing -> done, hidden in between.
     overlay_spawned_at = 0.0            # monotonic time of the last spawn
+    desktop_checked_at = 0.0            # ...and of the last look at a desktop that had no Wayland
     overlay_losses = 0                  # overlay processes that died in a row
     overlay_unsupported = ""            # GNOME, which has no layer-shell
     overlay_skipped = ""                # the desktop last found without Wayland (logged once each)
@@ -286,14 +327,21 @@ class Daemon:
         if self.overlay_spawned_at and time.monotonic() - self.overlay_spawned_at < OVERLAY_RESPAWN:
             return False                    # it died moments ago; notifications until it can be retried
         desk = current_desktop()
+        if not desk.wayland and time.monotonic() - self.desktop_checked_at >= OVERLAY_RESPAWN:
+            # A daemon started before Hyprland's sockets appeared saw no Wayland: look again
+            # (at a press, at most every 30 s). Typing and shortcuts use the new answer too.
+            self.desktop_checked_at = time.monotonic()
+            forget = getattr(current_desktop, "cache_clear", None)
+            if forget is not None:
+                forget()
+                desk = current_desktop()
         if desk.compositor == "gnome":
             # GNOME (Mutter) has no layer-shell: a regular window would steal focus.
             self.overlay_unsupported = desk.describe()
             self._overlay_fail(f"no layer-shell on {desk.describe()}; notifications only", tell=False)
             return False
         if not desk.wayland:
-            # X11 has none either. Asked again at each press: a daemon started before
-            # Hyprland's sockets appear sees no Wayland yet.
+            # X11 has none either.
             if desk.describe() != self.overlay_skipped:
                 self.overlay_skipped = desk.describe()
                 log.info("no waveform overlay on %s; notifications only", desk.describe())
@@ -578,7 +626,8 @@ class Daemon:
         m = self.meeting
         return {"ok": True, "state": self.state, "recording": m is not None,
                 "meeting": {"title": m.title, "code": m.code, "seconds": round(m.elapsed), "dir": str(m.dir)} if m else None,
-                "call": {k: self.call[k] for k in ("code", "title")} if self.call else None}
+                "call": {k: self.call[k] for k in ("code", "title")} if self.call else None,
+                "model": self._model_status()}
 
     def _meeting_command(self, arg: str) -> dict:
         verb, _, extra = arg.partition(" ")
@@ -655,7 +704,10 @@ class Daemon:
             session.discard()
             self.feedback.notify("Meeting recording too short; discarded", timeout_ms=3000)
             return {"ok": True, "state": self.state, "recording": False, "message": "too short; discarded"}
-        launch_processing(session.dir)
+        # systemd-run can take a while when the user manager is busy; key presses wait on the lock
+        self.launcher = threading.Thread(target=launch_processing, args=(session.dir,), name="meeting-process",
+                                         daemon=True)
+        self.launcher.start()
         self.feedback.notify("Meeting recorded", f"{secs / 60:.0f} min. Writing the transcript and notes…", timeout_ms=4000)
         return {"ok": True, "state": self.state, "recording": False, "message": f"recorded {secs:.0f}s; processing",
                 "dir": str(session.dir)}
@@ -701,6 +753,8 @@ class Daemon:
         file read."""
         failing = False
         while True:
+            if time.monotonic() - self.pruned_at > PRUNE_EVERY:
+                self._prune_audio()             # a daemon that runs for weeks keeps to keep_audio_days too
             try:
                 self._brief_tick()
                 failing = False
@@ -898,7 +952,7 @@ class Daemon:
                 threading.Thread(target=self._load_model, name="model", daemon=True).start()
                 message += "; loading the speech model"
             else:
-                message += "; the speech model is still loading"
+                message += "; the speech model is still loading and takes these settings when it is ready"
         elif engine_key(cfg) != self.transcriber.key:
             if self.state != IDLE:
                 return {"ok": False, "state": self.state, "error": "busy; reload again when idle to switch engines"}
@@ -919,10 +973,7 @@ class Daemon:
                         "error": f"could not load {cfg.engine.name}: {exc}"
                                  + ("; kept the previous engine and config" if self.transcriber else "")}
         if self.transcriber is not None:
-            self.transcriber.threshold_db = cfg.audio.threshold_db
-            self.transcriber.boost = cfg.audio.whisper_mode
-            if hasattr(self.transcriber, "adaptive"):
-                self.transcriber.adaptive = getattr(cfg.audio, "adaptive_threshold", True)
+            self._tune(self.transcriber, cfg)
         self.cfg = cfg
         if not cfg.feedback.overlay:
             self._overlay_quit()                # turned off: don't leave the pill running until the next press
@@ -931,7 +982,11 @@ class Daemon:
         if dataclasses.asdict(old.hotkeys) != dataclasses.asdict(cfg.hotkeys) and self.hotkeys is not None:
             self.hotkeys.stop.set()
             self._start_hotkeys()
+        elif old.hotkeys.backend != cfg.hotkeys.backend:
+            self.hotkeys_backend = None
+        self._note_keys()                       # bindings.lua may have changed too
         self._write_state(self.state)           # the bar's tooltip names the new keys now, not in a minute
+        self._prune_audio()                     # keep_audio_days may be shorter now
         log.info("%s", message)
         return {"ok": True, "state": self.state, "message": message}
 
@@ -1030,7 +1085,7 @@ class Daemon:
             what = f"{len(self.selection.split())} selected words" if self.selection else "no selection: new text"
             self.feedback.notify("Command mode", f"Say what to do ({what})", timeout_ms=2500)
         if self.model_error:
-            self.feedback.notify("chttr can't transcribe: speech model missing", "Run: chttr setup",
+            self.feedback.notify("chttr can't transcribe", "The speech model didn't load. Run chttr setup, then chttr reload.",
                                  urgency="critical", timeout_ms=8000)
         return {"ok": True, "state": self.state, "kind": kind}
 
@@ -1049,7 +1104,7 @@ class Daemon:
         self._overlay_state("transcribing")
         self._restore_mute_state()
         self.feedback.play("stop")
-        if self.overlay is None and secs >= TAP:     # the overlay shows this itself; a tap shows nothing
+        if self.overlay is None and secs >= TAP and not self.model_error:   # the overlay shows this; a tap shows nothing
             self.feedback.notify("Transcribing…", f"{secs:.1f}s of audio, peak {peak_db:.0f} dB", timeout_ms=10000)
         job = (seq, audio, secs, peak_db, self.kind, self.app, self.title, self.selection, captions, self.field,
                self.field_stale)
@@ -1098,7 +1153,13 @@ class Daemon:
                                      timeout_ms=8000)
                 self.model_ready.wait(MODEL_WAIT)
             if self.transcriber is None:
-                raise RuntimeError(self.model_error or "the speech model took too long to load")
+                # a model that failed to load was already reported at the key press
+                self._overlay_state("error")
+                self.feedback.play("error")
+                if not self.model_error:
+                    self.feedback.notify("chttr: the speech model took too long to load",
+                                         "Your dictation was not typed. See: chttr doctor", urgency="normal")
+                return
             t0 = time.monotonic()
             dictionary = Dictionary.load()
             if isinstance(captions, Streamer):
@@ -1145,6 +1206,9 @@ class Daemon:
             if kind != COMMAND and field is not None and not field_stale and self.cfg.polish.screen_context != "off":
                 text, ts_override = smart_join(field.before, field.after, text, dictionary.vocabulary + names,
                                                code=bool(mode and mode.is_code))
+            if mode and mode.in_terminal and mode.newline == "enter" and "\n" in text:
+                # a typed line break is Enter, which runs the line: only "run it" may press it
+                text = re.sub(r"[ \t]*\n\s*", " ", text)
             self._wait_turn(seq)
             method = deliver(text, self.cfg.output,
                              mode=(mode.output if mode else ""),
@@ -1244,14 +1308,21 @@ class Daemon:
             wf.writeframes((np.clip(audio, -1, 1) * 32767).astype(np.int16).tobytes())
         return path.name
 
+    pruned_at = 0.0                     # monotonic time of the last _prune_audio
+
     def _prune_audio(self) -> None:
+        """Delete dictation audio older than [history] keep_audio_days (all of it at 0)."""
+        self.pruned_at = time.monotonic()
         days = self.cfg.history.keep_audio_days
         if not C.HISTORY_AUDIO_DIR.exists():
             return
         cutoff = time.time() - days * 86400
         for f in C.HISTORY_AUDIO_DIR.glob("*.wav"):
-            if days <= 0 or f.stat().st_mtime < cutoff:
-                f.unlink(missing_ok=True)
+            try:
+                if days <= 0 or f.stat().st_mtime < cutoff:
+                    f.unlink(missing_ok=True)
+            except OSError as exc:
+                log.debug("could not prune %s: %s", f.name, exc)
 
     def _no_speech(self, secs: float, peak_db: float) -> None:
         if peak_db < QUIET_PEAK_DB:
@@ -1318,7 +1389,7 @@ class Daemon:
                                          urgency="normal", timeout_ms=8000)
                 else:
                     why = str(exc) if isinstance(exc, P.PolishUnavailable) else f"{type(exc).__name__}: {exc}"
-                    self.feedback.notify("chttr: cleanup unavailable", why[:160],
+                    self.feedback.notify("Cleanup unavailable", f"{why[:120].rstrip('.')}. Typed locally cleaned text instead.",
                                          urgency="normal", timeout_ms=8000)
             return tidy.tidy(text, level, code=code, chat=chat, fold_newlines=fold)
 
@@ -1461,7 +1532,7 @@ class Daemon:
             log.warning("hotkeys: %s", exc)
             self.feedback.notify("chttr: bad hotkey in config.toml", str(exc), urgency="normal", timeout_ms=8000)
             return
-        backend = H.resolve(self.cfg.hotkeys.backend, current_desktop().compositor)
+        backend = self.hotkeys_backend = H.resolve(self.cfg.hotkeys.backend, current_desktop().compositor)
         log.info("hotkeys: %s", {"compositor": "bound by the compositor", "none": "none (see chttr doctor)"}
                  .get(backend, backend))
         self.hotkeys = H.Hotkeys(backend, triggers, self.on_hotkey).start()
@@ -1520,6 +1591,8 @@ class Daemon:
                          name="calls", daemon=True).start()
         threading.Thread(target=P.warm, args=(self.cfg.polish,), daemon=True).start()
         self._start_hotkeys()
+        self._note_keys()
+        self._write_state(self.state)
         if self.transcriber is None:
             threading.Thread(target=self._load_model, name="model", daemon=True).start()
         log.info("listening on %s (cleanup backend: %s)", sock_path, P.backend(self.cfg.polish))
@@ -1541,6 +1614,8 @@ class Daemon:
                 self._overlay_quit()
                 self._restore_mute_state()
                 self._write_state(IDLE)
+            if self.launcher is not None:
+                self.launcher.join(20)          # a meeting stopped on the way out still gets its notes
             server.close()
             sock_path.unlink(missing_ok=True)
             log.info("stopped")

@@ -173,3 +173,19 @@ def test_connect_interactive_on_end_of_input(cfg, monkeypatch):
 
     monkeypatch.setattr(apikey.getpass, "getpass", eof)
     assert apikey.connect_interactive(cfg) is False
+
+
+def test_an_open_file_is_tightened_before_the_key_is_written(cfg, monkeypatch):
+    import os
+
+    from chttr import config as C
+
+    path = apikey.path(cfg)
+    path.parent.mkdir(parents=True)
+    path.write_text("old")
+    path.chmod(0o644)
+    modes = []
+    real = os.fdopen
+    monkeypatch.setattr(C.os, "fdopen", lambda fd, *a, **k: modes.append(stat.S_IMODE(os.fstat(fd).st_mode)) or real(fd, *a, **k))
+    apikey.save(GOOD, cfg)
+    assert modes == [0o600]
