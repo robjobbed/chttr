@@ -678,7 +678,7 @@ class Daemon:
         # from just before now to past the next refresh, plus brief_minutes
         half = timedelta(seconds=(minutes * 60 + 300 + 240) / 2)
         around = now - timedelta(minutes=2) + half
-        events = [e for url in urls for e in gcal._events(gcal._fetch(url), around, half)[0]]
+        events = [e for url in urls for e in gcal._events(gcal._fetch(url), around, half, self.cfg.meeting.email)[0]]
         self._brief_events = (time.monotonic(), key, events)
         return events
 

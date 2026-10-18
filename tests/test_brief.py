@@ -264,7 +264,7 @@ def test_cli_brief_prints_the_next_meeting_with_people(capsys, monkeypatch, meet
     weekly.start, weekly.end = soon, soon + timedelta(minutes=30)
     solo = gcal.Event("Focus time", soon - timedelta(minutes=20), soon)
     monkeypatch.setattr(gcal, "read_urls", lambda path: ["https://calendar.google.com/x/basic.ics"])
-    monkeypatch.setattr(gcal, "upcoming", lambda urls, hours=24: [solo, weekly])
+    monkeypatch.setattr(gcal, "upcoming", lambda urls, hours=24, me_email="": [solo, weekly])
     assert cli.cmd_brief(cli.build_parser().parse_args(["brief", "--next"])) == 0
     out = capsys.readouterr().out.splitlines()
     assert out[0] in ("Weekly sync in 30 min", "Weekly sync in 29 min")
@@ -274,7 +274,7 @@ def test_cli_brief_prints_the_next_meeting_with_people(capsys, monkeypatch, meet
 
 def test_cli_brief_by_title(capsys, monkeypatch, meetings, weekly):
     monkeypatch.setattr(gcal, "read_urls", lambda path: ["https://calendar.google.com/x/basic.ics"])
-    monkeypatch.setattr(gcal, "upcoming", lambda urls, hours=24: [weekly])
+    monkeypatch.setattr(gcal, "upcoming", lambda urls, hours=24, me_email="": [weekly])
     assert cli.cmd_brief(cli.build_parser().parse_args(["brief", "standup"])) == 1
     assert "no meeting matching 'standup'" in capsys.readouterr().err
     assert cli.cmd_brief(cli.build_parser().parse_args(["brief", "WEEKLY"])) == 0

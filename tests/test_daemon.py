@@ -1550,7 +1550,7 @@ def briefing(no_brief_thread, daemon, monkeypatch):
     fetched: list[str] = []
     monkeypatch.setattr(gcal, "read_urls", lambda path: ["https://calendar.google.com/x/basic.ics"])
     monkeypatch.setattr(gcal, "_fetch", lambda url, max_age=600: fetched.append(url) or b"")
-    monkeypatch.setattr(gcal, "_events", lambda data, around, window: (list(events), ""))
+    monkeypatch.setattr(gcal, "_events", lambda data, around, window, me_email="": (list(events), ""))
     monkeypatch.setattr(brief, "past_meetings", lambda: [last])
     monkeypatch.setattr(calls, "snapshot", lambda timeout=3.0: [])
     sent: list[tuple[str, str]] = []

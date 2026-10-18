@@ -799,7 +799,7 @@ def cmd_brief(args: argparse.Namespace) -> int:
         return 1
     query = " ".join(args.title).strip()
     try:
-        events = gcal.upcoming(urls, hours=24 * 7 if query else 24)
+        events = gcal.upcoming(urls, hours=24 * 7 if query else 24, me_email=cfg.meeting.email)
     except Exception as exc:  # noqa: BLE001
         print(f"can't read your calendar: {exc}", file=sys.stderr)
         return 1

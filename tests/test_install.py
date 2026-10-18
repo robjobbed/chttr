@@ -412,7 +412,8 @@ def test_bin_setup_keeps_uvs_own_python_on_arch(tmp_path):
     assert f"UV_PYTHON_PREFERENCE={expected}" in log.read_text().splitlines()
     env["UV_PYTHON_PREFERENCE"] = "system"          # your own choice wins
     subprocess.run(["bash", str(ROOT / "bin/setup")], env=env, check=True, capture_output=True)
-    assert log.read_text().splitlines()[-2] == "UV_PYTHON_PREFERENCE=system"
+    # the model download runs alongside uv and logs whenever it gets there: look at uv's lines only
+    assert [x for x in log.read_text().splitlines() if x.startswith("UV_")][-1] == "UV_PYTHON_PREFERENCE=system"
 
 
 def test_bin_setup_downloads_the_model_while_uv_installs(tmp_path):
