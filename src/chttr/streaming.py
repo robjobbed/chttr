@@ -6,9 +6,15 @@ recording stops, only the audio after the last pause is left to recognize, and
 the segments are joined. A dictation of any length therefore costs about one
 second of recognition after release instead of a pass over the whole recording.
 
+Most people let go of the key in the pause after their last word, so that pause
+does the last bit of work too: once SPECULATE_PAUSE seconds have been quiet, the
+open segment is recognized speculatively. If nothing louder than the speech
+threshold comes after it, letting go reuses that pass and the text is ready at
+once; if you keep talking it is simply recognized again.
+
 The same thread drives live captions: the closed segments plus a quick pass over
-the segment being spoken, instead of re-transcribing the last few seconds over
-and over.
+the last few seconds of the segment being spoken, so a long run of speech costs
+the same per caption as a short one.
 """
 
 from __future__ import annotations
@@ -31,6 +37,9 @@ MAX_SEGMENT = 20.0              # force a cut (at the quietest moment) in a long
 POLL = 0.1
 CAPTION_EVERY = 0.7
 CAPTION_MIN = 0.6               # show captions once this much audio is waiting
+CAPTION_WINDOW_CHUNKS = 300     # a caption pass recognizes at most the last 6 s of the open segment
+SPECULATE_PAUSE = 0.25          # quiet that triggers a speculative pass over the open segment
+SPECULATE_MIN = 0.6             # new audio (with speech in it) needed since the last pass
 
 
 class Source(Protocol):
@@ -64,16 +73,32 @@ def find_cut(levels: list[float], threshold_db: float, start: int = 0) -> int | 
     return None
 
 
+def _join(*parts: str) -> str:
+    return " ".join(p for p in parts if p)
+
+
+def _loud(levels: list[float], threshold_db: float) -> bool:
+    return any(db > threshold_db for db in levels)
+
+
 class Streamer:
     def __init__(self, source: Source, transcribe: Callable[[np.ndarray], str], threshold_db: float,
                  on_caption: Callable[[str], None] | None = None) -> None:
         self.source = source
         self.transcribe = transcribe
-        self.threshold_db = threshold_db
+        self.threshold_db = threshold_db    # read on every poll, so it can be adjusted while recording
         self.on_caption = on_caption
         self.done = 0                       # chunks already recognized
         self.segments: list[str] = []
         self.busy_seconds = 0.0             # recognition time spent while recording
+        self.tail_reused = False            # finish() reused the pass from the last pause
+        # (end chunk, text) of the open segment [done, end) as last recognized; after a
+        # segment closes it is (done, ""): nothing has been said since
+        self._partial: tuple[int, str] | None = None
+        # this recording's levels: the recorder starts a fresh list for the next one
+        self._levels = source.levels_db
+        self._lock = threading.Lock()
+        self._finished = False
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, name="streaming-asr", daemon=True)
 
@@ -83,7 +108,7 @@ class Streamer:
 
     @property
     def text(self) -> str:
-        return " ".join(s for s in self.segments if s)
+        return _join(*self.segments)
 
     def _recognize(self, audio: np.ndarray) -> str:
         t0 = time.monotonic()
@@ -92,26 +117,67 @@ class Streamer:
         finally:
             self.busy_seconds += time.monotonic() - t0
 
+    def _covered(self, levels: list[float], threshold_db: float, end: int) -> str | None:
+        """The text of [done, end) if the last pass already has it: it ended within
+        quiet audio of `end`, so the two differ only by silence."""
+        if self._partial is None or self._partial[0] <= self.done:
+            return None
+        pass_end, text = self._partial
+        if _loud(levels[min(pass_end, end):max(pass_end, end)], threshold_db):
+            return None
+        return text
+
+    def _should_speculate(self, levels: list[float], threshold_db: float, n: int) -> bool:
+        """The speaker has paused, and said something since the last pass."""
+        quiet = int(SPECULATE_PAUSE * CHUNKS_PER_SECOND)
+        since = self._partial[0] if self._partial else self.done
+        return (n - since >= SPECULATE_MIN * CHUNKS_PER_SECOND
+                and not _loud(levels[n - quiet:n], threshold_db)
+                and _loud(levels[since:n - quiet], threshold_db))
+
     def _loop(self) -> None:
-        last_caption, captioned = 0.0, -1
+        last_caption = last_guess = float("-inf")
+        captioned = -1
         while not self._stop.wait(POLL):
             try:
+                if self.source.levels_db is not self._levels:
+                    break                   # a new recording has started: this one is over
                 n = self.source.chunk_count
-                cut = find_cut(self.source.levels_db[:n], self.threshold_db, self.done)
+                levels = self._levels[:n]
+                threshold = self.threshold_db
+                cut = find_cut(levels, threshold, self.done)
                 if cut is not None and cut > self.done:
-                    text = self._recognize(self.source.audio_range(self.done, cut))
-                    if self._stop.is_set() and not text:
-                        break
-                    self.segments.append(text)
-                    self.done = cut
+                    text = self._covered(levels, threshold, cut)
+                    if text is None:
+                        text = self._recognize(self.source.audio_range(self.done, cut))
+                        if self._stop.is_set() and not text:
+                            break
+                    with self._lock:
+                        if self._finished:
+                            break
+                        self.segments.append(text)
+                        self.done = cut
+                        self._partial = (cut, "")
                     self._caption(self.text)
                     captioned = n
-                elif (self.on_caption and n != captioned and time.monotonic() - last_caption >= CAPTION_EVERY
-                      and n - self.done >= CAPTION_MIN * CHUNKS_PER_SECOND):
-                    last_caption, captioned = time.monotonic(), n
-                    partial = self._recognize(self.source.audio_range(self.done, n))
+                elif self._should_speculate(levels, threshold, n):
+                    last_guess = time.monotonic()
+                    text = self._recognize(self.source.audio_range(self.done, n))
+                    with self._lock:
+                        if self._finished:
+                            break
+                        self._partial = (n, text)
                     if not self._stop.is_set():
-                        self._caption(" ".join(x for x in (self.text, partial) if x))
+                        self._caption(_join(self.text, text))
+                    captioned = n
+                elif (self.on_caption and n != captioned and n - self.done >= CAPTION_MIN * CHUNKS_PER_SECOND
+                      and time.monotonic() - max(last_caption, last_guess) >= CAPTION_EVERY
+                      and _loud(levels[self.done:n], threshold)):
+                    last_caption, captioned = time.monotonic(), n
+                    start = max(self.done, n - CAPTION_WINDOW_CHUNKS)
+                    partial = self._recognize(self.source.audio_range(start, n))
+                    if not self._stop.is_set():
+                        self._caption(_join(self.text, partial))
             except Exception as exc:  # noqa: BLE001 - the final pass covers whatever this missed
                 log.debug("streaming pass failed: %s", exc)
 
@@ -122,17 +188,41 @@ class Streamer:
             except Exception:  # noqa: BLE001 - captions are cosmetic
                 pass
 
-    def finish(self, audio: np.ndarray, timeout: float = 15.0) -> str:
-        """Stop, recognize what came after the last closed segment of `audio` (the
-        whole recording) and return the full transcript."""
+    def finish_parts(self, audio: np.ndarray, timeout: float = 15.0) -> tuple[list[str], str]:
+        """Stop and return (the segments closed while recording, the text of the rest
+        of `audio`, the whole recording). The rest is recognized now, unless the pass
+        that ran in the last pause already covers it."""
         self._stop.set()
         if self._thread.ident is not None:
             self._thread.join(timeout)
-        tail = audio[self.done * CHUNK_FRAMES:]
-        tail_text = self.transcribe(tail) if len(tail) else ""
-        log.info("streaming: %d segment(s) during recording (%.2fs of recognition), tail %.1fs",
-                 len([s for s in self.segments if s]), self.busy_seconds, len(tail) / 16000)
-        return " ".join(x for x in (self.text, tail_text) if x)
+            if self._thread.is_alive():
+                log.warning("streaming: a recognition pass is still running after %.0fs; finishing without it",
+                            timeout)
+        with self._lock:
+            self._finished = True       # a pass still running can no longer change what we read here
+            done, partial, segments = self.done, self._partial, [s for s in self.segments if s]
+        n_total = len(audio) // CHUNK_FRAMES
+        tail = audio[done * CHUNK_FRAMES:]
+        self.tail_reused = False
+        if partial is not None and partial[0] <= n_total <= len(self._levels):
+            # nothing louder than the speech threshold since that pass: it has the rest
+            self.tail_reused = not _loud(self._levels[partial[0]:n_total], self.threshold_db)
+        if self.tail_reused and partial is not None:
+            tail_text = partial[1]
+            note = (" (reused the pass from your last pause)" if partial[0] > done
+                    else " (nothing said after your last pause)")
+        else:
+            tail_text = self.transcribe(tail) if len(tail) else ""
+            note = ""
+        log.info("streaming: %d segment(s) during recording (%.2fs of recognition), tail %.1fs%s",
+                 len(segments), self.busy_seconds, len(tail) / 16000, note)
+        return segments, tail_text
+
+    def finish(self, audio: np.ndarray, timeout: float = 15.0) -> str:
+        """Stop, recognize what came after the last closed segment of `audio` (the
+        whole recording) and return the full transcript."""
+        segments, tail_text = self.finish_parts(audio, timeout)
+        return _join(*segments, tail_text)
 
     def abort(self) -> None:
         self._stop.set()
