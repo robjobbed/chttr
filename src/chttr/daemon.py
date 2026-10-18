@@ -733,6 +733,8 @@ class Daemon:
             if hasattr(self.transcriber, "adaptive"):
                 self.transcriber.adaptive = getattr(cfg.audio, "adaptive_threshold", True)
         self.cfg = cfg
+        if not cfg.feedback.overlay:
+            self._overlay_quit()                # turned off: don't leave the pill running until the next press
         self.recorder.device = cfg.audio.device
         self.feedback = Feedback(cfg.feedback, self.runtime)    # writes the tones if sounds just turned on
         if dataclasses.asdict(old.hotkeys) != dataclasses.asdict(cfg.hotkeys) and self.hotkeys is not None:

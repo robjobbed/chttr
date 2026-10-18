@@ -1010,6 +1010,17 @@ def test_overlay_switched_off_by_a_reload_stops_the_process(pill):
     assert pill.overlay is None and proc.returncode == 0
 
 
+def test_a_reload_that_turns_the_overlay_off_stops_it_at_once(pill, monkeypatch, tmp_path):
+    path = tmp_path / "config.toml"
+    monkeypatch.setattr(C, "CONFIG_FILE", path)
+    monkeypatch.setattr(Dm, "engine_key", lambda cfg: pill.transcriber.key)
+    pill_dictate(pill, "one")
+    proc = pill.overlay
+    path.write_text("[feedback]\noverlay = false\n", encoding="utf-8")
+    assert pill.handle("reload")["ok"] is True
+    assert pill.overlay is None and proc.returncode == 0
+
+
 def test_live_captions_switched_on_restarts_the_overlay(pill):
     pill_dictate(pill, "one")
     pill.cfg.feedback.live_captions = True
