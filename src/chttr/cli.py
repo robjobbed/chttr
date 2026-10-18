@@ -808,9 +808,11 @@ def _pick_style(directory: Path) -> None:
 
 def cmd_menu(args: argparse.Namespace) -> int:
     """The bar widget's menu (Omarchy's menu picker, or fuzzel / wofi / rofi elsewhere)."""
+    import shutil
     import subprocess
 
     from . import desktop as DT
+    from . import polish as P
     from .meeting import meeting_dirs, read_json
     try:
         status = send("meeting status")
@@ -820,6 +822,11 @@ def cmd_menu(args: argparse.Namespace) -> int:
     notes = [Path(m["markdown"]) for d in reversed(meeting_dirs())
              if (m := read_json(d / "meta.json", {}) or {}).get("markdown") and Path(m["markdown"]).exists()]
     items: list[tuple[str, Callable[[], object]]] = []
+    if cfg.polish.backend != "none" and cfg.polish.level != "none" and P.backend(cfg.polish) == "none":
+        # cleanup is on but has nothing to run on: `chttr connect claude` is the guided key entry
+        items.append(("󰚩  Turn on Claude cleanup…", lambda: _terminal("chttr connect claude")))
+        if shutil.which("ollama"):
+            items.append(("󰚩  Use Ollama for cleanup (offline)", lambda: _terminal("ollama serve")))
     if status is None:
         items.append(("󰑓  Start the chttr daemon", lambda: subprocess.run(["systemctl", "--user", "restart", "chttr"])))
     elif status.get("recording"):
