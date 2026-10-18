@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+import gc
 import json
 import logging
 import os
@@ -35,6 +37,7 @@ from .transcriber import Transcriber, engine_key
 log = logging.getLogger("chttr.daemon")
 
 IDLE, RECORDING, TRANSCRIBING = "idle", "recording", "transcribing"
+LOADING = "loading"                     # the daemon answers while the speech model loads
 # What a recording is for. PTT and COMMAND end when the key is released;
 # HANDSFREE ends on silence or a second press.
 PTT, HANDSFREE, COMMAND = "dictate", "hands-free", "command"
@@ -54,17 +57,24 @@ DOUBLE_TAP = 0.45                       # a second press this soon after a short
 ATSPI_GIVE_UP = 5                       # unreadable fields in a row before screen context stops
 TAP = 0.35                              # recordings shorter than this are taps, not dictations
 CALL_TIMEOUT = 90                       # no word from the Meet tab for this long: the call is over
+MODEL_WAIT = 120                        # a dictation made while the model loads waits this long for it
 
 
 class Daemon:
-    def __init__(self, cfg: Config) -> None:
+    def __init__(self, cfg: Config, load_model: bool = True) -> None:
         self.cfg = cfg
         self.runtime = C.ensure_runtime_dir()
         self.state = IDLE
         self.lock = threading.Lock()
         self.feedback = Feedback(cfg.feedback, self.runtime)
         self.recorder = Recorder(cfg.audio.device, on_level=self._on_level)
-        self.transcriber = Transcriber(cfg)
+        # `chttr daemon` loads the model in the background (see serve), so the key
+        # works from the first second; tests and tools load it right here.
+        self.transcriber: Transcriber | None = Transcriber(cfg) if load_model else None
+        self.model_ready = threading.Event()
+        self.model_error = ""
+        if self.transcriber is not None:
+            self.model_ready.set()
         self.polish_warned = False
         self.overlay: subprocess.Popen | None = None
         self.overlay_lock = threading.Lock()
@@ -117,13 +127,41 @@ class Daemon:
 
     # ---- state -------------------------------------------------------------
     def _refresh_state(self) -> None:
-        """Recording beats transcribing beats idle."""
+        """Recording beats transcribing beats loading the model beats idle."""
         if self.recorder.active:
             state = RECORDING
+        elif self.jobs:
+            state = TRANSCRIBING
         else:
-            state = TRANSCRIBING if self.jobs else IDLE
+            state = LOADING if self.transcriber is None and not self.model_ready.is_set() else IDLE
         if state != self.state:
             self._write_state(state)
+
+    def _load_model(self) -> None:
+        """Load the speech model (a few seconds) while the daemon already answers."""
+        with self.lock:
+            if self.state == IDLE:
+                self._write_state(LOADING)
+        t0 = time.monotonic()
+        try:
+            transcriber = Transcriber(self.cfg)
+            with self.lock:
+                self.transcriber, self.model_error = transcriber, ""
+            log.info("speech model loaded in %.1fs", time.monotonic() - t0)
+        except (FileNotFoundError, RuntimeError, ImportError, OSError) as exc:
+            log.error("the speech model could not be loaded: %s", exc)
+            self.model_error = str(exc)
+            self.feedback.notify("chttr: the speech model is missing", f"{exc}\nRun: chttr setup",
+                                 urgency="critical", timeout_ms=0)
+        finally:
+            self.model_ready.set()
+            with self.lock:
+                self._refresh_state()
+
+    def _model_status(self) -> str:
+        if self.transcriber is not None:
+            return "ready"
+        return "missing" if self.model_ready.is_set() else "loading"
 
     def _write_state(self, state: str) -> None:
         self.state = state
@@ -194,6 +232,8 @@ class Daemon:
 
     # ---- streaming recognition / live captions ----------------------------
     def _captions_start(self) -> None:
+        if self.transcriber is None:
+            return                              # still loading: the whole recording is transcribed at the end
         captions = self.cfg.feedback.live_captions and self.cfg.feedback.overlay
         if self.cfg.engine.streaming:
             prompt = Dictionary.load().whisper_prompt()
@@ -268,7 +308,7 @@ class Daemon:
                 return self._meet_event(json.loads(arg))
             if cmd == "status":
                 return {"ok": True, "state": self.state, "kind": self.kind if self.state == RECORDING else "",
-                        "seconds": round(self.recorder.elapsed, 1)}
+                        "seconds": round(self.recorder.elapsed, 1), "model": self._model_status()}
             if cmd == "toggle":
                 return self._stop_and_transcribe()
             if cmd == "release":
@@ -403,30 +443,34 @@ class Daemon:
         from . import calls as K
 
         watcher = K.CallWatcher()
-        while not self._stop.wait(3.0):
-            if not self.cfg.meeting.detect_calls:
-                continue
-            try:
-                app = K.current_call(K.snapshot(), meet_call_active=self.call is not None)
-            except Exception:
-                log.debug("call detection failed", exc_info=True)
-                continue
-            decision = watcher.update(app, time.monotonic())
-            if decision is None:
-                continue
-            what, label = decision
-            if what == "start" and not self.meeting and self.call is None:
-                log.info("a call seems to have started in %s", label)
-                if self.cfg.meeting.auto == "always":
-                    with self.lock:
-                        self._meeting_start("app", self._calendar_title() or f"{label} call")
-                elif self.cfg.meeting.auto == "ask":
-                    threading.Thread(target=self._ask_to_record_app, args=(label,), daemon=True).start()
-            elif what == "end":
+        self._forever("calls", lambda: self._calls_tick(watcher), 3.0)
+
+    def _calls_tick(self, watcher) -> None:
+        from . import calls as K
+
+        if not self.cfg.meeting.detect_calls:
+            return
+        try:
+            app = K.current_call(K.snapshot(), meet_call_active=self.call is not None)
+        except Exception:
+            log.debug("call detection failed", exc_info=True)
+            return
+        decision = watcher.update(app, time.monotonic())
+        if decision is None:
+            return
+        what, label = decision
+        if what == "start" and not self.meeting and self.call is None:
+            log.info("a call seems to have started in %s", label)
+            if self.cfg.meeting.auto == "always":
                 with self.lock:
-                    if self.meeting and self.meeting.source == "app":
-                        log.info("%s let go of the microphone; the call is over", label)
-                        self._meeting_stop()
+                    self._meeting_start("app", self._calendar_title() or f"{label} call")
+            elif self.cfg.meeting.auto == "ask":
+                threading.Thread(target=self._ask_to_record_app, args=(label,), daemon=True).start()
+        elif what == "end":
+            with self.lock:
+                if self.meeting and self.meeting.source == "app":
+                    log.info("%s let go of the microphone; the call is over", label)
+                    self._meeting_stop()
 
     def _calendar_title(self) -> str:
         from . import gcal
@@ -490,16 +534,59 @@ class Daemon:
                     self._meeting_start("extension")
 
     def _reload(self) -> dict:
-        cfg = C.load_config()
-        message = "config reloaded"
-        if engine_key(cfg) != self.transcriber.key:
+        """Re-read config.toml and apply it now: audio levels, sounds, hotkeys and
+        (when idle) a different speech engine. A broken file changes nothing."""
+        try:
+            cfg = C.load_config(C.CONFIG_FILE)
+        except (ValueError, OSError) as exc:
+            return {"ok": False, "state": self.state, "error": f"config.toml: {exc}"}
+        old = self.cfg
+        before, after = dataclasses.asdict(old), dataclasses.asdict(cfg)
+        changed = [f"{section}.{key}" for section, values in after.items() if isinstance(values, dict)
+                   for key in values if before.get(section, {}).get(key) != values[key]]
+        if before.get("modes") != after.get("modes"):
+            changed.append("modes")
+        message = "config reloaded: " + ", ".join(changed) if changed else "config reloaded; nothing changed"
+        if self.transcriber is None:
+            if self.model_ready.is_set():
+                # the model failed to load: maybe it has been downloaded (or the engine fixed) since
+                self.model_ready.clear()
+                self.cfg = cfg
+                threading.Thread(target=self._load_model, name="model", daemon=True).start()
+                message += "; loading the speech model"
+            else:
+                message += "; the speech model is still loading"
+        elif engine_key(cfg) != self.transcriber.key:
             if self.state != IDLE:
                 return {"ok": False, "state": self.state, "error": "busy; reload again when idle to switch engines"}
-            self.transcriber = Transcriber(cfg)
-            message += f"; {cfg.engine.name} loaded"
+            self.transcriber = None             # free the old model before loading the new one
+            gc.collect()
+            try:
+                self.transcriber = Transcriber(cfg)
+                self.model_error = ""
+                message += f"; {cfg.engine.name} loaded"
+            except (FileNotFoundError, RuntimeError, ImportError, OSError) as exc:
+                log.error("could not load %s: %s", cfg.engine.name, exc)
+                try:
+                    self.transcriber = Transcriber(old)
+                except (FileNotFoundError, RuntimeError, ImportError, OSError) as again:
+                    self.model_error = str(again)
+                    self._refresh_state()
+                return {"ok": False, "state": self.state,
+                        "error": f"could not load {cfg.engine.name}: {exc}"
+                                 + ("; kept the previous engine and config" if self.transcriber else "")}
+        if self.transcriber is not None:
+            self.transcriber.threshold_db = cfg.audio.threshold_db
+            self.transcriber.boost = cfg.audio.whisper_mode
+            if hasattr(self.transcriber, "adaptive"):
+                self.transcriber.adaptive = getattr(cfg.audio, "adaptive_threshold", True)
         self.cfg = cfg
         self.recorder.device = cfg.audio.device
-        self.feedback.cfg = cfg.feedback
+        self.feedback = Feedback(cfg.feedback, self.runtime)    # writes the tones if sounds just turned on
+        if dataclasses.asdict(old.hotkeys) != dataclasses.asdict(cfg.hotkeys) and self.hotkeys is not None:
+            self.hotkeys.stop.set()
+            self._start_hotkeys()
+        log.info("%s", message)
         return {"ok": True, "state": self.state, "message": message}
 
     def _press(self, kind: str) -> dict:
@@ -594,6 +681,9 @@ class Daemon:
         if kind == COMMAND:
             what = f"{len(self.selection.split())} selected words" if self.selection else "no selection: new text"
             self.feedback.notify("Command mode", f"Say what to do ({what})", timeout_ms=2500)
+        if self.model_error:
+            self.feedback.notify("chttr can't transcribe: speech model missing", "Run: chttr setup",
+                                 urgency="critical", timeout_ms=8000)
         return {"ok": True, "state": self.state, "kind": kind}
 
     def _stop_and_transcribe(self) -> dict:
@@ -650,6 +740,12 @@ class Daemon:
         method = ""
         mode: Mode | None = None
         try:
+            if not self.model_ready.wait(0.3):
+                self.feedback.notify("Loading the speech model\u2026", "Your dictation is kept and typed when it is ready.",
+                                     timeout_ms=8000)
+                self.model_ready.wait(MODEL_WAIT)
+            if self.transcriber is None:
+                raise RuntimeError(self.model_error or "the speech model took too long to load")
             t0 = time.monotonic()
             dictionary = Dictionary.load()
             if isinstance(captions, Streamer):
@@ -662,8 +758,9 @@ class Daemon:
                 if captions:
                     captions.join(timeout=5)   # let an in-flight caption pass finish first
                 raw = self.transcriber.transcribe(audio, dictionary.whisper_prompt())
-            log.info("%s %.1fs audio (peak %.0f dB) -> %.2fs after release: %r",
-                     self.transcriber.engine.name, secs, peak_db, time.monotonic() - t0, raw)
+            log.info("%s %.1fs audio (peak %.0f dB) -> %.2fs after release: %d words",
+                     self.transcriber.engine.name, secs, peak_db, time.monotonic() - t0, len(raw.split()))
+            log.debug("raw: %r", raw)
             if not raw:
                 if secs >= TAP:                     # a tap (maybe half of a double tap) is not a dictation
                     self._no_speech(secs, peak_db)
@@ -672,7 +769,7 @@ class Daemon:
             names = CX.names_in(field.text) if field and self.cfg.polish.screen_context != "off" else []
             fixed = dictionary.apply(raw, names)
             if fixed != raw:
-                log.info("dictionary: %r", fixed)
+                log.debug("dictionary: %r", fixed)
             mode = self.cfg.mode_for(app)
             if kind == COMMAND:
                 text = self._run_command(fixed, selection, app, title, mode, dictionary)
@@ -682,7 +779,7 @@ class Daemon:
                 coded = devmode.transform(fixed, bool(mode and mode.is_code))
                 keep = devmode.keep_list(fixed, coded)
                 if coded != fixed:
-                    log.info("dev mode: %r", coded)
+                    log.debug("dev mode: %r", coded)
                 text = self._polish(coded, app, title, mode, dictionary, keep, names,
                                     field.before if field and self.cfg.polish.screen_context == "full" else "")
                 text = dictionary.expand_snippets(text)
@@ -849,31 +946,63 @@ class Daemon:
             log.warning("history write failed: %s", exc)
 
     # ---- server ------------------------------------------------------------
+    def _forever(self, name: str, fn, interval: float) -> None:
+        """Run fn every interval seconds until the daemon stops. An exception is logged
+        and the next tick runs anyway: auto-stop and the time limits must never die."""
+        last = ""
+        while not self._stop.wait(interval):
+            try:
+                fn()
+                last = ""
+            except Exception as exc:
+                if repr(exc) != last:           # a tick that keeps failing logs its traceback once
+                    log.exception("%s failed; continuing", name)
+                else:
+                    log.debug("%s failed again: %s", name, exc)
+                last = repr(exc)
+
     def _watchdog(self) -> None:
-        while not self._stop.wait(0.2):
-            with self.lock:
-                m = self.meeting
-                if m and m.elapsed >= self.cfg.meeting.max_hours * 3600:
-                    log.info("meeting max_hours reached; stopping")
-                    self._meeting_stop()
-                elif m and m.code and self.call and time.time() - self.call["seen"] > CALL_TIMEOUT:
-                    log.info("no word from the Meet tab for %ds; treating the call as over", CALL_TIMEOUT)
-                    self.call = None
-                    self._meeting_stop()
-                if self.state != RECORDING:
-                    continue
-                a = self.cfg.audio
-                if self.recorder.elapsed >= a.max_seconds:
-                    log.info("max_seconds reached; stopping")
+        self._forever("watchdog", self._watchdog_tick, 0.2)
+
+    def _watchdog_tick(self) -> None:
+        with self.lock:
+            m = self.meeting
+            if m and m.elapsed >= self.cfg.meeting.max_hours * 3600:
+                log.info("meeting max_hours reached; stopping")
+                self._meeting_stop()
+            elif m and m.code and self.call and time.time() - self.call["seen"] > CALL_TIMEOUT:
+                log.info("no word from the Meet tab for %ds; treating the call as over", CALL_TIMEOUT)
+                self.call = None
+                self._meeting_stop()
+            if self.state != RECORDING:
+                return
+            if not self.recorder.active:
+                self._recorder_quit()
+                return
+            a = self.cfg.audio
+            if self.recorder.elapsed >= a.max_seconds:
+                log.info("max_seconds reached; stopping")
+                self._stop_and_transcribe()
+            elif self.kind == HANDSFREE:
+                quiet = time.monotonic() - self.last_speech
+                if self.heard_speech and quiet >= a.auto_stop_silence:
+                    log.info("hands-free: %.1fs of silence; stopping", quiet)
                     self._stop_and_transcribe()
-                elif self.kind == HANDSFREE:
-                    quiet = time.monotonic() - self.last_speech
-                    if self.heard_speech and quiet >= a.auto_stop_silence:
-                        log.info("hands-free: %.1fs of silence; stopping", quiet)
-                        self._stop_and_transcribe()
-                    elif not self.heard_speech and self.recorder.elapsed >= a.no_speech_timeout:
-                        log.info("hands-free: nothing heard in %.0fs; cancelling", a.no_speech_timeout)
-                        self._cancel()
+                elif not self.heard_speech and self.recorder.elapsed >= a.no_speech_timeout:
+                    log.info("hands-free: nothing heard in %.0fs; cancelling", a.no_speech_timeout)
+                    self._cancel()
+
+    def _recorder_quit(self) -> None:
+        """The microphone went away mid-recording (unplugged, PipeWire restarted).
+        Whatever was said until then is still typed; then say what happened."""
+        if getattr(self.recorder, "chunk_count", 0) * 0.02 < TAP:      # 20 ms chunks
+            self._cancel()                      # nothing worth transcribing
+        else:
+            self._stop_and_transcribe()
+        error = getattr(self.recorder, "error", "")
+        log.warning("the recorder stopped by itself: %s", error or "no reason given")
+        if error:
+            self.feedback.notify("chttr: the microphone went away", error[:160], urgency="critical", timeout_ms=8000)
 
     def _start_hotkeys(self) -> None:
         from . import hotkeys as H
@@ -934,10 +1063,17 @@ class Daemon:
 
         signal.signal(signal.SIGTERM, on_signal)
         signal.signal(signal.SIGINT, on_signal)
-        threading.Thread(target=self._watchdog, daemon=True).start()
-        threading.Thread(target=self._watch_calls, name="calls", daemon=True).start()
+        from . import calls as K
+
+        threading.Thread(target=self._forever, args=("watchdog", self._watchdog_tick, 0.2),
+                         name="watchdog", daemon=True).start()
+        watcher = K.CallWatcher()
+        threading.Thread(target=self._forever, args=("calls", lambda: self._calls_tick(watcher), 3.0),
+                         name="calls", daemon=True).start()
         threading.Thread(target=P.warm, args=(self.cfg.polish,), daemon=True).start()
         self._start_hotkeys()
+        if self.transcriber is None:
+            threading.Thread(target=self._load_model, name="model", daemon=True).start()
         log.info("listening on %s (cleanup backend: %s)", sock_path, P.backend(self.cfg.polish))
         try:
             while not self._stop.is_set():
@@ -963,4 +1099,4 @@ class Daemon:
 
 
 def run(cfg: Config) -> None:
-    Daemon(cfg).serve()
+    Daemon(cfg, load_model=False).serve()
