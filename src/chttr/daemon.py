@@ -205,7 +205,7 @@ class Daemon:
             if only_if_changed and info == cache["written"]:
                 return
             try:
-                tmp = C.STATE_JSON.with_suffix(".json.tmp")
+                tmp = C.STATE_JSON.with_name(f".state.json.{os.getpid()}.{threading.get_ident()}.tmp")
                 tmp.write_text(json.dumps(info), encoding="utf-8")
                 os.replace(tmp, C.STATE_JSON)
             except OSError as exc:
@@ -245,7 +245,8 @@ class Daemon:
 
         with lock:
             self.state = state
-            tmp = C.STATE_FILE.with_suffix(".tmp")
+            # a temporary file of its own: a second daemon starting up must not move ours away
+            tmp = C.STATE_FILE.with_name(f".state.{os.getpid()}.{threading.get_ident()}.tmp")
             tmp.write_text(state, encoding="utf-8")
             os.replace(tmp, C.STATE_FILE)
             check_backend()

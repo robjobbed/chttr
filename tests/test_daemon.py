@@ -777,7 +777,14 @@ def test_the_daemon_answers_on_its_socket_while_the_model_loads(lazy_daemon, mon
     server = threading.Thread(target=d.serve, daemon=True)
     server.start()
     try:
-        assert wait_for(C.SOCKET_PATH.exists)
+        def answers() -> bool:                   # the socket file appears just before it listens
+            try:
+                client.send("status")
+                return True
+            except client.DaemonNotRunning:
+                return False
+
+        assert wait_for(answers)
         reply = client.send("status")
         assert reply["model"] == "loading" and reply["state"] == Dm.LOADING
         assert C.STATE_FILE.read_text(encoding="utf-8") == "loading"
