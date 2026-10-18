@@ -10,8 +10,9 @@ def test_windarchy_is_light_with_its_lavender_accent(fixtures):
     assert v["--accent"] == "#5b2bb5" and v["--bg"] == "#f3eefa" and v["--text"] == "#221c33"
     assert v["--danger"] == "#b42318" and v["--accent-soft"] == "rgba(91, 43, 181, 0.18)"
     assert v["--mark"].startswith("rgba(") and v["--mark"].endswith(", 0.35)")
-    assert v["--c1"] == "#5b2bb5" and v["--c8"] == "#5b2bb5"           # blue is color4, the accent here
-    assert "--c5" not in v                                             # no orange: app.css keeps its own
+    assert v["--panel"] == "#faf7fd" and v["--line"] == "#e9e2f5"    # lighter_ / dark_background
+    assert v["--c8"] == "#5b2bb5" and v["--c5"].startswith("#")      # accent and orange are named
+    assert "--c1" not in v and "--c2" not in v                       # no blue or magenta: app.css keeps its own
 
 
 def test_dark_theme_without_mode_is_read_from_the_background(fixtures):
@@ -25,7 +26,11 @@ def test_dark_theme_without_mode_is_read_from_the_background(fixtures):
 def test_small_text_stays_readable(fixtures):
     for name in ("colors.toml", "colors-dark.toml"):
         v = T.load_theme(fixtures / name)["vars"]
-        assert T.contrast(v["--muted"], v["--panel"]) >= 4.5
+        accent = v["--accent"]
+        for back in (v["--panel"], v["--bg"]):
+            assert T.contrast(v["--muted"], back) >= 4.5
+            # the active row and the selected tab: --accent-soft composited over the pane
+            assert T.contrast(v["--muted"], T._mix(back, accent, T.SOFT)) >= 4.5, (name, back)
         for i in range(1, 9):
             if f"--c{i}" in v:
                 assert T.contrast(v[f"--c{i}"], v["--bg"]) >= 4.5, i

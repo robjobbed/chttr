@@ -108,6 +108,12 @@
     return out;
   }
 
+  // Search as you type: the server drops one-letter words and only prefix-matches from three
+  // letters (library.fts_query), so "co" on its way to "contract" would come back empty.
+  function tooShortToSearch(pq) {
+    return !pq.speaker && !pq.after && !pq.before && pq.words.length > 0 && pq.words.length < 3;
+  }
+
   // ---- transcripts --------------------------------------------------------------------------
   // Mirror of library.turns: consecutive lines by one speaker, less than `gap` s apart, are one turn.
   function turnsFromLines(lines, gap = 3) {
@@ -190,7 +196,7 @@
   const isLatest = (channel, n) => (counters.get(channel || "") || 0) === n;
 
   const lib = {
-    parseRoute, buildRoute, fmtTs, parseTs, fmtDuration, parseQuery, filterDate, turnsFromLines, speakerPalette,
+    parseRoute, buildRoute, fmtTs, parseTs, fmtDuration, parseQuery, tooShortToSearch, filterDate, turnsFromLines, speakerPalette,
     isUnknownSpeaker, talkTime, lineAt, findRanges, stepRate, RATES, nextSeq, isLatest,
   };
   if (root) root.chttrLib = lib;

@@ -17,6 +17,7 @@
   const state = {
     meetings: [], styles: [], setup: null, current: null, route: null, view: "", loaded: false,
     meetingsError: "", hits: [], facet: "", reader: null,
+    held: "", forceSearch: false,                             // a search too short to run yet; Enter runs it anyway
   };
   const views = new Map();
   const rendered = { listKey: null, detailKey: null };
@@ -286,7 +287,10 @@
         q.blur();
       } else if (e.key === "Enter") {
         e.preventDefault();
+        state.forceSearch = true;                              // Enter searches a short word as it is
         apply();
+        if (state.forceSearch && state.held && state.results) state.searching = runSearch(state.held, state.results);
+        state.forceSearch = false;
         openTopHit();
       } else if (e.key === "ArrowDown") {
         e.preventDefault();
@@ -435,12 +439,22 @@
 
   async function runSearch(q, box) {
     const seq = L.nextSeq("search");
+    const force = state.forceSearch;
+    state.forceSearch = false;
+    state.held = "";
     if (q !== state.lastQ) state.facet = "";                    // a new search starts across every meeting
     state.lastQ = q;
     const pq = L.parseQuery(q);
     if (!pq.words && !pq.speaker && !pq.after && !pq.before) {
       state.hits = [];
       box.replaceChildren(...[meetingList()].flat());
+      return;
+    }
+    if (!force && L.tooShortToSearch(pq)) {                     // "co" while typing "contract": not "Nothing matches"
+      state.held = q;
+      state.hits = [];
+      box.replaceChildren(...[el("div", { class: "section-label" }, `Keep typing… Enter searches for “${pq.words}”`), meetingList()].flat());
+      markActive(state.route);
       return;
     }
     let res;
@@ -516,6 +530,7 @@
     },
     detailKey: (route) => route.id,
     async detail(route) {
+      if (state.reader && state.reader.id !== route.id) closeReader();   // stop the old meeting while the new one loads
       if (!route.id) {
         closeReader();
         if (!state.loaded) return el("div", { class: "empty" }, "Loading…");
@@ -736,15 +751,23 @@
       turns.length ? transcript : el("p", { class: "meta" }, "No transcript for this meeting."));
 
     // follow-along: the line being played lights up and stays in view, unless you scrolled lately
+    // (wheel, keys, the scrollbar, middle-click, a find match). Scroll events arrive on the next
+    // frame, so the reader's own scrolls are marked until the frame after that.
     let playing = -1;
     let userScrolled = 0;
     let lastRouteWrite = 0;
+    let autoScrolling = false;
+    let autoFrame = 0;
     const detail = $("#detail");
-    const noteScroll = () => (userScrolled = Date.now());
-    const scrollKeys = (e) => { if (["PageUp", "PageDown", "Home", "End"].includes(e.key)) noteScroll(); };
-    detail.addEventListener("wheel", noteScroll, { passive: true });
-    detail.addEventListener("touchmove", noteScroll, { passive: true });
-    detail.addEventListener("keydown", scrollKeys);
+    const noteScroll = () => { if (!autoScrolling) userScrolled = Date.now(); };
+    const autoScroll = (fn) => {
+      autoScrolling = true;
+      fn();
+      cancelAnimationFrame(autoFrame);
+      autoFrame = requestAnimationFrame(() => { autoFrame = requestAnimationFrame(() => (autoScrolling = false)); });
+    };
+    const show = (span, block) => autoScroll(() => span.scrollIntoView({ block }));
+    detail.addEventListener("scroll", noteScroll, { passive: true });
     const markPlaying = (time, scroll) => {
       const i = L.lineAt(starts, time);
       if (i === playing) return;
@@ -752,15 +775,19 @@
       playing = i;
       if (i >= 0) {
         spans[i].classList.add("playing");
-        if (scroll && Date.now() - userScrolled > 3000) spans[i].scrollIntoView({ block: "nearest" });
+        if (scroll && Date.now() - userScrolled > 3000) show(spans[i], "nearest");
       }
+    };
+    // the moment goes into the URL, so a refresh resumes about here; only while this meeting is the one shown
+    const writeT = (t) => {
+      reader.lastT = t;
+      if (state.view === "meetings" && state.route.id === m.id) navigate({ ...state.route, t }, { silent: true });
     };
     const onTime = () => {
       markPlaying(audio.currentTime, true);
-      if (Date.now() - lastRouteWrite > 5000 && audio.currentTime > 0) {    // refresh resumes about here
+      if (Date.now() - lastRouteWrite > 5000 && audio.currentTime > 0) {
         lastRouteWrite = Date.now();
-        reader.lastT = Math.floor(audio.currentTime);
-        navigate({ ...state.route, t: reader.lastT }, { silent: true });
+        writeT(Math.floor(audio.currentTime));
       }
     };
     if (audio) audio.addEventListener("timeupdate", onTime);
@@ -789,20 +816,20 @@
           const i = L.lineAt(starts, t);
           if (i >= 0) {
             spans[i].classList.add("hit");
-            spans[i].scrollIntoView({ block: "center" });
+            show(spans[i], "center");
           }
-        } else if (playing >= 0) spans[playing].scrollIntoView({ block: "nearest" });
+        } else if (playing >= 0) show(spans[playing], "nearest");
         userScrolled = 0;
-        reader.lastT = Math.round(t);
-        navigate({ ...state.route, t: reader.lastT }, { silent: true });
+        writeT(Math.round(t));
       },
       arrive(time) {                                          // first paint: show the moment from the URL
+        autoScroll(() => {});                                 // render() just reset the scroll: not the user's
         if (time === null || time === undefined) return;
         clearHit();
         const i = L.lineAt(starts, time);
         if (i >= 0) {
           spans[i].classList.add("hit");
-          spans[i].scrollIntoView({ block: "center" });
+          show(spans[i], "center");
         }
         if (audio) {
           const go = () => (audio.currentTime = time);
@@ -904,13 +931,12 @@
       snapshot: () => ({ audio, time: audio ? audio.currentTime : 0, paused: audio ? audio.paused : true, scroll: detail.scrollTop }),
       restore(keep) {
         if (!keep) return;
-        detail.scrollTop = keep.scroll;
+        autoScroll(() => (detail.scrollTop = keep.scroll));
         if (audio && keep.audio === audio) markPlaying(audio.currentTime, false);
       },
       destroy(keepAudio) {                                     // keepAudio: a rebuild (rename, new notes) keeps playing
-        detail.removeEventListener("wheel", noteScroll);
-        detail.removeEventListener("touchmove", noteScroll);
-        detail.removeEventListener("keydown", scrollKeys);
+        detail.removeEventListener("scroll", noteScroll);
+        cancelAnimationFrame(autoFrame);
         if (audio) {
           audio.removeEventListener("timeupdate", onTime);
           if (!keepAudio) audio.pause();
@@ -1243,8 +1269,9 @@
     }
     gPending = 0;
     const view = currentView();
-    if (view.onKey && view.onKey(e)) { e.preventDefault(); return; }
-    const onButton = t.closest && t.closest("button, a, summary");
+    const onButton = t.closest && t.closest("button, a, summary, [role=tab]");
+    const pressesControl = onButton && (e.key === " " || e.key === "Enter");   // the focused control's own key
+    if (!pressesControl && view.onKey && view.onKey(e)) { e.preventDefault(); return; }
     switch (e.key) {
       case "/": case "s":
         if (!$("#search").hidden) { e.preventDefault(); $("#q").focus(); $("#q").select(); }

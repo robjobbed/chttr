@@ -2,7 +2,9 @@
    theme on <html> (data-theme + inline custom properties), which wins over both blocks below.
    Contrast: .item .meta (12.5px, --muted) is 5.3:1 on --panel and 4.6:1 on --accent-soft in
    light mode, 6.3:1 and 5.5:1 in dark mode (WCAG AA for small text is 4.5:1); speaker colours
-   --c1..--c8 are all >= 4.5:1 on --bg, since they colour names. */
+   --c1..--c8 are all >= 4.5:1 on --bg, since they colour names. theme.py keeps the same
+   promise for a theme's colours: it darkens or lightens --muted until it reads at 4.5:1 on
+   --panel, --bg and --accent-soft over either, and each --cN until it reads on --bg. */
 :root {
   color-scheme: light dark;
   --bg: #fbfbfa; --panel: #ffffff; --text: #1d1d1f; --muted: #6b6b70; --line: #e7e6e3;

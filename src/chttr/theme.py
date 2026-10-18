@@ -21,6 +21,7 @@ _HEX = re.compile(r"^#?([0-9a-fA-F]{3}|[0-9a-fA-F]{6})(?:[0-9a-fA-F]{2})?$")
 _FALLBACK = {"accent": "color4", "background": "color0", "foreground": "color7", "red": "color1",
              "muted": "color8", "green": "color2", "yellow": "color3", "blue": "color4", "magenta": "color5",
              "cyan": "color6", "orange": "color11"}
+SOFT = 0.18                     # --accent-soft is the accent at this alpha
 SPEAKERS = ("blue", "magenta", "cyan", "green", "orange", "red", "yellow", "accent")   # --c1 .. --c8
 
 
@@ -65,11 +66,11 @@ def contrast(a: str, b: str) -> float:
     return (hi + 0.05) / (lo + 0.05)
 
 
-def _readable(color: str, background: str, text: str, ratio: float = 4.5) -> str:
-    """`color`, nudged towards the text colour until small text in it reads on `background`."""
+def _readable(color: str, backgrounds: list[str], text: str, ratio: float = 4.5) -> str:
+    """`color`, nudged towards the text colour until small text in it reads on every one of `backgrounds`."""
     for step in range(11):
         mixed = _mix(color, text, step / 10)
-        if contrast(mixed, background) >= ratio:
+        if all(contrast(mixed, b) >= ratio for b in backgrounds):
             return mixed
     return text
 
@@ -107,18 +108,23 @@ def load_theme(path: Path | None = None) -> dict | None:
         out["--text"] = fg
     muted = color("muted") or color("dark_foreground")
     if muted:
-        out["--muted"] = _readable(muted, panel, fg) if panel and fg else muted   # meta text stays >= 4.5:1
+        # meta text stays >= 4.5:1 wherever it sits: the list, the page, and the active row or
+        # selected tab (--accent-soft composited over either)
+        backs = [b for b in (panel, bg) if b]
+        if accent:
+            backs += [_mix(b, accent, SOFT) for b in backs]
+        out["--muted"] = _readable(muted, backs, fg) if backs and fg else muted
     line = color("dark_background") or (_mix(bg, fg, 0.12) if bg and fg else None)
     if line:
         out["--line"] = line
     if accent:
         out["--accent"] = accent
-        out["--accent-soft"] = _rgba(accent, 0.18)
+        out["--accent-soft"] = _rgba(accent, SOFT)
     if yellow := color("yellow"):
         out["--mark"] = _rgba(yellow, 0.35)
     if red := color("red"):
         out["--danger"] = red
     for i, name in enumerate(SPEAKERS, 1):
         if c := color(name):
-            out[f"--c{i}"] = _readable(c, bg, fg) if bg and fg else c       # speaker names are text too
+            out[f"--c{i}"] = _readable(c, [bg], fg) if bg and fg else c       # speaker names are text too
     return {"mode": mode, "vars": out}

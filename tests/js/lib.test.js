@@ -31,6 +31,14 @@ test("parseQuery mirrors library.parse_query", () => {
   assert.equal(L.parseQuery("SPEAKER:Ali").speaker, "Ali");
 });
 
+test("short words wait for more typing unless a filter is set", () => {
+  assert.equal(L.tooShortToSearch(L.parseQuery("co")), true);
+  assert.equal(L.tooShortToSearch(L.parseQuery("c")), true);
+  assert.equal(L.tooShortToSearch(L.parseQuery("con")), false);
+  assert.equal(L.tooShortToSearch(L.parseQuery("co speaker:dana")), false);
+  assert.equal(L.tooShortToSearch(L.parseQuery("on:today")), false);
+});
+
 test("turnsFromLines mirrors library.turns", () => {
   const lines = [
     { start: 0, end: 2, speaker: "Dana", text: "Hi." },
