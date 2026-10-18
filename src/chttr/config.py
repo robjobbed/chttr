@@ -246,6 +246,8 @@ email = ""
 calendar_file = "~/.config/chttr/calendar-urls"
 # Safety limit
 max_hours = 4
+# A notification this many minutes before a calendar meeting with what you agreed last time and open action items (0 = off)
+brief_minutes = 5
 
 # Per-app modes. The first mode that matches the focused window wins: `match` is
 # a list of regexes (case-insensitive) for the window's class, `title` a list for
@@ -439,6 +441,7 @@ class MeetingCfg:
     email: str = ""
     calendar_file: str = "~/.config/chttr/calendar-urls"
     max_hours: float = 4
+    brief_minutes: int = 5
 
 
 @dataclass
