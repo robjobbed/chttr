@@ -198,14 +198,15 @@ def remember(voices: dict[str, Voice], name: str, email: str, embedding: np.ndar
 
 
 def match_voice(voices: dict[str, Voice], embedding: np.ndarray, invited: set[str]) -> tuple[Voice | None, float]:
-    """Best remembered voice for a cluster centroid, or (None, best score)."""
-    best, best_score = None, -1.0
+    """Best remembered voice for a cluster centroid, or (None, best score). On a tie the
+    voice heard most recently wins."""
+    best, best_rank = None, (-1.0, "")
     for v in voices.values():
         score = float(v.embedding @ embedding)
         bar = VOICE_MATCH_ATTENDEE if v.key in invited else VOICE_MATCH_ANYONE
-        if score >= bar and score > best_score:
-            best, best_score = v, score
-    return best, best_score
+        if score >= bar and (score, v.updated) > best_rank:
+            best, best_rank = v, (score, v.updated)
+    return best, best_rank[0]
 
 
 def timed(label: str):

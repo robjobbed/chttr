@@ -87,3 +87,12 @@ def test_remember_needs_a_name_or_email():
     store: dict[str, D.Voice] = {}
     D.remember(store, "", "", np.ones(4, dtype=np.float32), 60)
     assert store == {}
+
+
+def test_match_voice_prefers_the_most_recently_heard_voice_on_a_tie():
+    v = np.ones(8, dtype=np.float32) / np.sqrt(8)
+    voices = {"old@x.com": D.Voice("old@x.com", "Old", "old@x.com", v, 3, "2026-01-01T10:00:00+00:00"),
+              "new@x.com": D.Voice("new@x.com", "New", "new@x.com", v, 1, "2026-09-01T10:00:00+00:00"),
+              "mid@x.com": D.Voice("mid@x.com", "Mid", "mid@x.com", v, 2, "2026-05-01T10:00:00+00:00")}
+    match, score = D.match_voice(voices, v, invited=set())
+    assert match is not None and match.name == "New" and score > 0.99
