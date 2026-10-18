@@ -49,3 +49,20 @@ def _real_models_for_model_tests(request, monkeypatch):
 @pytest.fixture
 def fixtures() -> Path:
     return FIXTURES
+
+
+def _sandboxed_calendar() -> None:
+    """[meeting] calendar_file defaults to ~/.config/chttr/calendar-urls, which the XDG
+    variables above don't move: no test, and no daemon thread a test leaves behind,
+    reads your real calendar. Patched for the whole session, not per test."""
+    from chttr import gcal
+
+    real, private = gcal.read_urls, (Path.home() / ".config" / "chttr").resolve()
+
+    def read_urls(path: str) -> list[str]:
+        return [] if Path(path).expanduser().resolve().is_relative_to(private) else real(path)
+
+    gcal.read_urls = read_urls
+
+
+_sandboxed_calendar()

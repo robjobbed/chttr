@@ -256,3 +256,87 @@ def test_screen_context_backs_off_when_atspi_never_answers(daemon, monkeypatch):
         daemon.handle("release")
         wait_idle(daemon)
     assert len(calls) == Dm.ATSPI_GIVE_UP
+
+
+# ---- pre-meeting brief -----------------------------------------------------
+@pytest.fixture
+def briefing(daemon, monkeypatch):
+    """A calendar with one meeting with Dana in four minutes, and notes from last time."""
+    from datetime import UTC, datetime, timedelta
+
+    from chttr import brief, gcal
+
+    for t in threading.enumerate():              # the fixture's own brief thread found no calendar
+        if t.name == "brief":
+            t.join(timeout=2)
+    start = datetime.now(UTC) + timedelta(minutes=4, seconds=10)
+    event = gcal.Event("Weekly sync", start, start + timedelta(minutes=30),
+                       attendees=[gcal.Attendee("Dana Lee", "dana@example.com"),
+                                  gcal.Attendee("", "rob@example.com", is_me=True)])
+    last = {"id": "m1", "started": time.time() - 7 * 86400, "title": "Weekly sync",
+            "attendee_emails": ["dana@example.com"], "speaker_emails": [], "me": ["Rob"],
+            "action_items": [{"owner": "Rob", "task": "Send Dana the pricing sheet", "due": ""}],
+            "markdown": "/notes/m1.md", "summary": "Pricing page ships first."}
+    events = [event]
+    monkeypatch.setattr(gcal, "read_urls", lambda path: ["https://calendar.google.com/x/basic.ics"])
+    monkeypatch.setattr(gcal, "upcoming", lambda urls, hours=24: list(events))
+    monkeypatch.setattr(brief, "past_meetings", lambda: [last])
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(daemon.feedback, "notify", lambda title, body="", **kw: sent.append((title, body)))
+    daemon.sent, daemon.events = sent, events
+    return daemon
+
+
+def test_brief_notifies_once_per_event(briefing):
+    assert briefing._brief_tick() == 1
+    title, body = briefing.sent[0]
+    assert title == "Weekly sync in 4 min"
+    assert body.splitlines()[0].startswith("Last met ") and body.endswith("• You: Send Dana the pricing sheet")
+    assert briefing._brief_tick() == 0                    # a minute later: nothing new
+    assert len(briefing.sent) == 1
+
+
+def test_brief_waits_until_brief_minutes_before(briefing):
+    briefing.cfg.meeting.brief_minutes = 2
+    assert briefing._brief_tick() == 0 and not briefing.sent
+    briefing.cfg.meeting.brief_minutes = 0                 # off after a reload
+    assert briefing._brief_tick() == 0
+
+
+def test_brief_skips_events_without_people_and_stays_discreet_in_a_call(briefing):
+    from datetime import timedelta
+
+    from chttr import gcal
+
+    focus = briefing.events[0]
+    briefing.events[:] = [gcal.Event("Focus time", focus.start, focus.end),
+                          gcal.Event("Retro", focus.start + timedelta(seconds=5), focus.end,
+                                     attendees=[gcal.Attendee("Dana Lee", "dana@example.com")])]
+    briefing.call = {"code": "abc-defg-hij", "title": "Another call", "seen": time.time()}
+    assert briefing._brief_tick() == 1
+    assert briefing.sent == [("Retro in 4 min", "chttr brief shows what you agreed last time.")]
+
+
+def test_brief_loop_ends_at_once_without_a_calendar(daemon):
+    alive = [t for t in threading.enumerate() if t.name == "brief"]
+    for t in alive:
+        t.join(timeout=2)
+    assert not any(t.is_alive() for t in alive)
+    started = time.monotonic()
+    daemon._brief_loop()                                  # no calendar: returns, no 60 s wait
+    assert time.monotonic() - started < 1
+
+
+def test_brief_loop_survives_an_offline_calendar(briefing, monkeypatch):
+    from chttr import gcal
+
+    briefing._stop.set()                                  # one pass, then the daemon is stopping
+    briefing._brief_loop()
+    assert len(briefing.sent) == 1
+
+    def offline(urls, hours=24):
+        raise OSError("network is unreachable")
+
+    monkeypatch.setattr(gcal, "upcoming", offline)
+    briefing._brief_loop()                                # logged, not raised
+    assert len(briefing.sent) == 1
