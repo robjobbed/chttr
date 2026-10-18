@@ -321,10 +321,11 @@ class NotedFeedback(QuietFeedback):
         self.notes.append(f"{title} | {body}")
 
 
-def no_speech_note(daemon, monkeypatch, peak_db, compositor="hyprland") -> str:
+def no_speech_note(daemon, monkeypatch, peak_db, compositor="hyprland", omarchy=True) -> str:
     from chttr.desktop import Desktop
 
     monkeypatch.setattr(Dm, "current_desktop", lambda: Desktop("wayland", compositor))
+    monkeypatch.setattr(Dm.shutil, "which", lambda name: f"/usr/bin/{name}" if omarchy else None)
     daemon.feedback = NotedFeedback(daemon.cfg.feedback, daemon.runtime)
     daemon._no_speech(2.0, peak_db)
     return daemon.feedback.notes[-1]
@@ -341,7 +342,7 @@ def test_no_speech_message_mentions_the_floor(daemon, monkeypatch):
 
 def test_no_speech_message_without_levels_skips_the_floor(daemon, monkeypatch):
     note = no_speech_note(daemon, monkeypatch, -31.0)
-    assert "Peak -31 dB; chttr listened down to -38 dB." in note
+    assert note.endswith("| Peak -31 dB. Raise the input level for best results.")
 
 
 def test_no_speech_on_a_loud_mic_stays_short(daemon, monkeypatch):
@@ -354,3 +355,38 @@ def test_silent_mic_names_the_omarchy_shortcut_only_on_hyprland(daemon, monkeypa
     assert note.startswith("No speech detected: the mic is silent | Peak -60 dB. Check the input device and mute")
     assert ("Super+Ctrl+A" in note) is (compositor == "hyprland")
     assert note.endswith(".")
+
+
+def test_no_speech_message_claims_no_lowering_that_never_happened(daemon, monkeypatch):
+    daemon.cfg.audio.adaptive_threshold = False
+    for _ in range(20):
+        daemon._on_level(db(-66), -50.0)
+    note = no_speech_note(daemon, monkeypatch, -31.0)
+    assert "Peak -31 dB over a -66 dB floor. Raise the input level" in note
+    assert "listened down" not in note
+
+
+def test_no_speech_message_skips_the_levels_of_a_newer_recording(daemon, monkeypatch):
+    for _ in range(20):
+        daemon._on_level(db(-66), -50.0)
+    daemon.jobs = 2                      # you started (and stopped) another dictation meanwhile
+    note = no_speech_note(daemon, monkeypatch, -31.0)
+    assert note.endswith("| Peak -31 dB. Raise the input level for best results.")
+
+
+def test_silent_mic_on_plain_hyprland_skips_the_omarchy_shortcut(daemon, monkeypatch):
+    note = no_speech_note(daemon, monkeypatch, -60.0, "hyprland", omarchy=False)
+    assert "Super+Ctrl+A" not in note
+    assert note.endswith("Check the input device and mute.")
+
+
+def test_hands_free_loud_speech_keeps_a_tv_as_a_pause(daemon):
+    # Lowering only goes as far as the speech needs: a -50 dB TV is not speech next
+    # to someone talking at -20 dB, so hands-free can still stop on your pause.
+    for _ in range(40):
+        daemon._on_level(db(-70), -60.0)
+    for _ in range(160):
+        daemon._on_level(db(-20), -10.0)
+    daemon.last_speech = 0.0
+    daemon._on_level(db(-50), -45.0)
+    assert daemon.last_speech == 0.0

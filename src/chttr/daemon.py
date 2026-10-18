@@ -789,18 +789,23 @@ class Daemon:
 
     def _no_speech(self, secs: float, peak_db: float) -> None:
         if peak_db < QUIET_PEAK_DB:
-            hint = " (Super+Ctrl+A opens Audio)." if current_desktop().compositor == "hyprland" else "."
+            omarchy = current_desktop().compositor == "hyprland" and shutil.which("omarchy-menu")
+            hint = " (Super+Ctrl+A opens Audio)." if omarchy else "."
             self.feedback.notify("No speech detected: the mic is silent",
                                  f"Peak {peak_db:.0f} dB. Check the input device and mute" + hint,
                                  urgency="normal", timeout_ms=6000)
         elif peak_db < -25:
-            # The tracker still holds the recording that just ended (_start replaces it).
+            # The tracker holds the recording that just ended, unless you have started
+            # another since (_start replaces it); then its numbers are not this one's.
             a, tracker = self.cfg.audio, self.levels
-            thr = tracker.threshold(a.threshold_db) if a.adaptive_threshold else a.threshold_db
-            over = f" over a {tracker.floor:.0f} dB floor" if tracker.count else ""
+            levels_text = ""
+            if tracker.count and self.state != RECORDING and self.jobs <= 1:
+                thr = tracker.threshold(a.threshold_db) if a.adaptive_threshold else a.threshold_db
+                levels_text = f" over a {tracker.floor:.0f} dB floor"
+                if thr < a.threshold_db:
+                    levels_text += f"; chttr listened down to {thr:.0f} dB"
             self.feedback.notify("No speech detected: the mic is quiet",
-                                 f"Peak {peak_db:.0f} dB{over}; chttr listened down to {thr:.0f} dB. "
-                                 "Raise the input level for best results.",
+                                 f"Peak {peak_db:.0f} dB{levels_text}. Raise the input level for best results.",
                                  urgency="normal", timeout_ms=6000)
         else:
             self.feedback.notify("No speech detected", f"{secs:.1f}s, peak {peak_db:.0f} dB", timeout_ms=2500)

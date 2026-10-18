@@ -68,10 +68,32 @@ def test_clipping(monkeypatch, capsys):
     assert mic_line(capsys).endswith("clipping; lower the input volume")
 
 
-@pytest.mark.parametrize("adaptive, verdict", [(True, "quiet but usable"), (False, "too quiet")])
-def test_verdict_follows_the_adaptive_setting(monkeypatch, capsys, adaptive, verdict):
-    fake_mic(monkeypatch, [-68.0] * 40 + [-46.0] * 160, -33.0)
+@pytest.mark.parametrize("adaptive, heard, verdict", [(True, "hello there", "quiet but usable (threshold lowered"),
+                                                     (False, "", "too quiet")])
+def test_verdict_follows_the_adaptive_setting(monkeypatch, capsys, adaptive, heard, verdict):
+    fake_mic(monkeypatch, [-68.0] * 40 + [-46.0] * 160, -33.0, heard=heard)
     cfg = C.Config()
     cfg.audio.adaptive_threshold = adaptive
     cli._mic_check(cfg)
     assert verdict in mic_line(capsys)
+
+
+def test_one_short_word_is_not_too_quiet(monkeypatch, capsys):
+    # "hello" (0.3 s) in 4 s of room: the speech level is the word, not the room.
+    fake_mic(monkeypatch, [-65.0] * 90 + [-25.0] * 15 + [-65.0] * 95, -12.0, heard="hello")
+    assert cli._mic_check(C.Config()) is True
+    assert mic_line(capsys).endswith("speech -25 dB, floor -65 dB: good")
+
+
+def test_never_too_quiet_when_something_was_heard(monkeypatch, capsys):
+    fake_mic(monkeypatch, [-45.0] * 100 + [-42.0] * 100, -30.0, heard="hello")
+    assert cli._mic_check(C.Config()) is True
+    assert mic_line(capsys).endswith("speech -42 dB, floor -45 dB: quiet but usable")
+
+
+def test_quiet_without_adaptive_levels_says_so_when_heard(monkeypatch, capsys):
+    fake_mic(monkeypatch, [-68.0] * 40 + [-46.0] * 160, -33.0, heard="hello")
+    cfg = C.Config()
+    cfg.audio.adaptive_threshold = False
+    cli._mic_check(cfg)
+    assert mic_line(capsys).endswith(": quiet but usable")
