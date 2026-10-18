@@ -201,7 +201,7 @@ def test_dev_mode_in_code_editors(daemon, monkeypatch):
     daemon.handle("start")
     daemon.handle("release")
     wait_idle(daemon)
-    assert daemon.typed == ["Open @main.py and rename userId."]
+    assert daemon.typed == ["Open @main.py and rename userId"]          # editors get no trailing period
 
 
 def test_level_none_skips_cleanup(daemon, monkeypatch):
@@ -256,3 +256,89 @@ def test_screen_context_backs_off_when_atspi_never_answers(daemon, monkeypatch):
         daemon.handle("release")
         wait_idle(daemon)
     assert len(calls) == Dm.ATSPI_GIVE_UP
+
+
+# ---- local cleanup and the cleanup breaker ---------------------------------------
+
+@pytest.fixture
+def offline(monkeypatch):
+    """The real module-level breaker (the daemon registered on_recover on it), reset,
+    with a background probe that never touches the network."""
+    b = Dm.P.breaker
+    b._opened_at = None
+    monkeypatch.setattr(Dm.P, "_ping", lambda which, cfg: (_ for _ in ()).throw(TimeoutError("still down")))
+    yield b
+    b._opened_at = None
+
+
+def dictate(d, text):
+    d.transcriber.texts = [text]
+    d.handle("start")
+    d.handle("release")
+    wait_idle(d)
+    return d.typed[-1]
+
+
+def test_without_a_backend_terminals_get_locally_cleaned_text(daemon):
+    typed = dictate(daemon, "um git commit dash m fix the parser period")
+    assert "um" not in typed.lower().split() and not typed.endswith(".")
+    assert typed.startswith("git commit")
+
+
+def test_a_short_command_with_a_filler_takes_the_quick_path(daemon, monkeypatch):
+    monkeypatch.setattr(Dm.P, "backend", lambda cfg: pytest.fail("asked for a backend"))
+    assert dictate(daemon, "Um, git status.") == "git status"
+
+
+def test_without_a_backend_spoken_punctuation_works_in_other_apps(daemon, monkeypatch):
+    monkeypatch.setattr(Dm, "focused_window", lambda: ("org.gnome.TextEditor", "notes"))
+    assert dictate(daemon, "um so send the contract comma then new line call Dana") == \
+        "So send the contract, then\nCall Dana."
+
+
+def test_cleaning_up_locally_is_explained_once(daemon, monkeypatch, tmp_path):
+    monkeypatch.setattr(Dm.C, "DATA_DIR", tmp_path / "data")
+    monkeypatch.setattr(Dm.P, "backend", lambda cfg: "none")
+    daemon.cfg.polish.backend = "auto"                       # nothing found, not a choice you made
+    dictate(daemon, "ok")                                     # short: nothing worth explaining yet
+    dictate(daemon, "um this is a longer sentence for the editor")
+    dictate(daemon, "and here is another one that is long enough")
+    assert daemon.feedback.notes.count("Cleaning up locally") == 1
+    assert (tmp_path / "data" / "hinted-cleanup").exists()
+
+
+def test_no_hint_when_you_turned_cleanup_off(daemon, monkeypatch, tmp_path):
+    monkeypatch.setattr(Dm.C, "DATA_DIR", tmp_path / "data")
+    dictate(daemon, "um this is a longer sentence for the editor")      # the fixture sets backend = "none"
+    assert "Cleaning up locally" not in daemon.feedback.notes
+
+
+def test_an_unreachable_model_costs_one_notice_and_no_waiting(daemon, monkeypatch, offline):
+    import anthropic
+
+    calls = []
+
+    def dead(system, user, cfg):
+        calls.append(user)
+        raise anthropic.APIConnectionError(request=None)
+
+    monkeypatch.setattr(Dm.P, "backend", lambda cfg: "claude")
+    monkeypatch.setattr(Dm.P, "_claude", dead)
+    t0 = time.monotonic()
+    assert dictate(daemon, "um git commit dash m fix the parser period") == "git commit dash m fix the parser"
+    assert time.monotonic() - t0 < 0.5
+    assert dictate(daemon, "um and then run the whole test suite again") == "and then run the whole test suite again"
+    assert len(calls) == 1                                     # the breaker skipped the second request
+    assert daemon.feedback.notes.count("Cleanup offline") == 1
+    assert "chttr: cleanup unavailable" not in daemon.feedback.notes
+    offline.succeeded()                                        # back online: the next outage is announced again
+    assert daemon.polish_warned is False
+
+
+def test_model_output_gets_the_terminal_rules(daemon, monkeypatch, caplog):
+    monkeypatch.setattr(Dm.P, "backend", lambda cfg: "claude")
+    monkeypatch.setattr(Dm.P, "polish", lambda *a, **k: "Run the whole test suite again.")
+    with caplog.at_level("INFO", logger="chttr.daemon"):
+        assert dictate(daemon, "um run the whole test suite again period") == "Run the whole test suite again"
+    polish_lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("polish (")]
+    assert polish_lines and "test suite" not in polish_lines[0]          # word count, not your words
