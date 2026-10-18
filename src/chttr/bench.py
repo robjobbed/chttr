@@ -5,7 +5,8 @@ For each WAV it measures
 - release: the wait after you let go in the pause after your last word (PAUSE
            seconds after it) with streaming recognition on: the pass that started
            SPECULATE_PAUSE into that pause has had the rest of it to run, so only
-           what it has not finished by then is left
+           what it has not finished by then is left (the same as tail when there
+           is no such pass: no pause before the end, or the open segment is too long)
 - tail:    the same recording without that reuse: the audio after the last
            closed segment, recognized after a quick release 0.2 s after the
            last word (what chttr 1.0 did)
@@ -131,7 +132,7 @@ def run(files: list[Path], cfg: Config, runs: int = 3, cleanup: bool = False) ->
         # between its start (noticed half a poll late, on average) and the release
         spec = speculate_point(levels, threshold, end)
         release = release_point(levels, threshold, after=S.PAUSE)
-        if start < spec <= release:
+        if start < spec <= release and spec - start <= S.SPECULATE_MAX * S.CHUNKS_PER_SECOND:
             head_start = ((release - spec) / S.CHUNKS_PER_SECOND - S.POLL / 2) * 1000
             guess = audio[start * S.CHUNK_FRAMES: spec * S.CHUNK_FRAMES]
             for _ in range(runs):

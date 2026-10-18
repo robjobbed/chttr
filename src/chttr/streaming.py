@@ -10,7 +10,10 @@ Most people let go of the key in the pause after their last word, so that pause
 does the last bit of work too: once SPECULATE_PAUSE seconds have been quiet, the
 open segment is recognized speculatively. If nothing louder than the speech
 threshold comes after it, letting go reuses that pass and the text is ready at
-once; if you keep talking it is simply recognized again.
+once; if you keep talking it is simply recognized again. An open segment only
+grows past SPECULATE_MAX when none of its pauses is long enough to close it; from
+then on it gets no pause passes (letting go mid-word would wait for one that
+long) and is recognized when it closes or at release, as before.
 
 The same thread drives live captions: the closed segments plus a quick pass over
 the last few seconds of the segment being spoken, so a long run of speech costs
@@ -40,6 +43,7 @@ CAPTION_MIN = 0.6               # show captions once this much audio is waiting
 CAPTION_WINDOW_CHUNKS = 300     # a caption pass recognizes at most the last 6 s of the open segment
 SPECULATE_PAUSE = 0.25          # quiet that triggers a speculative pass over the open segment
 SPECULATE_MIN = 0.6             # new audio (with speech in it) needed since the last pass
+SPECULATE_MAX = 6.0             # no pause pass over a longer open segment: letting go mid-word would wait for it
 
 
 class Source(Protocol):
@@ -132,12 +136,19 @@ class Streamer:
         quiet = int(SPECULATE_PAUSE * CHUNKS_PER_SECOND)
         since = self._partial[0] if self._partial else self.done
         return (n - since >= SPECULATE_MIN * CHUNKS_PER_SECOND
+                and n - self.done <= SPECULATE_MAX * CHUNKS_PER_SECOND
                 and not _loud(levels[n - quiet:n], threshold_db)
                 and _loud(levels[since:n - quiet], threshold_db))
 
+    def _audio(self, start: int, end: int) -> np.ndarray | None:
+        """Chunks [start, end), or None when the recorder has already let go of them
+        (it stopped, or started the next recording): this recording is over."""
+        audio = self.source.audio_range(start, end)
+        return audio if len(audio) >= (end - start) * CHUNK_FRAMES else None
+
     def _loop(self) -> None:
         last_caption = last_guess = float("-inf")
-        captioned = -1
+        captioned = -1                      # the end of the last pass of any kind
         while not self._stop.wait(POLL):
             try:
                 if self.source.levels_db is not self._levels:
@@ -149,7 +160,10 @@ class Streamer:
                 if cut is not None and cut > self.done:
                     text = self._covered(levels, threshold, cut)
                     if text is None:
-                        text = self._recognize(self.source.audio_range(self.done, cut))
+                        audio = self._audio(self.done, cut)
+                        if audio is None:
+                            break
+                        text = self._recognize(audio)
                         if self._stop.is_set() and not text:
                             break
                     with self._lock:
@@ -161,8 +175,11 @@ class Streamer:
                     self._caption(self.text)
                     captioned = n
                 elif self._should_speculate(levels, threshold, n):
+                    audio = self._audio(self.done, n)
+                    if audio is None:
+                        break               # never keep a pass over a cut-short recording as the text
                     last_guess = time.monotonic()
-                    text = self._recognize(self.source.audio_range(self.done, n))
+                    text = self._recognize(audio)
                     with self._lock:
                         if self._finished:
                             break
@@ -172,7 +189,7 @@ class Streamer:
                     captioned = n
                 elif (self.on_caption and n != captioned and n - self.done >= CAPTION_MIN * CHUNKS_PER_SECOND
                       and time.monotonic() - max(last_caption, last_guess) >= CAPTION_EVERY
-                      and _loud(levels[self.done:n], threshold)):
+                      and _loud(levels[max(self.done, captioned):n], threshold)):   # said something new
                     last_caption, captioned = time.monotonic(), n
                     start = max(self.done, n - CAPTION_WINDOW_CHUNKS)
                     partial = self._recognize(self.source.audio_range(start, n))

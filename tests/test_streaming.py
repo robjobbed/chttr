@@ -348,3 +348,63 @@ def test_finish_does_not_wait_forever_for_a_stuck_pass(monkeypatch):
     release.set()
     time.sleep(0.05)
     assert streamer.segments == []           # the late pass did not sneak in afterwards
+
+
+def test_a_long_pause_with_captions_on_runs_no_passes_after_the_pause_pass(monkeypatch):
+    monkeypatch.setattr(S, "POLL", 0.005)
+    monkeypatch.setattr(S, "MIN_SPEECH", 4.0)
+    monkeypatch.setattr(S, "CAPTION_EVERY", 0.0)       # captions as often as they may run
+    plan = levels(("speech", 1.0), ("pause", 2.0))
+    source = GrowingSource(plan)
+    rec = Recognizer()
+    captions: list[str] = []
+    streamer = S.Streamer(source, rec, THRESHOLD, on_caption=captions.append).start()
+    while source.chunk_count < len(plan):
+        source.feed(5)
+        time.sleep(0.005)
+    time.sleep(0.05)
+    streamer.abort()
+    speech = 50
+    pause_pass = int(S.SPECULATE_PAUSE * S.CHUNKS_PER_SECOND)
+    after = [i for i, chunks in enumerate(rec.calls) if chunks >= speech + pause_pass]
+    assert len(after) == 1 and after[0] == len(rec.calls) - 1    # the pause pass, and nothing after it
+
+
+class StoppedSource(GrowingSource):
+    """The recorder let go of its chunks (the key was released) between the
+    streamer reading chunk_count and asking for the audio."""
+
+    def audio_range(self, start: int, end: int) -> np.ndarray:
+        return self.audio[:0]
+
+
+@pytest.mark.real_minimum
+def test_a_pass_over_a_recording_that_just_stopped_is_not_kept(monkeypatch):
+    monkeypatch.setattr(S, "POLL", 0.005)
+    plan = levels(("speech", 1.0), ("pause", 0.4))
+    source = StoppedSource(plan)
+    source.feed(len(plan))
+    rec = Recognizer("hello there")
+    streamer = S.Streamer(source, rec, THRESHOLD).start()
+    time.sleep(0.05)
+    assert rec.calls == [] and streamer._partial is None
+    assert rec.finish(streamer, source.audio) == "hello there"
+    assert rec.during_finish == [len(plan)]
+    assert streamer.tail_reused is False
+
+
+def test_no_pause_pass_over_an_open_segment_longer_than_the_limit(monkeypatch):
+    monkeypatch.setattr(S, "POLL", 0.005)
+    monkeypatch.setattr(S, "MIN_SPEECH", 4.0)
+    monkeypatch.setattr(S, "SPECULATE_MAX", 3.0)
+    plan = levels(("speech", 1.0), ("pause", 0.3), ("speech", 1.0), ("pause", 0.3), ("speech", 0.5), ("pause", 0.3))
+    source = GrowingSource(plan)
+    rec = Recognizer()
+    streamer = S.Streamer(source, rec, THRESHOLD).start()
+    for end, passes in ((65, 1), (130, 2)):      # the end of each short pause (too short to close a segment)
+        source.feed(end - source.chunk_count)
+        wait_for(lambda passes=passes: len(rec.calls) == passes)
+    source.feed(len(plan))                       # the third pause comes 3.4 s into the open segment
+    time.sleep(0.05)
+    streamer.abort()
+    assert rec.calls == [65, 130]
