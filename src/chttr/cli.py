@@ -554,7 +554,12 @@ def cmd_meeting_process(args: argparse.Namespace) -> int:
         raise SystemExit(143)
 
     signal.signal(signal.SIGTERM, interrupted)
-    cfg = C.load_config()
+    try:
+        cfg = C.load_config()
+    except (ValueError, OSError) as exc:
+        # the daemon recorded this meeting on the defaults; transcribe it the same way rather than lose it
+        logging.warning("config.toml: %s; processing with the defaults", exc)
+        cfg = C.Config(modes=C._default_modes())
     try:
         md = process(directory, cfg, summary=False if args.no_summary else None)
     except Exception as exc:

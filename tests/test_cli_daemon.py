@@ -128,3 +128,23 @@ def test_a_finished_meeting_is_not_marked_failed_by_a_late_stop(monkeypatch, tmp
     with pytest.raises(SystemExit):
         cli.cmd_meeting_process(argparse.Namespace(meeting=str(directory), no_summary=False, notify=False))
     assert json.loads((directory / "meta.json").read_text(encoding="utf-8"))["status"] == "done"
+
+
+def test_a_meeting_recorded_on_a_broken_config_is_still_processed(monkeypatch, tmp_path):
+    from chttr import meeting
+
+    directory = tmp_path / "m"
+    directory.mkdir()
+    (directory / "meta.json").write_text(json.dumps({"status": "recorded"}), encoding="utf-8")
+    monkeypatch.setattr(signal, "signal", lambda sig, fn: None)
+
+    def broken(*a, **k):
+        raise ValueError("output.mode must be one of type, paste, copy (got 'shout')")
+
+    monkeypatch.setattr(C, "load_config", broken)
+    seen = []
+    monkeypatch.setattr(meeting, "process", lambda directory, cfg, summary=None: seen.append(cfg) or "# Meeting")
+    monkeypatch.setattr(cli, "_after_meeting", lambda directory, cfg: [])
+    code = cli.cmd_meeting_process(argparse.Namespace(meeting=str(directory), no_summary=False, notify=False))
+    assert code == 0
+    assert seen and seen[0].modes                            # processed with the defaults, like the daemon

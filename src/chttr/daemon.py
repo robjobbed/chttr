@@ -148,7 +148,7 @@ class Daemon:
             with self.lock:
                 self.transcriber, self.model_error = transcriber, ""
             log.info("speech model loaded in %.1fs", time.monotonic() - t0)
-        except (FileNotFoundError, RuntimeError, ImportError, OSError) as exc:
+        except Exception as exc:  # noqa: BLE001 - onnxruntime raises plain Exceptions for a corrupt model
             log.error("the speech model could not be loaded: %s", exc)
             self.model_error = str(exc)
             self.feedback.notify("chttr: the speech model is missing", f"{exc}\nRun: chttr setup",
@@ -551,6 +551,7 @@ class Daemon:
             if self.model_ready.is_set():
                 # the model failed to load: maybe it has been downloaded (or the engine fixed) since
                 self.model_ready.clear()
+                self.model_error = ""           # loading again, not missing; _load_model sets it if this fails
                 self.cfg = cfg
                 threading.Thread(target=self._load_model, name="model", daemon=True).start()
                 message += "; loading the speech model"
@@ -565,11 +566,11 @@ class Daemon:
                 self.transcriber = Transcriber(cfg)
                 self.model_error = ""
                 message += f"; {cfg.engine.name} loaded"
-            except (FileNotFoundError, RuntimeError, ImportError, OSError) as exc:
+            except Exception as exc:  # noqa: BLE001 - see _load_model
                 log.error("could not load %s: %s", cfg.engine.name, exc)
                 try:
                     self.transcriber = Transcriber(old)
-                except (FileNotFoundError, RuntimeError, ImportError, OSError) as again:
+                except Exception as again:  # noqa: BLE001
                     self.model_error = str(again)
                     self._refresh_state()
                 return {"ok": False, "state": self.state,
@@ -995,8 +996,8 @@ class Daemon:
     def _recorder_quit(self) -> None:
         """The microphone went away mid-recording (unplugged, PipeWire restarted).
         Whatever was said until then is still typed; then say what happened."""
-        if getattr(self.recorder, "chunk_count", 0) * 0.02 < TAP:      # 20 ms chunks
-            self._cancel()                      # nothing worth transcribing
+        if not self.heard_speech:
+            self._cancel()                      # nothing was said: don't report it as silence
         else:
             self._stop_and_transcribe()
         error = getattr(self.recorder, "error", "")

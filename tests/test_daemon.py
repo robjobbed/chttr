@@ -332,6 +332,34 @@ def test_a_missing_model_is_one_clear_notice_and_no_crash(lazy_daemon):
     assert d.feedback.notes[-1] == "chttr error"
 
 
+def test_a_corrupt_model_is_the_same_clear_notice(lazy_daemon):
+    d = lazy_daemon
+    # what onnxruntime raises for a half-downloaded model: a plain Exception, not a RuntimeError
+    d.Model.error = Exception("[ONNXRuntimeError] : 7 : INVALID_PROTOBUF : Load model failed")
+    d._load_model()
+    assert d.state == Dm.IDLE
+    assert d.handle("status")["model"] == "missing"
+    assert "INVALID_PROTOBUF" in d.model_error
+    assert "chttr: the speech model is missing" in d.feedback.notes
+
+
+def test_a_reload_after_a_failed_model_load_does_not_say_missing_while_it_loads(lazy_daemon, monkeypatch, tmp_path):
+    d = lazy_daemon
+    d.Model.error = FileNotFoundError("no model")
+    d._load_model()
+    monkeypatch.setattr(C, "CONFIG_FILE", tmp_path / "config.toml")
+    d.Model.error = None
+    d.Model.gate.clear()
+    d.handle("reload")
+    assert d.model_error == ""
+    d.feedback.notes.clear()
+    d.handle("start")
+    assert "chttr can't transcribe: speech model missing" not in d.feedback.notes
+    d.handle("cancel")
+    d.Model.gate.set()
+    assert wait_for(lambda: d.handle("status")["model"] == "ready")
+
+
 def test_reload_retries_a_model_that_failed_to_load(lazy_daemon, monkeypatch, tmp_path):
     d = lazy_daemon
     d.Model.error = FileNotFoundError("no model")
@@ -391,10 +419,24 @@ def test_a_microphone_that_goes_away_still_types_what_was_said(daemon):
     daemon.recorder.active = False                               # pw-record quit by itself
     daemon.recorder.error = "stream error: connection lost"
     daemon.recorder.chunk_count = 50                             # one second of audio
+    daemon.heard_speech = True
     daemon._watchdog_tick()
     wait_idle(daemon)
     assert daemon.typed == ["half a sentence"]
     assert "chttr: the microphone went away" in daemon.feedback.notes
+
+
+def test_a_microphone_gone_after_a_silent_pause_is_not_called_silence(daemon):
+    daemon.transcriber.texts = [""]
+    daemon.handle("start")
+    daemon.recorder.active = False
+    daemon.recorder.error = "stream error: connection lost"
+    daemon.recorder.chunk_count = 75                             # 1.5 s, nothing said
+    daemon._watchdog_tick()
+    wait_idle(daemon)
+    assert daemon.typed == []
+    assert daemon.feedback.notes[-1] == "chttr: the microphone went away"
+    assert not any("No speech" in n for n in daemon.feedback.notes)
 
 
 def test_a_microphone_gone_before_a_word_is_not_called_silence(daemon):
