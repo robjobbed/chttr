@@ -57,12 +57,17 @@ class QuietFeedback:
     def __init__(self, cfg, runtime):
         self.cfg = cfg
         self.notes: list[str] = []
+        self.offers: list[dict] = []
 
     def play(self, name):
         pass
 
     def notify(self, title, body="", **kw):
         self.notes.append(title)
+
+    def offer(self, title, body, primary, others=(), **kw):
+        self.offers.append({"title": title, "body": body, "primary": primary, "others": list(others), **kw})
+        return None
 
 
 @pytest.fixture
@@ -226,25 +231,17 @@ def test_names_on_screen_fix_sound_alikes(daemon, monkeypatch):
     assert daemon.typed == ["Priyanka will send it"]
 
 
-def test_learn_from_edits_offers_and_learns(daemon, monkeypatch, tmp_path):
-    from chttr import dictionary
-
-    monkeypatch.setattr(dictionary, "DICTIONARY_FILE", tmp_path / "d.toml")
-    monkeypatch.setattr(Dm.Dictionary.load.__func__, "__defaults__", (tmp_path / "d.toml",))
-    monkeypatch.setattr(Dm.Dictionary.save, "__defaults__", (tmp_path / "d.toml",))
+def test_learn_from_edits_offers_and_learns(daemon, monkeypatch):
     field = Dm.CX.Field("Mail", "Please send the contract to Sohrab by Friday.", "")
     monkeypatch.setattr(Dm.CX, "read_field", lambda *a, **k: field)
-
-    class Out:
-        stdout = "learn\n"
-
-    asked = []
-    monkeypatch.setattr(Dm.subprocess, "run", lambda cmd, **k: asked.append(cmd) or Out())
     daemon._learn_from_edits("Please send the contract to Sorov by Friday.")
-    assert asked and "Sohrab" in asked[0][-2]
-    assert dictionary.Dictionary.load(tmp_path / "d.toml").replacements == {"sorov": "Sohrab"}
+    [offer] = daemon.feedback.offers
+    assert offer["title"] == "Learn \u201cSohrab\u201d?"
+    label, argv = offer["primary"]
+    assert label == "Learn it"
+    assert argv[-5:] == ["learn", "Sohrab", "--heard", "Sorov", "--notify"]   # the click runs `chttr learn`
     daemon._learn_from_edits("Please send the contract to Sorov by Friday.")
-    assert len(asked) == 1                                      # offered once per session
+    assert len(daemon.feedback.offers) == 1                     # offered once per session
 
 
 def test_screen_context_backs_off_when_atspi_never_answers(daemon, monkeypatch):
@@ -256,3 +253,87 @@ def test_screen_context_backs_off_when_atspi_never_answers(daemon, monkeypatch):
         daemon.handle("release")
         wait_idle(daemon)
     assert len(calls) == Dm.ATSPI_GIVE_UP
+
+
+# ---- "Record this call?" notifications -------------------------------------
+
+class FakeSession:
+    def __init__(self, cfg, code, title, source):
+        self.code, self.title, self.source = code, title, source
+        self.dir = "meeting-dir"
+        self.recorder = type("R", (), {"started": 0.0})()
+        self.elapsed = 0.0
+
+    def start(self):
+        pass
+
+    def discard(self):
+        pass
+
+
+@pytest.fixture
+def fake_sessions(daemon, monkeypatch, tmp_path):
+    made: list[FakeSession] = []
+    monkeypatch.setattr(Dm, "Session", lambda *a: made.append(FakeSession(*a)) or made[-1])
+    monkeypatch.setattr(C, "MEETING_STATE_FILE", tmp_path / "meeting.json")
+    return made
+
+
+def test_ask_to_record_app_offers_a_click_that_starts_the_meeting(daemon, monkeypatch):
+    from chttr import gcal
+
+    monkeypatch.setattr(gcal, "read_urls", lambda *a: [])
+    monkeypatch.setattr(gcal, "find_event", lambda *a: None)
+    monkeypatch.setattr(daemon, "_calendar_title", lambda: "")
+    daemon._ask_to_record_app("Zoom")
+    [offer] = daemon.feedback.offers
+    assert offer["title"] == "Record \u201cthis Zoom call\u201d?"
+    label, argv = offer["primary"]
+    assert label == "Record"
+    assert argv[-6:] == ["meeting", "start", "--title", "Zoom call", "--source", "app"]
+    assert offer["glyph"]
+
+
+def test_ask_to_record_meet_call_names_the_call(daemon, monkeypatch):
+    from chttr import gcal
+
+    monkeypatch.setattr(gcal, "read_urls", lambda *a: [])
+    monkeypatch.setattr(gcal, "find_event", lambda *a: None)
+    daemon._ask_to_record("abc-defg-hij", "Weekly sync")
+    [offer] = daemon.feedback.offers
+    assert offer["title"] == "Record \u201cWeekly sync\u201d?"
+    assert offer["primary"][1][-4:] == ["meeting", "start", "--call", "abc-defg-hij"]
+
+
+def test_meeting_start_takes_title_and_source_as_json(daemon, fake_sessions):
+    reply = daemon.handle('meeting start {"title": "Zoom call", "source": "app"}')
+    assert reply["ok"], reply
+    [session] = fake_sessions
+    assert (session.title, session.source) == ("Zoom call", "app")   # case kept
+    assert daemon.meeting is session
+
+
+def test_meeting_start_alone_still_records_by_hand(daemon, fake_sessions):
+    assert daemon.handle("meeting START")["ok"]
+    [session] = fake_sessions
+    assert (session.title, session.source) == ("", "manual")
+
+
+def test_meeting_start_rejects_bad_options(daemon, fake_sessions):
+    reply = daemon.handle("meeting start {not json")
+    assert not reply["ok"] and "bad meeting start options" in reply["error"]
+    assert not fake_sessions
+
+
+def test_record_click_after_the_meet_call_ended_records_nothing(daemon, fake_sessions):
+    reply = daemon.handle('meeting start {"call": "abc-defg-hij"}')
+    assert not reply["ok"]
+    assert not fake_sessions
+    assert "That call has ended" in daemon.feedback.notes
+
+
+def test_record_click_during_the_meet_call_records_it(daemon, fake_sessions):
+    daemon.call = {"code": "abc-defg-hij", "title": "Weekly sync", "seen": time.time()}
+    assert daemon.handle('meeting start {"call": "abc-defg-hij"}')["ok"]
+    [session] = fake_sessions
+    assert (session.code, session.title, session.source) == ("abc-defg-hij", "Weekly sync", "extension")
