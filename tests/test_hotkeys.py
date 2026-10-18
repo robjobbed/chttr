@@ -151,3 +151,77 @@ def test_compositor_bindings_anywhere_prevent_double_presses(monkeypatch):
     monkeypatch.setattr(H, "readable_keyboards", lambda: ["/dev/input/event3"])
     # even if detection misses Hyprland, its chttr bindings mean: don't also read the keyboard
     assert H.resolve("auto", "wlroots") == "compositor"
+
+
+# ---- effective_bindings: the keys that are really bound ------------------------------------
+
+DEFAULT_KEYS = {"dictate": "Insert", "command": "Alt+Insert", "hands_free": "Super+Insert",
+                "history": "Super+Shift+Insert", "meeting": "Super+Alt+Insert"}
+
+
+def _desk(compositor):
+    from chttr.desktop import Desktop
+
+    return Desktop("wayland", compositor)
+
+
+def _cfg(backend="compositor"):
+    from chttr import config as C
+
+    cfg = C.Config()
+    cfg.hotkeys.backend = backend
+    return cfg
+
+
+@pytest.mark.parametrize(("rel", "block", "compositor"), [
+    (".config/hypr/bindings.lua", "BINDINGS_LUA", "hyprland"),
+    (".config/hypr/bindings.conf", "BINDINGS_CONF", "hyprland"),
+    (".config/sway/config.d/chttr.conf", "SWAY_BINDINGS", "sway"),
+])
+def test_effective_bindings_read_what_setup_writes(tmp_path, rel, block, compositor):
+    from chttr import install
+
+    path = tmp_path / rel
+    path.parent.mkdir(parents=True)
+    path.write_text(getattr(install, block).format(exe="/home/me/.local/bin/chttr"))
+    assert H.effective_bindings(_cfg(), _desk(compositor), home=tmp_path) == DEFAULT_KEYS
+
+
+def test_effective_bindings_follow_keys_the_user_changed(tmp_path):
+    (tmp_path / ".config/hypr").mkdir(parents=True)
+    (tmp_path / ".config/hypr/bindings.lua").write_text(
+        'o.bind("F9", "chttr: push-to-talk", "chttr start")\n'
+        'o.bind("F9", "chttr: push-to-talk (release)", "chttr release", { release = true })\n'
+        "-- o.bind(\"F8\", \"old\", \"chttr command\")\n"
+        "o.bind('CTRL + SHIFT + space', 'chttr: command', 'uwsm app -- chttr command')\n")
+    (tmp_path / ".config/hypr/bindings.conf").write_text(
+        "$mainMod = SUPER\nbind = $mainMod, F10, exec, ~/.local/bin/chttr meeting  toggle\n"
+        "bindr = , F9, exec, chttr release\n")
+    got = H.effective_bindings(_cfg(), _desk("hyprland"), home=tmp_path)
+    assert got == {"dictate": "F9", "command": "Ctrl+Shift+Space", "meeting": "Super+F10"}
+
+
+def test_effective_bindings_on_sway_main_config(tmp_path):
+    (tmp_path / ".config/sway").mkdir(parents=True)
+    (tmp_path / ".config/sway/config").write_text(
+        "bindsym --to-code Mod4+Mod1+Pause exec chttr toggle\nbindsym --release Pause exec chttr release\n"
+        "bindsym Pause exec chttr start\n")
+    got = H.effective_bindings(_cfg(), _desk("sway"), home=tmp_path)
+    assert got == {"dictate": "Pause", "hands_free": "Super+Alt+Pause"}
+
+
+def test_effective_bindings_fall_back_to_the_config(tmp_path):
+    cfg = _cfg("portal")
+    cfg.hotkeys.meeting = ""
+    expected = {k: v for k, v in DEFAULT_KEYS.items() if k != "meeting"}
+    assert H.effective_bindings(cfg, _desk("gnome"), home=tmp_path) == expected
+    assert H.effective_bindings(_cfg("evdev"), _desk("niri"), home=tmp_path) == DEFAULT_KEYS
+    # the compositor backend with no readable bindings: the configured keys are the best guess
+    assert H.effective_bindings(_cfg(), _desk("hyprland"), home=tmp_path) == DEFAULT_KEYS
+    assert H.effective_bindings(_cfg("none"), _desk("niri"), home=tmp_path) == {}
+
+
+def test_key_labels_are_normalised():
+    assert H.key_label(["Mod1", "Insert"]) == "Alt+Insert"
+    assert H.key_label(["SUPER", "SHIFT", "INSERT"]) == "Super+Shift+Insert"
+    assert H.key_label(["mod4", "f12"]) == "Super+F12"
