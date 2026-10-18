@@ -25,6 +25,17 @@ def test_tools_search_read_and_notes(lib):  # noqa: F811
     assert json.loads(t["list_action_items"](owner="ali"))[0]["due"] == "Friday"
 
 
+def test_read_transcript_reads_mm_ss_as_minutes_and_seconds(lib, monkeypatch):  # noqa: F811
+    seen = []
+    monkeypatch.setattr(A.L, "context_around", lambda mid, at, seconds: seen.append(at) or [])
+    t = tools()
+    t["read_transcript"]("2026-10-01-140000", around="12:40")
+    t["read_transcript"]("2026-10-01-140000", around="01:02:03")
+    t["read_transcript"]("2026-10-01-140000", around="40")
+    assert seen == [12 * 60 + 40, 3723, 40]
+    assert "error" in json.loads(t["read_transcript"]("2026-10-01-140000", around="soon"))
+
+
 def rpc(lines: list[dict]) -> list[dict]:
     out = io.StringIO()
     M.run(io.StringIO("\n".join(json.dumps(x) for x in lines) + "\nnot json\n"), out)

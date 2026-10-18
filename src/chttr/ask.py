@@ -63,7 +63,10 @@ def tool_functions(on_call=None):
         note("read_transcript", meeting_id=meeting_id, around=around)
         seconds = max(10, min(int(seconds), 900))
         if around:
-            h, m, s = (int(x) for x in ([*around.split(":")] + ["0", "0"])[:3])
+            try:    # "12:40" is 12 min 40 s, "40" is 40 s
+                h, m, s = (int(float(x)) for x in (["0", "0", *around.strip().split(":")])[-3:])
+            except ValueError:
+                return json.dumps({"error": f"around must be hh:mm:ss, not {around!r}"})
             lines = L.context_around(meeting_id, h * 3600 + m * 60 + s, seconds)
         else:
             m_ = L.meeting(meeting_id)
