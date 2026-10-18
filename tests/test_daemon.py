@@ -1339,7 +1339,7 @@ def test_ask_to_record_app_offers_a_click_that_starts_the_meeting(daemon, monkey
     from chttr import gcal
 
     monkeypatch.setattr(gcal, "read_urls", lambda *a: [])
-    monkeypatch.setattr(gcal, "find_event", lambda *a: None)
+    monkeypatch.setattr(gcal, "find_event", lambda *a, **k: None)
     monkeypatch.setattr(daemon, "_calendar_title", lambda: "")
     daemon._ask_to_record_app("Zoom")
     [offer] = daemon.feedback.offers
@@ -1354,7 +1354,7 @@ def test_ask_to_record_meet_call_names_the_call(daemon, monkeypatch):
     from chttr import gcal
 
     monkeypatch.setattr(gcal, "read_urls", lambda *a: [])
-    monkeypatch.setattr(gcal, "find_event", lambda *a: None)
+    monkeypatch.setattr(gcal, "find_event", lambda *a, **k: None)
     daemon._ask_to_record("abc-defg-hij", "Weekly sync")
     [offer] = daemon.feedback.offers
     assert offer["title"] == "Record \u201cWeekly sync\u201d?"
@@ -1489,3 +1489,14 @@ def test_meet_join_adopts_only_a_hand_started_meeting(daemon):
     daemon.handle('meet {"type":"joined","code":"abc-defg-hij","title":"Standup"}')
     assert manual.code == "abc-defg-hij" and manual.title == "Standup" and saved
     daemon.meeting = None
+
+
+def test_calendar_lookups_know_your_meeting_email(daemon, monkeypatch):
+    from chttr import gcal
+
+    asked = []
+    monkeypatch.setattr(gcal, "read_urls", lambda *a: ["https://x/basic.ics"])
+    monkeypatch.setattr(gcal, "find_event", lambda urls, code="", when=None, me_email="": asked.append(me_email))
+    daemon.cfg.meeting.email = "rob@company.com"
+    daemon._ask_to_record("abc-defg-hij", "Weekly sync")
+    assert asked == ["rob@company.com"]

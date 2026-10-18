@@ -775,7 +775,7 @@ def cmd_meeting_calendar(args: argparse.Namespace) -> int:
         print("no calendar yet. In Google Calendar: Settings > (your calendar) > Integrate calendar >\n"
               "\"Secret address in iCal format\", then: chttr meeting calendar 'https://calendar.google.com/…/basic.ics'")
         return 1
-    events = gcal.upcoming(urls, hours=48)
+    events = gcal.upcoming(urls, hours=48, me_email=cfg.meeting.email)
     print(f"{len(urls)} calendar(s); next 48 h:")
     for e in events[:15]:
         who = ", ".join(a.name or a.email for a in e.attendees if not a.is_me)

@@ -221,7 +221,7 @@ detect_calls = true
 room_speakers = true
 # Keep the audio (stereo Opus: you left, them right) next to the notes
 keep_audio = false
-# Notes (summary, sections, action items) with the [polish] Claude model (needs a key)
+# Notes (summary, sections, action items) with the [polish] model (Claude or Ollama); without either, on-device notes
 summary = true
 summary_effort = "medium"
 # Note style: "auto" (Claude picks from the meeting), or a style id such as

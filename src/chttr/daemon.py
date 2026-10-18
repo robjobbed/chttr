@@ -649,7 +649,8 @@ class Daemon:
         from . import gcal
 
         try:
-            event = gcal.find_event(gcal.read_urls(self.cfg.meeting.calendar_file), "")
+            event = gcal.find_event(gcal.read_urls(self.cfg.meeting.calendar_file), "",
+                                     me_email=self.cfg.meeting.email)
             return event.title if event else ""
         except Exception:  # noqa: BLE001
             return ""
@@ -675,7 +676,8 @@ class Daemon:
 
         title, body = self._calendar_title(), "chttr will save a transcript and notes."
         try:
-            event = gcal.find_event(gcal.read_urls(self.cfg.meeting.calendar_file), "")
+            event = gcal.find_event(gcal.read_urls(self.cfg.meeting.calendar_file), "",
+                                     me_email=self.cfg.meeting.email)
             people = [a.name or a.email for a in event.attendees if not a.is_me] if event else []
             if people:
                 body = ", ".join(people[:5]) + (f" +{len(people) - 5}" if len(people) > 5 else "")
@@ -693,7 +695,8 @@ class Daemon:
 
         label, body = title or "this Meet call", "chttr will save a transcript with speaker names."
         try:
-            event = gcal.find_event(gcal.read_urls(self.cfg.meeting.calendar_file), code)
+            event = gcal.find_event(gcal.read_urls(self.cfg.meeting.calendar_file), code,
+                                     me_email=self.cfg.meeting.email)
             if event:
                 label = event.title
                 people = [a.name or a.email for a in event.attendees if not a.is_me]
