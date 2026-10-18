@@ -4,29 +4,39 @@ Used when no Claude key or Ollama is set up, while the model is unreachable, and
 as a quick pass before the model sees a dictation. Rules, in order:
 
     a) spoken formatting becomes symbols (table below)
-    b) "scratch that" removes the phrase before it (back to , . ! ? ; or a new line);
-       "delete that" / "strike that" only when they stand on their own
+    b) "scratch that" removes the phrase before it (back to , . ! ? ; or a new line)
+       when a pause, the start or the end sets it off on at least one side;
+       "delete that" / "strike that" only when set off on both sides. Never after
+       "I", "you", "to", "please", "don't", ...: "Did you delete that?" is a question
     c) fillers go: um, uh, erm, hmm anywhere; "like", "you know", "I mean" only
        when set off by commas. Stutters ("the the") collapse for words of up to
        four letters ("had had" and "that that" stay)
-    d) spacing and capitals: no space before , ; ! ? (or . : outside code), one space
-       between words, a capital at the start, after . ! ? and on each new line, "i" -> "I";
-       a sentence of three words or more with no closing punctuation gets a period
+    d) spacing and capitals: no space before , ; (or . : ! ? outside code, where
+       "if ! grep" and "sudo !!" mean something), one space between words, a capital
+       at the start, after . ! ? and on each new line ("user_id" and "x86" stay as
+       spoken), "i" -> "I"; a sentence of three words or more with no closing
+       punctuation gets a period
     e) per app: code (terminals, editors) keeps your capitals, gets no added period
-       and loses one trailing period; chat folds new lines into spaces unless you
-       dictated a list
+       and loses one trailing period; chat adds no period and, when the app has no
+       safe way to type a line break (fold_newlines), folds new lines into spaces
+       unless you dictated a list
 
 Spoken formatting (case-insensitive; never after "a", "the", "my", ...):
 
-    comma, colon, semicolon         , : ;       anywhere ("the Oxford comma" stays)
+    comma, colon, semicolon         , : ;       after a word ("the Oxford comma" and
+                                                "Colon cancer ..." stay)
     period, full stop               .           only before the end, punctuation, a
     question mark                   ?           capital or another command, so "a period
-    exclamation mark / point        !           of time" and "the trial period" stay
+    exclamation mark / point        !           of time" and "the trial period" stay;
+                                                never "period" after a time unit, a
+                                                hyphenated word or an adjective ("a 14 day
+                                                period", "a two-year period", "a difficult
+                                                period"); "at 5 period" is a full stop
     dash                            " - "       between words, not in code ("dash m"
                                                 is a flag: dev mode's business)
     open quote, close quote         "
-    new line, new paragraph         \\n, \\n\\n
-    bullet point                    \\n-
+    new line, new paragraph         \\n, \\n\\n    not "a brand new line of shoes"
+    bullet point                    \\n-          not "the next bullet point"
 
 Self-corrections ("Tuesday, no, Friday") are left to the model: deciding what
 "no" takes back needs to understand the sentence.
@@ -98,13 +108,39 @@ _COMPOUNDS = {
         "accounting", "fiscal"}),
     "comma": frozenset({"oxford", "serial", "inverted"}),
     "dash": frozenset({"em", "en"}),
+    "new line": frozenset({"brand", "product", "whole", "entire", "clothing", "fashion", "production"}),
+    "bullet point": frozenset({
+        "next", "first", "last", "second", "third", "fourth", "fifth", "final", "main", "key", "top",
+        "brand", "product", "whole", "one", "two", "three", "each", "other", "previous"}),
 }
+_COMPOUNDS["newline"] = _COMPOUNDS["new line"]
+# "a difficult period", "a two-year period", "a 14 day period": the noun, at the end of
+# a sentence where the recognizer has put its own stop
+_PERIOD_AFTER = frozenset({
+    "day", "days", "week", "weeks", "month", "months", "year", "years", "quarter", "quarters", "hour",
+    "hours", "minute", "minutes", "decade", "season", "term", "semester", "night", "weekend",
+    "short", "long", "same", "given", "whole", "entire", "brief", "difficult", "strong", "weak", "busy",
+    "quiet", "extended", "prolonged", "lengthy", "hard", "tough", "rough",
+    "slow", "critical", "initial", "early", "late", "recent", "current", "previous", "next", "last",
+    "certain", "specific", "limited", "set", "fixed", "transitional", "peak", "summer", "winter",
+    "spring", "autumn", "historical", "medieval", "victorian", "postwar", "creative",
+    "productive", "stressful", "challenging", "formative", "comment", "consultation", "lock", "tax"})
 _PUNCT = ",.;:!?"
 
 
 def _prev_word(before: str) -> str:
     m = re.search(r"([A-Za-z'-]+)[ \t,]*$", before)
     return m.group(1).lower() if m else ""
+
+
+def _a_noun_period(before: str) -> bool:
+    """"a difficult period", "a two-year period", "a 14 day period": not a full stop.
+    A bare number is not enough: "call me at 5 period" is a full stop."""
+    token = before.rstrip(" \t,").rsplit(None, 1)[-1:]
+    if not token:
+        return False
+    word = token[0].lower()
+    return "-" in word.strip("-") or word in _PERIOD_AFTER
 
 
 def _clause_ends(after: str) -> bool:
@@ -122,8 +158,14 @@ def _convert(text: str, m: re.Match, code: bool) -> tuple[str, str] | None:
     prev = _prev_word(before)
     if prev in _DETERMINERS or prev in _COMPOUNDS.get(word, ()):
         return None
+    if kind in ("loose", "strict") and not before.strip():
+        return None                                 # nothing to punctuate: "Colon cancer ..."
     if kind == "strict" and not _clause_ends(after):
         return None
+    if word == "period" and _a_noun_period(before):
+        return None
+    if word in ("new line", "newline") and re.match(r"[ \t]+of\b", after, re.IGNORECASE):
+        return None                                 # "a new line of products"
     b, a = before.rstrip(" \t"), after.lstrip(" \t")
     if kind in ("loose", "strict"):
         b = b.rstrip(_PUNCT)                        # the recognizer's own pause or stop is replaced
@@ -159,18 +201,34 @@ def spoken_formatting(text: str, code: bool = False) -> str:
 
 _SCRATCH_RE = re.compile(r"(?<![\w'-])(scratch that|delete that|strike that)(?![\w'-])", re.IGNORECASE)
 _BOUNDARY_RE = re.compile(r"[,.;!?](?=\s)|\n")
+# "Did you delete that?", "I'll scratch that off", "I had to delete that": the words
+# are part of the sentence when what comes right before them can't stand alone.
+_SCRATCH_SUBJECTS = frozenset({
+    "i", "i'll", "i'd", "i've", "you", "you'll", "you'd", "we", "we'll", "we'd", "they", "they'll", "to",
+    "can", "could", "will", "would", "should", "must", "might", "may", "shall", "please", "don't", "didn't",
+    "won't", "wouldn't", "can't", "shouldn't", "do", "did", "does", "let's", "just", "not", "never", "gonna",
+    "wanna", "who", "why", "how"})
+
+
+def _is_command(before: str, after: str, phrase: str) -> bool:
+    """Whether "scratch that" / "delete that" stands on its own, or is in a sentence."""
+    stripped = before.rstrip(" \t")
+    prev, nxt = stripped[-1:], after.lstrip(" \t")[:1]
+    left, right = prev in ("", *_PUNCT, "\n"), nxt in ("", *_PUNCT, "\n")
+    if not left and _prev_word(stripped) in _SCRATCH_SUBJECTS:
+        return False
+    if phrase.startswith("scratch"):
+        return left or right            # "..., scratch that okay" / "Send it Tuesday scratch that."
+    return left and right               # "Send it Tuesday. Delete that." but not "Did you delete that?"
 
 
 def scratch_that(text: str) -> str:
     pos = 0
     while m := _SCRATCH_RE.search(text, pos):
         before, after = text[:m.start()], text[m.end():]
-        if not m.group(1).lower().startswith("scratch"):
-            # "delete that file" is a sentence; "..., delete that." is a command
-            prev, nxt = before.rstrip(" \t")[-1:], after.lstrip(" \t")[:1]
-            if prev not in ("", *_PUNCT, "\n") and nxt not in ("", *_PUNCT, "\n"):
-                pos = m.end()
-                continue
+        if not _is_command(before, after, m.group(1).lower()):
+            pos = m.end()
+            continue
         kept = before.rstrip().rstrip(_PUNCT).rstrip()
         cut = [b.end() for b in _BOUNDARY_RE.finditer(kept)]
         kept = kept[:cut[-1]] if cut else ""
@@ -220,7 +278,8 @@ _LONE_I_RE = re.compile(r"(?<![\w'-])i(?=(?:'(?:m|d|ll|ve|s|re))?(?![\w'-])(?!\.
 def _capitalize(text: str) -> str:
     def up(m: re.Match) -> str:
         word, tail = m.group(2), text[m.end():]
-        if any(c.isupper() for c in word) or re.match(r"[./:@_\\-]\w", tail):   # iPhone, example.com
+        if any(c.isupper() or c.isdigit() or c == "_" for c in word) or re.match(r"[./:@_\\-]\w", tail):
+            # iPhone, user_id, x86, example.com
             return m.group(0)
         prev = (text[:m.start()] + m.group(1)).split()
         if prev and m.group(1).strip() and (prev[-1].lower() in _ABBREVIATIONS or prev[-1].endswith("...")):
@@ -235,7 +294,8 @@ def spacing(text: str, code: bool = False) -> str:
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r" *\n *", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
-    text = re.sub(r" +([,;!?])" if code else r" +([,;!?.:])(?!\w)", r"\1", text)
+    # in code only before , and ; ("if ! grep", "sudo !!" and "cd ." mean something)
+    text = re.sub(r" +([,;])" if code else r" +([,;!?.:])(?!\w)", r"\1", text)
     text = re.sub(r",+(?=[.!?;:])", "", text)
     text = re.sub(r",{2,}", ",", text)
     return re.sub(r"^[\s,;]+", "", text).rstrip()
@@ -251,11 +311,13 @@ def _closes_sentence(text: str) -> str:
 
 # ---- e) per app ------------------------------------------------------------------
 
-def for_app(text: str, code: bool = False, chat: bool = False) -> str:
-    """The rules that depend on where the text goes: also the safety net after the model."""
+def for_app(text: str, code: bool = False, chat: bool = False, fold_newlines: bool | None = None) -> str:
+    """The rules that depend on where the text goes: also the safety net after the model.
+    `fold_newlines` (default: `chat`) is for apps where typing a line break would send
+    the message; leave it off when the app's line breaks are typed as Shift+Enter."""
     if code and re.search(r"[\w)\"']\.$", text) and not text.endswith(".."):
         text = text[:-1]
-    if chat and not re.search(r"(^|\n)- ", text):
+    if (chat if fold_newlines is None else fold_newlines) and not re.search(r"(^|\n)- ", text):
         text = re.sub(r"(?<=[\w)])\s*\n\s*", ". ", text)     # a line break becomes a sentence break
         text = re.sub(r"\s*\n\s*", " ", text)
     return text
@@ -263,7 +325,8 @@ def for_app(text: str, code: bool = False, chat: bool = False) -> str:
 
 # ---- public ------------------------------------------------------------------------
 
-def tidy(text: str, level: str = "medium", *, code: bool = False, chat: bool = False) -> str:
+def tidy(text: str, level: str = "medium", *, code: bool = False, chat: bool = False,
+         fold_newlines: bool | None = None) -> str:
     """Clean a raw transcript with local rules only (see the module docstring)."""
     if level == "none" or not text:
         return text
@@ -273,7 +336,7 @@ def tidy(text: str, level: str = "medium", *, code: bool = False, chat: bool = F
     text = spacing(fillers(text), code)
     if not re.search(r"\w", text):
         return ""
-    text = for_app(text, code, chat)
+    text = for_app(text, code, chat, fold_newlines)
     if not code:
         text = _capitalize(text)
         if not chat:

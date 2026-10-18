@@ -637,9 +637,9 @@ class Daemon:
     def _wait_turn(self, seq: int) -> None:
         """Block until every earlier dictation has been delivered (or given up)."""
         with self.delivery:
-            # an earlier dictation is at most its cleanup budget away (twice that on Ollama)
+            # an earlier dictation may still be cleaning up (twice the budget on Ollama) or typing
             self.delivery.wait_for(lambda: self.next_delivery >= seq,
-                                   timeout=self.cfg.polish.cleanup_timeout_seconds * 3 + 10)
+                                   timeout=max(60, 2 * (self.cfg.polish.cleanup_timeout_seconds + 10)))
 
     def _done_turn(self, seq: int) -> None:
         with self.delivery:
@@ -794,17 +794,19 @@ class Daemon:
                 keep: list[str] | None = None, names: list[str] | None = None, screen_text: str = "") -> str:
         level = self.cfg.polish.level
         code, chat = bool(mode and mode.is_code), bool(mode and mode.name == "chat")
+        # Line breaks are folded only where typing one would send the message.
+        fold = chat and getattr(mode, "newline", "enter") != "shift+enter"
         if (mode and not mode.polish) or level == "none":
             return text
         # Fillers, stutters, spacing and the terminal's trailing period go first, so
         # "um git status" takes the quick path.
-        text = tidy.tidy(text, "light", code=code, chat=chat)
+        text = tidy.tidy(text, "light", code=code, chat=chat, fold_newlines=fold)
         if P.quick_path(text, self.cfg.polish.quick_max_words):
             log.info("short and clean; typed without a model round trip")
             return text
         which = P.backend(self.cfg.polish)
         if which == "none":
-            out = tidy.tidy(text, level, code=code, chat=chat)
+            out = tidy.tidy(text, level, code=code, chat=chat, fold_newlines=fold)
             self._hint_cleanup_off(text)
             return out
         try:
@@ -812,7 +814,8 @@ class Daemon:
             vocabulary = dictionary.vocabulary + (names or [] if self.cfg.polish.screen_context in ("names", "full") else [])
             out = P.polish(text, self.cfg.polish, app, title, vocabulary, style=mode.style if mode else "",
                            keep=list(dictionary.snippets) + (keep or []), screen_text=screen_text)
-            out = tidy.for_app(out, code=code, chat=chat)     # a stray trailing period in a terminal
+            out = tidy.for_app(out, code=code, chat=chat, fold_newlines=fold)   # a stray trailing period in a terminal
+            self.polish_warned = False                         # it works: the next failure is news
             log.info("polish (%s) %.2fs: %d words", mode.name if mode else "default", time.monotonic() - t1,
                      len(out.split()))
             log.debug("polished: %r", out)
@@ -826,9 +829,10 @@ class Daemon:
                                          f"{'Claude' if which == 'claude' else 'Ollama'} answers again.",
                                          urgency="normal", timeout_ms=8000)
                 else:
-                    self.feedback.notify("chttr: cleanup unavailable", f"{type(exc).__name__}: {str(exc)[:160]}",
+                    why = str(exc) if isinstance(exc, P.PolishUnavailable) else f"{type(exc).__name__}: {exc}"
+                    self.feedback.notify("chttr: cleanup unavailable", why[:160],
                                          urgency="normal", timeout_ms=8000)
-            return tidy.tidy(text, level, code=code, chat=chat)
+            return tidy.tidy(text, level, code=code, chat=chat, fold_newlines=fold)
 
     def _hint_cleanup_off(self, text: str) -> None:
         """Once per install: say that cleanup runs locally and how to get Claude's

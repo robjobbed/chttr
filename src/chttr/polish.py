@@ -89,13 +89,19 @@ class PolishUnavailable(RuntimeError):
 class Breaker:
     """After a connection failure, skip the model for `cooldown` seconds instead of
     making every dictation wait for the same timeout. After the cooldown the next
-    request is a trial; `probe(fn)` also checks in the background, so the first
-    dictation after the network comes back is cleaned by the model again."""
+    request is a trial. `probe(fn)` also checks in the background; when the backend
+    answers, the next request is a trial at once, so the first dictation after the
+    network comes back is cleaned by the model again.
+
+    Only a real answer closes the breaker (and calls `on_recover`): during an
+    overload the API answers a probe while completions keep failing, and closing on
+    the probe would announce a new outage every cooldown."""
 
     def __init__(self, cooldown: float = 30.0) -> None:
         self.cooldown = cooldown
         self.on_recover: Callable[[], None] | None = None
         self._opened_at: float | None = None
+        self._ready = False                  # the probe got an answer: let the next request try
         self._probing = False
         self._lock = threading.Lock()
 
@@ -104,46 +110,56 @@ class Breaker:
         return self._opened_at is not None
 
     def allow(self) -> bool:
+        """True when a request may go. While open, one trial goes per cooldown (or
+        right after a probe answered); the others are turned away until it is back."""
         with self._lock:
-            return self._opened_at is None or time.monotonic() - self._opened_at >= self.cooldown
+            if self._opened_at is None:
+                return True
+            if self._ready or time.monotonic() - self._opened_at >= self.cooldown:
+                self._ready, self._opened_at = False, time.monotonic()
+                return True
+            return False
 
     def failed(self, exc: BaseException | None = None) -> None:
         with self._lock:
-            was_open, self._opened_at = self.open, time.monotonic()
+            was_open, self._opened_at, self._ready = self.open, time.monotonic(), False
         if not was_open:
             log.warning("cleanup unreachable (%s); cleaning up locally for %.0f s", exc, self.cooldown)
 
     def succeeded(self) -> None:
         with self._lock:
-            was_open, self._opened_at = self.open, None
+            was_open, self._opened_at, self._ready = self.open, None, False
         if was_open:
             log.info("cleanup reachable again")
             if self.on_recover:
                 self.on_recover()
 
     def probe(self, fn: Callable[[], object]) -> None:
-        """While open, call `fn` every cooldown in a daemon thread; success closes the breaker."""
+        """While open, call `fn` every cooldown in a daemon thread. When it answers, the
+        next request is let through as a trial (the breaker stays open until it works)."""
         with self._lock:
             if self._probing or self._opened_at is None:
                 return
             self._probing = True
 
         def run() -> None:
-            try:
-                while self.open:
-                    time.sleep(self.cooldown)
-                    if not self.open:
-                        break
-                    try:
-                        fn()
-                    except Exception as exc:  # noqa: BLE001 - any answer at all means it is reachable
-                        if is_outage(exc):
-                            self.failed(exc)
-                            continue
-                    self.succeeded()
-            finally:
+            while True:
+                time.sleep(self.cooldown)
                 with self._lock:
+                    if self._opened_at is None or self._ready:
+                        self._probing = False
+                        return
+                try:
+                    fn()
+                except Exception as exc:  # noqa: BLE001 - any answer at all means it is reachable
+                    if is_outage(exc):
+                        self.failed(exc)
+                        continue
+                with self._lock:
+                    self._ready = self._opened_at is not None
                     self._probing = False
+                log.info("cleanup answers again; the next dictation tries it")
+                return
 
         threading.Thread(target=run, name="chttr-cleanup-probe", daemon=True).start()
 
@@ -245,6 +261,11 @@ def claude_request(model: str, effort: str, system: str, user: str) -> dict:
     return params
 
 
+def _is_timeout(exc: BaseException) -> bool:
+    anthropic = sys.modules.get("anthropic")
+    return isinstance(exc, TimeoutError) or bool(anthropic and isinstance(exc, anthropic.APITimeoutError))
+
+
 def _budget(cfg: PolishCfg, user: str) -> float:
     """How long a dictation waits for the model: cleanup_timeout_seconds, plus a
     second per hundred words past the first hundred (long dictations take longer
@@ -260,9 +281,13 @@ def _cleanup_client(cfg: PolishCfg):
 
 # What models put around the answer. Each pattern is narrow on purpose: "Here's the
 # plan: ship Friday" and "Let me know if you need anything" are things people dictate.
+# A preamble ends its line, unless it names the cleanup itself ("Here is the cleaned
+# text: ..."), and it is kept whenever its opening words are in what you said.
 _PREAMBLE_RE = re.compile(
-    r"^(?:(?:here is|here's)\b[^\n:]*\b(?:clean\w*|correct\w*|edit\w*|polish\w*|text|version|transcript\w*|"
-    r"dictation|result)\b[^\n:]*:[ \t]*\n*|cleaned(?: up)? text:[ \t]*\n*|sure\b[^\n]*:[ \t]*\n+)",
+    r"^(?:(?:here is|here's)\b[^\n:]*\b(?:clean\w*|correct\w*|polish\w*|transcript\w*|dictation)\b[^\n:]*:"
+    r"[ \t]*\n*"
+    r"|(?:here is|here's)\b[^\n:]*\b(?:edit\w*|text|version|result|rewrit\w*|revis\w*)\b[^\n:]*:[ \t]*(?:\n+|$)"
+    r"|cleaned(?: up)? text:[ \t]*\n*|sure\b[^\n]*:[ \t]*(?:\n+|$))",
     re.IGNORECASE,
 )
 _SIGNOFF_RE = re.compile(
@@ -273,13 +298,33 @@ _SIGNOFF_RE = re.compile(
 _QUOTES = (('"', '"'), ("\u201c", "\u201d"), ("'", "'"))
 
 
+def _words(text: str) -> str:
+    """Lowercase letters, digits and single spaces, padded: for "were these words said"."""
+    return " " + " ".join(re.sub(r"[^a-z0-9]+", " ", text.lower().replace("'", "")).split()) + " "
+
+
+def _strip_preamble(text: str, request: str) -> str:
+    m = _PREAMBLE_RE.match(text)
+    if not m:
+        return text
+    opening = " ".join(_words(m.group(0)).split()[:4])
+    if opening and f" {opening} " in _words(request):
+        return text                                   # you said it: "Here's the updated version: ..."
+    return text[m.end():]
+
+
 def strip_chatter(text: str, request: str = "") -> str:
     """Remove what a model adds around the answer: a "Here is the cleaned text:" line,
     code fences or quotes around all of it (unless the request had quotes of its own),
-    and a closing "Let me know if you'd like any changes"."""
-    text = _SIGNOFF_RE.sub("", _PREAMBLE_RE.sub("", text.strip())).strip()
+    and a closing "Let me know if you'd like any changes". Words that are in the request
+    stay: they were dictated."""
+    text = _strip_preamble(text.strip(), request)
+    m = _SIGNOFF_RE.search(text)
+    if m and f" {' '.join(_words(m.group(0)).split()[:5])} " not in _words(request):
+        text = text[:m.start()]
+    text = text.strip()
     fenced = re.fullmatch(r"```[\w-]*\n(.*?)\n?```", text, flags=re.DOTALL)
-    if fenced:
+    if fenced and "```" not in request:
         text = fenced.group(1).strip()
     if not re.search(r"[\"\u201c\u201d]|\bquote\b", request, re.IGNORECASE):
         for start, end in _QUOTES:
@@ -290,14 +335,17 @@ def strip_chatter(text: str, request: str = "") -> str:
     return text
 
 
-def _claude(system: str, user: str, cfg: PolishCfg) -> str | None:
+def _claude(system: str, user: str, cfg: PolishCfg, timeout: float | None = None) -> str | None:
     params = claude_request(cfg.cleanup_model or cfg.model, cfg.effort, system, user)
-    params["timeout"] = _budget(cfg, user)
+    params["timeout"] = timeout or _budget(cfg, user)
     c = _cleanup_client(cfg)
     response = c.beta.messages.create(**params) if "betas" in params else c.messages.create(**params)  # type: ignore[attr-defined]
     if response.stop_reason == "refusal":
         log.warning("refused (%s)", getattr(response.stop_details, "category", None))
         return None
+    if response.stop_reason == "max_tokens":
+        # Half an answer typed as if it were all of it loses words: the caller falls back.
+        raise PolishUnavailable("Claude stopped before the end")
     u = response.usage
     log.debug("cleanup tokens: %d in (%d cached) / %d out", u.input_tokens,
               getattr(u, "cache_read_input_tokens", 0) or 0, u.output_tokens)
@@ -306,6 +354,21 @@ def _claude(system: str, user: str, cfg: PolishCfg) -> str | None:
 
 # Ollama unloads an idle model after 5 minutes, and loading it again costs seconds.
 OLLAMA_KEEP_ALIVE = "30m"
+# The context window a dictation normally gets. A different num_ctx makes Ollama load
+# the model again, so it only grows (in powers of two) for a long dictation.
+OLLAMA_MIN_CTX = 2048
+
+
+def ollama_options(system: str, user: str) -> dict:
+    """Room for the whole answer and the whole prompt: a reply cut at num_predict, or a
+    prompt longer than num_ctx (Ollama then drops its start, the rules), loses words."""
+    words = len(user.split())
+    num_predict = max(400, 2 * words)                       # a cleaned dictation is about as long as it was
+    needed = (len(system) + len(user)) // 3 + num_predict     # ~3 characters a token, generously
+    num_ctx = OLLAMA_MIN_CTX
+    while num_ctx < needed:
+        num_ctx *= 2
+    return {"temperature": 0.2, "num_predict": num_predict, "num_ctx": num_ctx}
 
 
 def _post_ollama(cfg: PolishCfg, path: str, payload: dict, timeout: float) -> dict:
@@ -324,28 +387,30 @@ def warm(cfg: PolishCfg) -> None:
             _cleanup_client(cfg).models.retrieve(cfg.cleanup_model or cfg.model)  # type: ignore[attr-defined]
         elif which == "ollama":
             # Loading a model can take a while on a CPU; this runs in the background.
-            _post_ollama(cfg, "/api/generate", {"model": cfg.ollama_model, "prompt": "", "keep_alive": OLLAMA_KEEP_ALIVE},
-                         timeout=60)
+            _post_ollama(cfg, "/api/generate", {"model": cfg.ollama_model, "prompt": "", "keep_alive": OLLAMA_KEEP_ALIVE,
+                                                "options": {"num_ctx": OLLAMA_MIN_CTX}}, timeout=60)
     except Exception as exc:  # noqa: BLE001 - only a warm-up
         log.debug("cleanup warm-up failed: %s", exc)
 
 
-def _ollama(system: str, user: str, cfg: PolishCfg) -> str | None:
+def _ollama(system: str, user: str, cfg: PolishCfg, timeout: float | None = None) -> str | None:
     # The long prompt is written for Claude; a small local model does better with the short one.
     small = SYSTEM_PROMPT_SMALL if system == SYSTEM_PROMPT else system
-    budget = _budget(cfg, user) * 2           # a model on this machine's CPU is slower than Haiku
+    budget = timeout or _budget(cfg, user) * 2           # a model on this machine's CPU is slower than Haiku
     try:
         data = _post_ollama(cfg, "/api/chat", {
             "model": cfg.ollama_model,
             "stream": False,
             "keep_alive": OLLAMA_KEEP_ALIVE,
-            "options": {"temperature": 0.2, "num_predict": 400, "num_ctx": 2048},
+            "options": ollama_options(small, user),
             "messages": [{"role": "system", "content": small}, {"role": "user", "content": user}],
         }, timeout=budget)
     except TimeoutError as exc:
         # Ollama is up but slow: not an outage, so no back-off; say what would help.
         raise PolishUnavailable(f"Ollama took longer than {budget:.0f} s; a smaller model is faster "
                                 f"(ollama_model = \"qwen2.5:1.5b\")") from exc
+    if data.get("done_reason") == "length":
+        raise PolishUnavailable("Ollama stopped before the end")
     return strip_chatter(str(data.get("message", {}).get("content", "")), user)
 
 
@@ -358,20 +423,25 @@ def _ping(which: str, cfg: PolishCfg) -> None:
             pass
 
 
-def _complete(system: str, user: str, cfg: PolishCfg) -> str | None:
+def _complete(system: str, user: str, cfg: PolishCfg, *, timeout: float | None = None) -> str | None:
     """Dictation cleanup and command mode. Raises PolishUnavailable at once while the
-    breaker is open (the backend failed to answer within the last cooldown)."""
-    if not breaker.allow():
-        raise PolishUnavailable("cleanup offline")
+    breaker is open (the backend failed to answer within the last cooldown).
+    `timeout` replaces the dictation budget (command mode writes longer answers); a
+    request that runs into it was slow, not offline, so it doesn't open the breaker."""
     which = backend(cfg)
     if which == "none":
         raise PolishUnavailable("no cleanup backend: add an Anthropic key or start Ollama")
+    if not breaker.allow():
+        raise PolishUnavailable("cleanup offline")
     try:
-        out = _claude(system, user, cfg) if which == "claude" else _ollama(system, user, cfg)
+        fn = _claude if which == "claude" else _ollama
+        out = fn(system, user, cfg, timeout=timeout)
     except Exception as exc:
-        if is_outage(exc):
+        if is_outage(exc) and not (timeout and _is_timeout(exc)):
             breaker.failed(exc)
             breaker.probe(lambda: _ping(which, cfg))
+        elif breaker.open and not is_outage(exc):
+            breaker.succeeded()               # it answered (with an error of its own): not offline
         raise
     breaker.succeeded()
     return out
@@ -432,7 +502,10 @@ def command(instruction: str, selection: str, cfg: PolishCfg, app: str = "", tit
     context = _context(cfg, app, title, style, vocabulary)
     if selection:
         context += f"<selection>\n{selection}\n</selection>\n"
-    result = _complete(COMMAND_PROMPT, f"{context}<instruction>\n{instruction}\n</instruction>", cfg)
+    user = f"{context}<instruction>\n{instruction}\n</instruction>"
+    # A rewrite can be as long as the selection, and nothing is typed until it is done:
+    # wait like notes do, not like a dictation.
+    result = _complete(COMMAND_PROMPT, user, cfg, timeout=max(cfg.timeout_seconds, _budget(cfg, user) * 2))
     if not result:
         raise PolishUnavailable("the model returned nothing")
     return result

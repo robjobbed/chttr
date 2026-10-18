@@ -318,7 +318,7 @@ def test_an_unreachable_model_costs_one_notice_and_no_waiting(daemon, monkeypatc
 
     calls = []
 
-    def dead(system, user, cfg):
+    def dead(system, user, cfg, timeout=None):
         calls.append(user)
         raise anthropic.APIConnectionError(request=None)
 
@@ -342,3 +342,39 @@ def test_model_output_gets_the_terminal_rules(daemon, monkeypatch, caplog):
         assert dictate(daemon, "um run the whole test suite again period") == "Run the whole test suite again"
     polish_lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("polish (")]
     assert polish_lines and "test suite" not in polish_lines[0]          # word count, not your words
+
+
+def test_a_slow_answer_does_not_silence_the_next_outage(daemon, monkeypatch, offline):
+    import anthropic
+
+    monkeypatch.setattr(Dm.P, "backend", lambda cfg: "claude")
+    answers = [Dm.P.PolishUnavailable("Ollama took longer than 10 s"), "Fine, ship it today.",
+               anthropic.APIConnectionError(request=None)]
+
+    def backend_(system, user, cfg, timeout=None):
+        a = answers.pop(0)
+        if isinstance(a, Exception):
+            raise a
+        return a
+
+    monkeypatch.setattr(Dm.P, "_claude", backend_)
+    notes = []
+    monkeypatch.setattr(daemon.feedback, "notify", lambda title, body="", **kw: notes.append((title, body)))
+    dictate(daemon, "um so ship it today then")
+    dictate(daemon, "um so ship it today then")             # it worked again
+    dictate(daemon, "um so ship it today then")             # a real outage: announced
+    notes = [n for n in notes if "leanup" in n[0]]
+    assert notes == [("chttr: cleanup unavailable", "Ollama took longer than 10 s"),       # no class name
+                     ("Cleanup offline", "Typing locally cleaned text until Claude answers again.")]
+
+
+def test_chat_keeps_line_breaks_when_they_are_typed_safely(daemon, monkeypatch):
+    monkeypatch.setattr(Dm, "focused_window", lambda: ("Slack", "general"))
+    chat = daemon.cfg.mode_for("Slack")
+    assert chat.name == "chat"
+    assert dictate(daemon, "hi all new paragraph the build is green") == "Hi all. The build is green"
+    chat.newline = "shift+enter"                             # line breaks typed without sending
+    assert dictate(daemon, "hi all new paragraph the build is green") == "Hi all\n\nThe build is green"
+    monkeypatch.setattr(Dm.P, "backend", lambda cfg: "claude")
+    monkeypatch.setattr(Dm.P, "polish", lambda *a, **k: "Hi all,\n\nThe build is green.")
+    assert dictate(daemon, "hi all new paragraph the build is green") == "Hi all,\n\nThe build is green."

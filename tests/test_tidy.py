@@ -15,6 +15,7 @@ MEDIUM = [
     ("um so send the contract comma then new line scratch that okay", "So send the contract, okay."),
     # spoken punctuation
     ("send it Friday period", "Send it Friday."),
+    ("call me at 5 period", "Call me at 5."),
     ("Send it Friday period.", "Send it Friday."),
     ("Send it Friday period Then call me.", "Send it Friday. Then call me."),
     ("Are you coming question mark", "Are you coming?"),
@@ -33,18 +34,38 @@ MEDIUM = [
     ("Add a comma after the name.", "Add a comma after the name."),
     ("We need a new line of products.", "We need a new line of products."),
     ("Use a dash here.", "Use a dash here."),
+    # "period" the noun, where the recognizer put its own stop after it
+    ("It was a difficult period.", "It was a difficult period."),
+    ("We met for a short period.", "We met for a short period."),
+    ("Q3 was a strong period.", "Q3 was a strong period."),
+    ("The study ran for a two-year period.", "The study ran for a two-year period."),
+    ("Refunds come after a 14 day period.", "Refunds come after a 14 day period."),
+    ("The next bullet point is about pricing.", "The next bullet point is about pricing."),
+    ("They make a brand new line of shoes.", "They make a brand new line of shoes."),
+    ("Colon cancer screening is next week.", "Colon cancer screening is next week."),
+    ("Comma placement matters.", "Comma placement matters."),
     # line breaks and lists
     ("first line new line second line new paragraph third", "First line\nSecond line\n\nThird"),
     ("Okay. New line. Next thing.", "Okay.\nNext thing."),
     ("bullet point apples bullet point pears", "- Apples\n- Pears"),
     ("Shopping list colon bullet point apples bullet point pears", "Shopping list:\n- Apples\n- Pears"),
-    ("Line one new line line two scratch that line three", "Line one\nLine three"),
+    ("Line one new line line two, scratch that, line three", "Line one\nLine three"),
     # scratch that
     ("Send it Tuesday. Scratch that, send it Friday.", "Send it Friday."),
     ("Send it Tuesday. Delete that. Send it Friday.", "Send it Friday."),
     ("One, two, three, scratch that", "One, two"),
     ("scratch that", ""),
+    ("Send it Tuesday scratch that.", ""),                                           # set off on one side is enough
     ("Please delete that file.", "Please delete that file."),                       # a sentence, not a command
+    # ... and these are sentences too, whatever is around them
+    ("Did you delete that?", "Did you delete that?"),
+    ("Please don't delete that.", "Please don't delete that."),
+    ("Should I delete that?", "Should I delete that?"),
+    ("The email was rude, so I had to delete that.", "The email was rude, so I had to delete that."),
+    ("Thanks, I'll scratch that off the list.", "Thanks, I'll scratch that off the list."),
+    ("I'll scratch that off the list.", "I'll scratch that off the list."),
+    ("Can you scratch that itch", "Can you scratch that itch."),
+    ("We should strike that.", "We should strike that."),
     # fillers and stutters
     ("Uh, the the report is done.", "The report is done."),
     ("I I I think so", "I think so."),
@@ -64,6 +85,8 @@ MEDIUM = [
     ("Meet at 5 p.m. tomorrow", "Meet at 5 p.m. tomorrow."),
     ("Wait , what ?", "Wait, what?"),
     ("Sounds good", "Sounds good"),                                                 # too short to need a period
+    ("user_id is null", "user_id is null."),                                        # identifiers keep their case
+    ("x86 builds are slower", "x86 builds are slower."),
 ]
 
 
@@ -82,6 +105,9 @@ CODE = [
     ("cd ..", "cd .."),
     ("Wait...", "Wait..."),
     ("open main.py", "open main.py"),
+    ("if ! grep foo bar", "if ! grep foo bar"),                                    # shell meaning kept
+    ("sudo !!", "sudo !!"),
+    ("echo hi ; ls", "echo hi; ls"),
 ]
 
 
@@ -94,6 +120,12 @@ def test_chat_folds_line_breaks_into_sentences():
     assert tidy("first line new line second line new paragraph third", chat=True) == "First line. Second line. Third"
     assert tidy("Hi Dana, new line thanks for the notes.", chat=True) == "Hi Dana. Thanks for the notes."
     assert tidy("Hi Dana,\nthanks.", chat=True) == "Hi Dana, thanks."
+
+
+def test_chat_keeps_line_breaks_when_the_app_types_them_safely():
+    # chat modes whose line breaks are typed as Shift+Enter (no message is sent)
+    assert tidy("first line new paragraph second line", chat=True, fold_newlines=False) == "First line\n\nSecond line"
+    assert T.for_app("Hey\n\nAre you free", chat=True, fold_newlines=False) == "Hey\n\nAre you free"
 
 
 def test_chat_keeps_a_dictated_list():
