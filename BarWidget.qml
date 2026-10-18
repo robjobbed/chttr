@@ -59,8 +59,9 @@ BarWidget {
   function press(button) {
     if (chttrState === "setup") {
       Quickshell.execDetached(["omarchy-launch-floating-terminal-with-presentation", pluginDir + "/bin/setup"])
-    } else if (chttrState === "off" && button !== Qt.RightButton) {
-      // Start the service; if that fails, show chttr doctor so the click never does nothing.
+    } else if (chttrState === "off") {
+      // Any click starts the service (a meeting can't start without it); if that fails,
+      // show chttr doctor so the click never does nothing.
       Quickshell.execDetached(["sh", "-c", "systemctl --user start chttr.service || " +
                                "exec omarchy-launch-floating-terminal-with-presentation \"$0\" doctor", exe])
     } else if (button === Qt.RightButton) {

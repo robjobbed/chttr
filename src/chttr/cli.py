@@ -91,18 +91,34 @@ def _status_json(state: str, info: dict | None = None) -> str:
                        "meeting_seconds": seconds, "cleanup": cleanup, "hotkey": dictate})
 
 
+_listening: dict = {}       # the socket fallback's last answer, so --follow asks every 2 s at most
+
+
 def _current_state() -> tuple[str, dict]:
-    """The state to show and what the daemon wrote with it: "off" when no daemon is
-    running (no state.json, or the process that wrote it is gone)."""
+    """The daemon's state (idle/recording/transcribing/loading, or "off" when no daemon
+    is running: no state.json, or the process that wrote it is gone) and what it wrote
+    with it. A meeting in progress is left to _status_json, so plain output keeps the
+    daemon's own state."""
+    def mtime(path: Path) -> int | None:
+        try:
+            return path.stat().st_mtime_ns
+        except OSError:
+            return None
+
     info = read_state_json()
     if info and daemon_alive(info):
         state = str(info.get("state") or read_state())
-        return _with_meeting(state if state in ICONS and state != "off" else "idle"), info
+        return (state if state in ICONS and state not in ("off", "meeting") else "idle"), info
     # A daemon from before 1.1 writes no state.json, and a second `chttr daemon` that
-    # gave up (one was already running) leaves its own pid behind: ask the socket.
-    if daemon_listening():
+    # gave up (one was already running) leaves its own pid behind: ask the socket. Each
+    # ask costs the daemon a request, so the answer stands for 2 s unless a new socket
+    # or a rewritten state.json says something changed.
+    key = tuple(mtime(p) for p in (C.SOCKET_PATH, C.STATE_JSON)) + (str(C.SOCKET_PATH),)
+    if _listening.get("key") != key or time.monotonic() - _listening.get("at", 0.0) > 2:
+        _listening.update(key=key, at=time.monotonic(), up=daemon_listening())
+    if _listening["up"]:
         state = read_state()
-        return _with_meeting(state if state in ICONS and state != "off" else "idle"), info
+        return (state if state in ICONS and state not in ("off", "meeting") else "idle"), info
     return "off", info
 
 

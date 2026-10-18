@@ -21,12 +21,16 @@ ALIVE_PID = 2**22 + 1000        # above the largest pid_max: never a real proces
 
 @pytest.fixture(autouse=True)
 def runtime(tmp_path, monkeypatch):
-    """A runtime dir of our own for every test (never the real one)."""
+    """A runtime dir of our own for every test (never the real one), and a `send` that
+    fails the test: status must never wait on (or crash over) the daemon's socket."""
     rt = tmp_path / "chttr"
     rt.mkdir()
     for name, path in (("RUNTIME_DIR", rt), ("SOCKET_PATH", rt / "chttr.sock"), ("STATE_FILE", rt / "state"),
                        ("STATE_JSON", rt / "state.json"), ("MEETING_STATE_FILE", rt / "meeting")):
         monkeypatch.setattr(C, name, path)
+    monkeypatch.setattr(cli, "send", lambda *a, **k: pytest.fail("status must not talk to the daemon"))
+    monkeypatch.setattr(K, "send", lambda *a, **k: pytest.fail("status must not talk to the daemon"))
+    monkeypatch.setattr(cli, "_listening", {})
     return rt
 
 
@@ -90,6 +94,15 @@ def test_a_live_daemon_reports_the_state_from_the_json(capsys, alive):
     assert data["tooltip"] == "chttr: listening · let go of Insert to type"
 
 
+def test_plain_status_keeps_the_daemons_own_state_during_a_meeting(capsys, alive):
+    """Scripts compare `chttr status` with idle/recording/transcribing; only the bar
+    (--json) shows the meeting."""
+    write_state("idle")
+    C.MEETING_STATE_FILE.write_text(json.dumps({"title": "", "code": "", "started": time.time() - 5}))
+    assert status(capsys) == "idle"
+    assert json.loads(status(capsys, json_out=True))["alt"] == "meeting"
+
+
 def test_loading(capsys, alive):
     write_state("loading", model="loading")
     data = json.loads(status(capsys, json_out=True))
@@ -111,6 +124,23 @@ def test_a_daemon_from_before_state_json_still_shows(capsys, tmp_path):
         assert status(capsys) == "transcribing"
     finally:
         server.close()
+
+
+def test_the_socket_fallback_asks_every_2_seconds_at_most(monkeypatch, capsys):
+    asks = []
+    monkeypatch.setattr(cli, "daemon_listening", lambda: asks.append(1) or True)
+    C.SOCKET_PATH.write_text("")
+    C.STATE_FILE.write_text("idle", encoding="utf-8")
+    for _ in range(5):
+        assert cli._current_state()[0] == "idle"
+    assert len(asks) == 1
+    clock = time.monotonic()
+    monkeypatch.setattr(cli.time, "monotonic", lambda: clock + 2.5)
+    cli._current_state()
+    assert len(asks) == 2
+    write_state("idle", pid=ALIVE_PID)                 # a rewritten state.json: ask again now
+    cli._current_state()
+    assert len(asks) == 3
 
 
 def test_daemon_alive():
@@ -278,9 +308,14 @@ def test_follow_emits_on_changes_only(monkeypatch, capsys, alive):
 
 def test_follow_plain_text(monkeypatch, capsys, alive):
     write_state("idle")
-    lines = follow(monkeypatch, capsys, [lambda: None, lambda: write_state("recording"), lambda: None],
+
+    def meeting_starts():
+        C.MEETING_STATE_FILE.write_text(json.dumps({"title": "", "code": "", "started": time.time()}))
+
+    lines = follow(monkeypatch, capsys, [lambda: None, lambda: write_state("recording"), lambda: None,
+                                         lambda: write_state("idle"), meeting_starts, lambda: None],
                    json_out=False)
-    assert lines == ["idle", "recording"]
+    assert lines == ["idle", "recording", "idle"]          # a meeting doesn't change the plain state
 
 
 def test_status_never_raises_daemon_not_running(monkeypatch, capsys):

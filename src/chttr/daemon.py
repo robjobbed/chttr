@@ -130,25 +130,38 @@ class Daemon:
         # wrote it (a pid that is gone means chttr is off), the meeting, the cleanup
         # backend and the keys. The backend is probed off-thread at most once a minute
         # (the Ollama check can take half a second) and the file rewritten when it changes.
+        # A minute's refresh keeps it true while chttr sits idle: Ollama coming or going,
+        # a reload, a meeting cancelled.
         lock = self.__dict__.setdefault("_state_lock", threading.Lock())
         cache = getattr(self, "_cleanup_cache", None)
         if cache is None:
-            cache = self._cleanup_cache = {"backend": "", "polish": None, "at": 0.0, "probing": False}
+            cache = self._cleanup_cache = {"backend": "", "polish": None, "at": 0.0, "probing": False,
+                                           "written": None, "refreshing": False}
 
-        def dump() -> None:
+        def snapshot() -> dict:
             m = getattr(self, "meeting", None)
             since = getattr(self, "_state_since", None)
             if not since or since[0] != self.state:
                 since = self._state_since = (self.state, time.time())
-            info = {"state": self.state, "kind": getattr(self, "kind", "") if self.state == RECORDING else "",
+            return {"state": self.state, "kind": getattr(self, "kind", "") if self.state == RECORDING else "",
                     "since": since[1], "pid": os.getpid(),
                     "meeting": {"title": m.title, "code": m.code, "started": m.recorder.started} if m else None,
                     "cleanup": cache["backend"],
                     "hotkeys": {k: v for k, v in vars(self.cfg.hotkeys).items() if k != "backend"},
                     "model": "loading" if self.state == "loading" else "ready"}
-            tmp = C.STATE_JSON.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(info), encoding="utf-8")
-            os.replace(tmp, C.STATE_JSON)
+
+        def dump(only_if_changed: bool = False) -> None:
+            info = snapshot()
+            if only_if_changed and info == cache["written"]:
+                return
+            try:
+                tmp = C.STATE_JSON.with_suffix(".json.tmp")
+                tmp.write_text(json.dumps(info), encoding="utf-8")
+                os.replace(tmp, C.STATE_JSON)
+            except OSError as exc:
+                log.debug("could not write %s: %s", C.STATE_JSON, exc)
+                return
+            cache["written"] = info
 
         def probe(polish) -> None:
             try:
@@ -157,35 +170,43 @@ class Daemon:
                 log.debug("cleanup backend probe failed: %s", exc)
                 found = cache["backend"]
             with lock:
+                cache["probing"] = False
                 if self.cfg.polish is not polish or polish.backend != "auto":   # reloaded meanwhile
-                    cache["probing"] = False
                     return
-                changed = found != cache["backend"]
-                cache.update(backend=found, polish=polish, at=time.monotonic(), probing=False)
-                if changed:
-                    try:
-                        dump()
-                    except OSError as exc:
-                        log.debug("could not write %s: %s", C.STATE_JSON, exc)
+                cache.update(backend=found, polish=polish)
+                dump(only_if_changed=True)
+
+        def check_backend() -> None:          # with the lock held
+            polish = self.cfg.polish
+            if polish.backend != "auto":             # nothing to probe (and probe again if it becomes auto)
+                cache.update(backend=polish.backend, polish=None)
+            elif (cache["polish"] is not polish or time.monotonic() - cache["at"] > 60) and not cache["probing"]:
+                cache.update(probing=True, at=time.monotonic())
+                try:
+                    threading.Thread(target=probe, args=(polish,), name="cleanup-probe", daemon=True).start()
+                except RuntimeError:                 # interpreter shutting down
+                    cache["probing"] = False
+
+        def refresh(stop: threading.Event) -> None:
+            while not stop.wait(61):
+                with lock:
+                    check_backend()
+                    dump(only_if_changed=True)
 
         with lock:
             self.state = state
             tmp = C.STATE_FILE.with_suffix(".tmp")
             tmp.write_text(state, encoding="utf-8")
             os.replace(tmp, C.STATE_FILE)
-            polish = self.cfg.polish
-            if polish.backend != "auto":             # nothing to probe (and probe again if it becomes auto)
-                cache.update(backend=polish.backend, polish=None)
-            elif (cache["polish"] is not polish or time.monotonic() - cache["at"] > 60) and not cache["probing"]:
-                cache["probing"] = True
+            check_backend()
+            dump()
+            stop = getattr(self, "_stop", None)
+            if stop is not None and not cache["refreshing"]:
+                cache["refreshing"] = True
                 try:
-                    threading.Thread(target=probe, args=(polish,), name="cleanup-probe", daemon=True).start()
-                except RuntimeError:                 # interpreter shutting down
-                    cache["probing"] = False
-            try:
-                dump()
-            except OSError as exc:
-                log.debug("could not write %s: %s", C.STATE_JSON, exc)
+                    threading.Thread(target=refresh, args=(stop,), name="state-refresh", daemon=True).start()
+                except RuntimeError:
+                    cache["refreshing"] = False
 
     # ---- overlay -----------------------------------------------------------
     def _overlay_open(self, label: str) -> None:
