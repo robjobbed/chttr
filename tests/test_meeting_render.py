@@ -155,3 +155,117 @@ def test_notes_prompt_lists_each_speakers_share_of_the_talk(result):
 
     _, _, speakers, _, _ = _notes_inputs(result)
     assert "- Dana: named by Meet's captions (49% of talk time)" in speakers.splitlines()
+
+
+def test_done_title_says_what_was_saved(tmp_path, result):
+    directory = tmp_path / "m"
+    directory.mkdir()
+    store.write_json(directory / "result.json", result)
+    assert edit.done_title(directory) == "Notes saved"
+    result["notes"] = {**result["notes"], "style": "lite"}
+    store.write_json(directory / "result.json", result)
+    assert edit.done_title(directory) == "On-device notes saved"
+    result["notes"] = {}
+    store.write_json(directory / "result.json", result)
+    assert edit.done_title(directory) == "Transcript saved"
+    result["notes"] = {"error": "RuntimeError: overloaded"}
+    store.write_json(directory / "result.json", result)
+    assert edit.done_title(directory) == "Transcript saved"
+    assert edit.done_title(None) == "Transcript saved"
+
+
+def test_summary_line_counts_people_and_action_items(tmp_path, result):
+    directory = tmp_path / "m"
+    directory.mkdir()
+    store.write_json(directory / "result.json", result)
+    assert edit.summary_line(tmp_path / "x.md", directory) == "10 min · Rob, Dana, Speaker 1 · 1 action item"
+    result["speakers"].update({n: {**result["speakers"]["Dana"], "label": n} for n in ("Ali", "Sam")})
+    result["notes"]["action_items"] *= 3
+    store.write_json(directory / "result.json", result)
+    assert edit.summary_line(tmp_path / "x.md", directory) == "10 min · Rob, Dana, Speaker 1 (+2) · 3 action items"
+    result["notes"] = {}
+    store.write_json(directory / "result.json", result)
+    assert edit.summary_line(tmp_path / "x.md", directory).endswith("(+2)")
+
+
+def test_rename_forgets_the_voice_stored_under_the_wrong_name(tmp_path, cfg, result, monkeypatch):
+    voices_file = tmp_path / "voices.json"
+    monkeypatch.setattr(D.load_voices, "__defaults__", (voices_file,))
+    monkeypatch.setattr(D.save_voices, "__defaults__", (voices_file,))
+    voice = np.ones(8, dtype=np.float32) / np.sqrt(8)
+    other = np.array([1, -1] * 4, dtype=np.float32) / np.sqrt(8)
+    D.save_voices({"dana@x.com": D.Voice("dana@x.com", "Dana", "dana@x.com", voice, 3, "2026-10-01T10:00:00+00:00"),
+                   "ali@x.com": D.Voice("ali@x.com", "Ali", "ali@x.com", other, 2, "2026-10-01T10:00:00+00:00")})
+    directory = tmp_path / "meeting"
+    directory.mkdir()
+    store.write_json(directory / "result.json", result)
+    np.savez(directory / "speakers.npz", **{"0": voice})
+
+    edit.rename(directory, "Dana", "Sam", "", cfg)               # the captions named the wrong person
+
+    voices = D.load_voices()
+    assert "dana@x.com" not in voices and "sam" in voices and "ali@x.com" in voices
+    assert float(voices["sam"].embedding @ voice) > 0.99
+
+
+def test_rename_keeps_a_stored_voice_that_does_not_match(tmp_path, cfg, result, monkeypatch):
+    voices_file = tmp_path / "voices.json"
+    monkeypatch.setattr(D.load_voices, "__defaults__", (voices_file,))
+    monkeypatch.setattr(D.save_voices, "__defaults__", (voices_file,))
+    voice = np.ones(8, dtype=np.float32) / np.sqrt(8)
+    other = np.array([1, -1] * 4, dtype=np.float32) / np.sqrt(8)
+    D.save_voices({"dana@x.com": D.Voice("dana@x.com", "Dana", "dana@x.com", other, 9, "2026-10-01T10:00:00+00:00")})
+    directory = tmp_path / "meeting"
+    directory.mkdir()
+    store.write_json(directory / "result.json", result)
+    np.savez(directory / "speakers.npz", **{"0": voice})
+
+    edit.rename(directory, "Dana", "Sam", "sam@x.com", cfg)
+
+    assert set(D.load_voices()) == {"dana@x.com", "sam@x.com"}   # the real Dana sounds different: keep her
+
+
+class Run:
+    def __init__(self, stdout=""):
+        self.calls: list[list[str]] = []
+        self.stdout = stdout
+
+    def __call__(self, cmd, **kw):
+        self.calls.append(cmd)
+        return type("Out", (), {"stdout": self.stdout, "returncode": 0})()
+
+
+def test_notify_done_on_omarchy_opens_the_notes_on_click(tmp_path, result, monkeypatch):
+    monkeypatch.setattr(C, "MEETINGS_DATA_DIR", tmp_path / "meetings")
+    directory = tmp_path / "meetings" / "2026-10-11-140000"
+    directory.mkdir(parents=True)
+    md = tmp_path / "notes" / "2026-10-11 1400 Pricing call.md"
+    store.update_meta(directory, id=directory.name, markdown=str(md))
+    result["notes"]["style"] = "lite"
+    store.write_json(directory / "result.json", result)
+    run = Run()
+    monkeypatch.setattr(edit.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(edit.subprocess, "run", run)
+
+    edit.notify_done(md, "10 min · Rob, Dana", ["slack"], on_send=lambda d: None)
+
+    assert run.calls == [["omarchy-notification-send", "--app-name", "chttr", "-g", edit.GLYPH, "-u", "normal",
+                          "-t", "120000", "On-device notes saved: 2026-10-11 1400 Pricing call",
+                          "10 min · Rob, Dana\nClick to open.", "--exec", "xdg-open", str(md)]]
+
+
+def test_notify_done_elsewhere_waits_for_open_or_send(tmp_path, result, monkeypatch):
+    directory = tmp_path / "m"
+    directory.mkdir()
+    store.write_json(directory / "result.json", result)
+    run = Run(stdout="send:slack\n")
+    sent = []
+    monkeypatch.setattr(edit.shutil, "which", lambda name: None)
+    monkeypatch.setattr(edit.subprocess, "run", run)
+
+    edit.notify_done(tmp_path / "Pricing call.md", "10 min", ["slack"], on_send=sent.append, directory=directory)
+
+    (cmd,) = run.calls
+    assert cmd[0] == "notify-send" and "--wait" in cmd and "send:slack=Send to Slack" in cmd
+    assert cmd[-2:] == ["Notes saved: Pricing call", "10 min"]
+    assert sent == ["slack"]
