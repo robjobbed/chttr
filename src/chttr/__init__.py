@@ -1,6 +1,6 @@
 """chttr: Wispr Flow-style voice dictation for Omarchy / Hyprland."""
 
-__version__ = "1.0.0rc1"
+__version__ = "1.1.0"
 
 
 def main() -> None:

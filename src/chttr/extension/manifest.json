@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "chttr for Google Meet",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Tells chttr when you join a Meet call and whom the captions say is speaking, so meeting transcripts get names. Nothing leaves your computer.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAwXFuJCtE2CtX2+vqkoxqcjmPc7V8MWUFLVDjZCo4mYtlfGJl0BtL7dOLCNhwNOo0rwjhQADyablzWXgv2qf87cgZe/iwRaO9k9vM4tNbN0Mf17+F7HTE9CU1Jsck4dksJ1MmeDzKYruj5vt8y/tQZBF8L5aVavmejjw8yGsgMTLy2faWpci3mSi0aqPJCDU2XqQJ7yN8R8I9guCLAVeUvBY9ZvjdvYQmKPOTxgfbrrfpjyslfpD8JUdmISca58xVX0dYKdNYQeHTHsEJQwIDT8GwLJBP94WO8IKkxFqyNTdhR9RIA07Lt/44Z98rDKar46uU82VZLZINd7XQOp9LiwIDAQAB",
   "permissions": ["nativeMessaging"],

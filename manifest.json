@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "robjobbed.chttr",
   "name": "chttr",
-  "version": "1.0.0rc1",
+  "version": "1.1.0",
   "author": "robjobbed",
   "license": "MIT",
   "description": "Voice dictation and meeting transcripts for Omarchy. Hold Insert, talk, let go: local Parakeet speech-to-text, cleaned up by Claude, typed into any app. Records meetings (built for Google Meet) with speaker names from captions, your calendar and remembered voices. Click the widget once to set up.",
