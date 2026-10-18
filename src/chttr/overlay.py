@@ -10,7 +10,9 @@ closes.
 
     overlay.py [--label TEXT] [--captions] [--palette JSON]
 
-To try it by hand: printf 'show\\n0.05 -20\\nstate transcribing\\n' | overlay.py
+To try it by hand (the sleep keeps stdin open; it quits when stdin closes):
+
+    (printf 'show\\n0.05 -20\\nstate transcribing\\n'; sleep 5) | /usr/bin/python3 overlay.py
 """
 
 import argparse
@@ -48,11 +50,6 @@ BARS = 28
 W, H = 320, 72
 W_CAP, H_CAP = 460, 112     # with live captions
 TICK_MS = 33
-DECAY = 0.82                # per tick: how fast a bar falls back
-GAIN_WINDOW = 3.0           # seconds of levels the display gain follows
-GAIN_MIN_DB = -45.0         # a mic quieter than this isn't amplified further: silence stays flat
-DONE_HOLD, FADE = 0.9, 0.2  # "done": seconds shown, then seconds fading out
-NOTICE_HOLD = 1.5           # "nothing heard" / "error"
 SHIMMER_PERIOD = 1.1        # seconds per sweep across the bars
 LISTENING = ("listening", "command", "handsfree")
 # Used when the daemon sends no theme: lavender on near-black.
@@ -76,9 +73,9 @@ class Overlay:
         self.app.connect("activate", self.on_activate)
 
     def reset(self) -> None:
-        self.levels = [-90.0] * BARS    # recent rms history in dB, newest last
+        self.levels = [-90.0] * BARS    # recent levels in dB (falling off smoothly), newest last
         self.hot = [False] * BARS       # that reading was close to clipping
-        self.shown = [0.0] * BARS       # what each bar shows, 0..1, smoothed
+        self.shown = [0.0] * BARS       # what each bar shows, 0..1
         self.recent: deque[tuple[float, float]] = deque()   # (time, dB) for the display gain
         self.peak_db = -90.0
         self.caption = self.text = ""
@@ -174,23 +171,15 @@ class Overlay:
         if self.mode not in LISTENING:  # bars stay frozen once you let go
             return
         db = 20 * math.log10(min(max(rms, 1e-6), 1.0))
-        self.recent.append((time.monotonic(), db))
-        self.levels.append(db)
+        now = time.monotonic()
+        since = now - self.recent[-1][0] if self.recent else 0.0
+        self.recent.append((now, db))
+        level = lines.envelope(db, self.levels[-1], since)
+        self.levels.append(level)
         self.hot.append(peak_db > -1.0)
-        self.shown.append(self.gain(db, *self.gain_range()))
+        self.shown.append(lines.gain(level, *lines.gain_range(d for _, d in self.recent)))
         del self.levels[:-BARS], self.hot[:-BARS], self.shown[:-BARS]
         self.peak_db = peak_db
-
-    def gain_range(self) -> tuple[float, float]:
-        """(floor, top) in dB over the last few seconds. The top never drops below
-        GAIN_MIN_DB, so a quiet mic still fills the bars while plain silence stays flat."""
-        dbs = [d for _, d in self.recent] or [-90.0]
-        return min(max(min(dbs), -70.0), -55.0), max(max(dbs), GAIN_MIN_DB) + 1.5
-
-    @staticmethod
-    def gain(db: float, floor: float, top: float) -> float:
-        """A reading as a bar height, 0..1."""
-        return min(1.0, max(0.0, (db - floor) / (top - floor)))
 
     def show(self, label: str) -> None:
         self.label = label
@@ -221,24 +210,19 @@ class Overlay:
         self.phase += 0.15
         since = now - self.mode_t0
         if self.mode in LISTENING:
-            while self.recent and now - self.recent[0][0] > GAIN_WINDOW:
+            while self.recent and now - self.recent[0][0] > lines.GAIN_WINDOW:
                 self.recent.popleft()
-            floor, top = self.gain_range()
-            self.shown = [max(self.gain(db, floor, top), s * DECAY)
-                          for db, s in zip(self.levels, self.shown, strict=True)]
+            # The gain follows the last few seconds, so bars rescale as you get louder or quieter.
+            floor, top = lines.gain_range(d for _, d in self.recent)
+            self.shown = [lines.gain(db, floor, top) for db in self.levels]
         elif self.mode == "transcribing":
             # The waveform you just spoke settles into a low ridge for the shimmer to run along.
             self.shown = [s + (0.22 - s) * 0.08 for s in self.shown]
-        elif self.mode == "done":
-            if since >= DONE_HOLD + FADE:
-                self.hide()
-                return self.tick()
-            self.alpha = 1.0 if since < DONE_HOLD else 1.0 - (since - DONE_HOLD) / FADE
-        elif self.mode in ("error", "nospeech"):
-            if since >= NOTICE_HOLD:
-                self.hide()
-                return self.tick()
-            self.alpha = 1.0 if since < NOTICE_HOLD - FADE else (NOTICE_HOLD - since) / FADE
+        alpha = lines.fade(self.mode, since)
+        if alpha is None:
+            self.hide()
+            return self.tick()
+        self.alpha = alpha
         self.area.queue_draw()
         return True
 
@@ -334,7 +318,8 @@ class Overlay:
         cr.set_source_rgb(*self.fg)
         cr.select_font_face("sans-serif")
         cr.set_font_size(14)
-        text = self.fit(cr, " ".join(self.text.split()), width - 44 - 20) or "typed"
+        text = lines.fit(" ".join(self.text.split()), width - 44 - 20,
+                         lambda t: cr.text_extents(t).x_advance) or "typed"
         cr.move_to(44, mid + 5)
         cr.show_text(text)
 
@@ -350,21 +335,6 @@ class Overlay:
         mid = (H if not self.captions else height) / 2
         cr.move_to((width - ext.x_advance) / 2, mid + ext.height / 2 - 1)
         cr.show_text(text)
-
-    @staticmethod
-    def fit(cr, text: str, maxw: float) -> str:
-        """`text`, cut at a word with an ellipsis if it doesn't fit in `maxw`."""
-        if cr.text_extents(text).x_advance <= maxw:
-            return text
-        words = text.split()
-        while words:
-            words.pop()
-            trial = " ".join(words) + "…"
-            if cr.text_extents(trial).x_advance <= maxw:
-                return trial
-        while text and cr.text_extents(text + "…").x_advance > maxw:
-            text = text[:-1]
-        return text + "…" if text else ""
 
     def draw_caption(self, cr, width, top, height) -> None:
         """The tail of the live transcript, two lines at most, newest words kept."""

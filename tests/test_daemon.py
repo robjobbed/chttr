@@ -263,11 +263,13 @@ def test_screen_context_backs_off_when_atspi_never_answers(daemon, monkeypatch):
 class FakeOverlayProc:
     """Stands in for overlay.py: records what the daemon writes to it."""
 
-    spawned = []                # noqa: RUF012 - every spawn, reset by the fixture
+    spawned = []                # noqa: RUF012 - every spawn's command, reset by the fixture
+    procs = []                  # noqa: RUF012 - and the process
 
     def __init__(self, cmd, **kw):
         assert str(Dm.OVERLAY_SCRIPT) in cmd
         FakeOverlayProc.spawned.append(cmd)
+        FakeOverlayProc.procs.append(self)
         self.cmd = cmd
         self.written = bytearray()
         self.returncode = None
@@ -308,7 +310,7 @@ class FakeOverlayProc:
 @pytest.fixture
 def pill(daemon, monkeypatch):
     """The daemon on Hyprland with the overlay switched on (and a fake overlay process)."""
-    FakeOverlayProc.spawned = []
+    FakeOverlayProc.spawned, FakeOverlayProc.procs = [], []
     monkeypatch.setattr(Dm.subprocess, "Popen", FakeOverlayProc)
     monkeypatch.setattr(Dm, "current_desktop", lambda: _desk("hyprland"))
     monkeypatch.setattr(Dm.OP, "omarchy_palette", lambda path=None: None)
@@ -365,11 +367,13 @@ def test_nothing_heard(pill):
     assert pill.overlay.commands()[-1] == "state nospeech"
 
 
-def test_command_mode_pill(pill):
+def test_command_mode_pill(pill, monkeypatch):
+    monkeypatch.setattr(Dm.Daemon, "_run_command", lambda self, *a, **k: "")   # e.g. no model to run it
     dictate(pill, "make it shorter", verb="command")
     commands = pill.overlay.commands()
     assert commands[:2] == ["show command", "state command"]
-    assert commands[-1] == "hide"                       # no model: the notification explains, the pill goes
+    assert commands[-1] == "hide"                       # the notification explains; the pill goes
+    assert pill.overlay_mode == "hidden"
 
 
 def test_hands_free_pill(pill):
@@ -454,7 +458,9 @@ def test_an_overlay_that_keeps_dying_falls_back_to_notifications(pill, monkeypat
     assert "Waveform overlay off" not in pill.feedback.notes     # once could be a fluke
     pill.overlay_spawned_at -= Dm.OVERLAY_RESPAWN
     dictate(pill, "two")
-    assert "Waveform overlay off" in pill.feedback.notes
+    # After the dictation's own notifications, which share its slot and would replace it at once.
+    assert pill.feedback.notes[-3:] == ["Transcribing…", "Typed", "Waveform overlay off"]
+    assert all(p.stdin.closed for p in Doomed.procs)    # no BrokenPipeError in the journal at exit
     dictate(pill, "three")                               # within 30 s: no new process, notifications instead
     assert len(Doomed.spawned) == 2
     assert pill.overlay is None
@@ -497,3 +503,58 @@ def test_without_an_overlay_notifications_still_appear(daemon):
     notes.clear()
     dictate(daemon, "", secs=0.2)
     assert not any(title == "Transcribing…" for title, _ in notes)
+
+
+def test_overlay_warning_waits_for_the_next_recording_to_end(pill, monkeypatch):
+    class Doomed(FakeOverlayProc):
+        def __init__(self, cmd, **kw):
+            super().__init__(cmd, **kw)
+            self.returncode = 1
+
+    monkeypatch.setattr(Dm.subprocess, "Popen", Doomed)
+    pill.overlay_losses = 1                              # it died once already
+    pill.transcriber.texts = ["first"]
+    pill.transcriber.delays = [0.3]
+    pill.handle("start")
+    pill.handle("release")
+    pill.handle("start")                                 # recording again before "first" is typed
+    time.sleep(0.5)
+    assert pill.typed == ["first"] and "Waveform overlay off" not in pill.feedback.notes
+    pill.transcriber.texts = ["second"]
+    pill.handle("release")
+    wait_idle(pill)
+    assert pill.feedback.notes[-1] == "Waveform overlay off"
+    assert pill.feedback.notes.count("Waveform overlay off") == 1
+
+
+def test_an_overlay_that_cannot_start_with_the_daemon_says_so_then(pill, monkeypatch):
+    def no_python(cmd, **kw):
+        raise FileNotFoundError("/usr/bin/python3")
+
+    monkeypatch.setattr(Dm.subprocess, "Popen", no_python)
+    pill._overlay_warm()
+    assert pill.feedback.notes == ["Waveform overlay off"]
+
+
+def test_overlay_starts_once_wayland_shows_up(pill, monkeypatch):
+    """A daemon started before Hyprland's sockets exist sees no Wayland yet."""
+    monkeypatch.setattr(Dm, "current_desktop", lambda: _desk("unknown", session="unknown"))
+    pill._overlay_warm()
+    assert FakeOverlayProc.spawned == []
+    monkeypatch.setattr(Dm, "current_desktop", lambda: _desk("hyprland"))
+    dictate(pill, "hello")
+    assert len(FakeOverlayProc.spawned) == 1 and pill.overlay.commands()[-1] == "state done"
+    assert "Waveform overlay off" not in pill.feedback.notes
+
+
+def test_one_overlay_death_is_counted_once(pill):
+    dictate(pill, "one")
+    proc = pill.overlay
+    proc.returncode = 1
+    threads = [threading.Thread(target=pill._overlay_lost, args=(proc,)) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert pill.overlay is None and pill.overlay_losses == 1
+    assert proc.stdin.closed

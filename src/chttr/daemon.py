@@ -139,7 +139,9 @@ class Daemon:
     # press), shown on press, moved through transcribing -> done, hidden in between.
     overlay_spawned_at = 0.0            # monotonic time of the last spawn
     overlay_losses = 0                  # overlay processes that died in a row
-    overlay_unsupported = ""            # the desktop, when it has no layer-shell
+    overlay_unsupported = ""            # GNOME, which has no layer-shell
+    overlay_skipped = ""                # the desktop last found without Wayland (logged once each)
+    overlay_warning = ""                # a "Waveform overlay off" notice waiting for the dictation to end
     overlay_captions = False            # the running overlay was started with --captions
     overlay_palette: dict | None = None  # the theme it was last given
     overlay_mode = ""                   # the last state sent; "hidden" after a hide
@@ -149,6 +151,7 @@ class Daemon:
         try:
             if self.cfg.feedback.overlay and self.overlay is None:
                 self._overlay_spawn()
+            self._overlay_warn()
         except Exception:                   # the overlay is cosmetic; never stop the daemon over it
             log.debug("could not start the overlay", exc_info=True)
 
@@ -158,10 +161,17 @@ class Daemon:
         if self.overlay_spawned_at and time.monotonic() - self.overlay_spawned_at < OVERLAY_RESPAWN:
             return False                    # it died moments ago; notifications until it can be retried
         desk = current_desktop()
-        if desk.compositor == "gnome" or not desk.wayland:
-            # GNOME (Mutter) and X11 have no layer-shell: a regular window would steal focus.
+        if desk.compositor == "gnome":
+            # GNOME (Mutter) has no layer-shell: a regular window would steal focus.
             self.overlay_unsupported = desk.describe()
-            self._overlay_fail(f"no layer-shell on {desk.describe()}; notifications only")
+            self._overlay_fail(f"no layer-shell on {desk.describe()}; notifications only", tell=False)
+            return False
+        if not desk.wayland:
+            # X11 has none either. Asked again at each press: a daemon started before
+            # Hyprland's sockets appear sees no Wayland yet.
+            if desk.describe() != self.overlay_skipped:
+                self.overlay_skipped = desk.describe()
+                log.info("no waveform overlay on %s; notifications only", desk.describe())
             return False
         env = dict(os.environ)
         for lib in LAYER_SHELL_LIBS:
@@ -227,26 +237,46 @@ class Daemon:
             self._overlay_send(OP.format("text", text[:60]))
 
     def _overlay_settle(self) -> None:
-        """A dictation that ended without saying how (command mode with no model, say):
-        don't leave the pill shimmering."""
+        """The end of a dictation. One that ended without saying how (command mode with
+        no model, say) doesn't leave the pill shimmering, and a pending "Waveform overlay
+        off" notice is sent now that the dictation's own notifications are done."""
         if self.overlay_mode == "transcribing":
             self._overlay_state("hide")
+        self._overlay_warn()
 
-    def _overlay_fail(self, detail: str) -> None:
-        """The overlay can't run: say so once (in the log, and on desktops that could show it)."""
+    def _overlay_fail(self, detail: str, tell: bool = True) -> None:
+        """The overlay can't run: say so once, in the log and (on desktops that could
+        show it) in a notification. That waits for the dictation to end: its own
+        notifications share one slot and would replace it at once."""
         if not self.overlay_warned:
             self.overlay_warned = True
             log.warning("level overlay unavailable: %s", detail)
-            if not self.overlay_unsupported:
-                self.feedback.notify("Waveform overlay off", f"{detail[:160]}. See: chttr doctor",
-                                     urgency="normal", timeout_ms=8000)
+            if tell:
+                self.overlay_warning = f"{detail[:160]}. See: chttr doctor"
+
+    def _overlay_warn(self) -> None:
+        """Send the pending "Waveform overlay off" notice, unless a dictation is still going."""
+        if not self.overlay_warning or self._overlay_busy():
+            return
+        with self.overlay_lock:
+            body, self.overlay_warning = self.overlay_warning, ""
+        if body:
+            self.feedback.notify("Waveform overlay off", body, urgency="normal", timeout_ms=8000)
 
     def _overlay_lost(self, proc: subprocess.Popen) -> None:
         """The overlay exited or stopped reading. It's started again at the next press
         (at most every OVERLAY_RESPAWN seconds); dying twice in a row is reported."""
-        if self.overlay is not proc:
-            return                          # already dealt with
-        self.overlay = None
+        with self.overlay_lock:             # the audio thread and a key press can both get here
+            if self.overlay is not proc:
+                return                      # already dealt with
+            self.overlay = None
+        # A writer whose last flush failed would try again when garbage-collected and
+        # print a BrokenPipeError to the journal; closing it drops the data.
+        try:
+            if proc.stdin:
+                proc.stdin.close()
+        except (OSError, ValueError):
+            pass
         try:
             proc.kill()
             proc.wait(timeout=1)

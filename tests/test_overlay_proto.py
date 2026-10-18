@@ -175,3 +175,52 @@ def test_overlay_handles_every_command():
     for cmd in OP.COMMANDS:
         assert f'cmd == "{cmd}"' in source, cmd
     assert "--palette" in source and "--captions" in source and "--label" in source
+
+
+# ---- the overlay's drawing arithmetic (overlay_lines.py, no GTK) -------------
+
+def _lines():
+    return _overlay_loader_namespace()["lines"]
+
+
+def test_a_quiet_mic_fills_the_bars_and_silence_stays_flat():
+    L = _lines()
+    quiet = [-50.0, -42.0, -38.0, -60.0]                 # a laptop mic at arm's length
+    floor, top = L.gain_range(quiet)
+    assert L.gain(-38.0, floor, top) > 0.9               # its loudest moment nearly fills the pill
+    silence = [-62.0, -61.0, -63.0]
+    floor, top = L.gain_range(silence)
+    assert top == L.GAIN_MIN_DB + 1.5                    # not amplified past GAIN_MIN_DB
+    assert all(L.gain(db, floor, top) < 0.2 for db in silence)
+    assert L.gain_range([]) == (-70.0, L.GAIN_MIN_DB + 1.5)
+    assert L.gain(10.0, -60.0, -20.0) == 1.0 and L.gain(-90.0, -60.0, -20.0) == 0.0
+
+
+def test_bars_fall_back_smoothly_after_a_loud_moment():
+    L = _lines()
+    level, trail = -10.0, []
+    for _ in range(6):                                   # silence after a shout, a reading every 20 ms
+        level = L.envelope(-90.0, level, 0.02)
+        trail.append(level)
+    assert trail == sorted(trail, reverse=True) and trail[0] == -14.0
+    assert L.envelope(-5.0, -30.0, 0.02) == -5.0         # rising is instant
+    assert L.envelope(-90.0, -10.0, 5.0) == -30.0        # a long gap falls at most 0.1 s worth
+
+
+def test_done_holds_then_fades_then_hides():
+    L = _lines()
+    assert L.fade("done", 0.0) == 1.0 and L.fade("done", L.DONE_HOLD - 0.01) == 1.0
+    assert L.fade("done", L.DONE_HOLD + L.FADE / 2) == pytest.approx(0.5)
+    assert L.fade("done", L.DONE_HOLD + L.FADE) is None
+    assert L.fade("nospeech", L.NOTICE_HOLD - L.FADE / 2) == pytest.approx(0.5)
+    assert L.fade("error", L.NOTICE_HOLD) is None
+    assert L.fade("listening", 99.0) == L.fade("transcribing", 99.0) == 1.0   # those wait for the daemon
+
+
+def test_done_text_is_cut_at_a_word():
+    L = _lines()
+    width = len                                          # one unit per character
+    assert L.fit("hello world", 20, width) == "hello world"
+    assert L.fit("hello there world", 13, width) == "hello there…"
+    assert L.fit("supercalifragilistic", 8, width) == "superca…"
+    assert L.fit("", 8, width) == ""
