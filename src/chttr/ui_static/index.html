@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>chttr · meetings</title>
   <link rel="stylesheet" href="static/app.css">
+  <link rel="stylesheet" href="static/home.css">
 </head>
 <body>
   <header class="top">
@@ -13,7 +14,9 @@
       <input id="q" type="search" placeholder="Search every meeting… (try a name, a number, a decision)" aria-label="Search meetings">
     </form>
     <nav class="tabs" role="tablist">
+      <button class="tab" data-view="home" role="tab">Home</button>
       <button class="tab active" data-view="meetings" role="tab">Meetings</button>
+      <button class="tab" data-view="dictations" role="tab">Dictations</button>
       <button class="tab" data-view="actions" role="tab">Action items</button>
       <button class="tab" data-view="lingo" role="tab" title="Fix how chttr spells your words">Lingo</button>
     </nav>
@@ -26,5 +29,7 @@
   </main>
   <div id="toast" class="toast" role="status" hidden></div>
   <script src="static/app.js"></script>
+  <script src="static/home.js"></script>
+  <script src="static/dictations.js"></script>
 </body>
 </html>

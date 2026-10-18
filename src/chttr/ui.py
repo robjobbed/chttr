@@ -30,6 +30,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from . import config as C
 from . import library as L
+from . import ui_api
 from .dictionary import Dictionary
 
 log = logging.getLogger("chttr.ui")
@@ -164,6 +165,10 @@ class Handler(BaseHTTPRequestHandler):
 
                 return self._json([{"id": s.id, "name": s.name, "description": s.description}
                                    for s in load_styles().values()])
+            # other packages: extra API routes dispatch here
+            r = ui_api.route(path, q, self.cfg)
+            if r is not None:
+                return self._send(r[0], r[1], r[2])
             m = re.match(r"^/api/meeting/([^/]+)(/audio)?$", path)
             if m and _ID.match(unquote(m.group(1))):
                 mid = unquote(m.group(1))
