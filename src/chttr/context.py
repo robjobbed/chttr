@@ -57,6 +57,25 @@ def read_field(python: str, timeout: float = 0.6, before: int = 600, after: int 
                  int(data.get("caret", 0)), int(data.get("count", 0)))
 
 
+def probe(python: str, timeout: float = 2.0) -> dict:
+    """What `atspi_helper.py --probe` says: {"gi": bool, "bus": bool, "apps": N},
+    or {} if the helper couldn't run."""
+    try:
+        out = subprocess.run([python, "-I", str(HELPER), "--probe"], capture_output=True, text=True,
+                             timeout=timeout)
+        data = json.loads(out.stdout or "{}")
+    except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+        log.debug("AT-SPI probe failed: %s", exc)
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    try:
+        apps = int(data.get("apps") or 0)
+    except (TypeError, ValueError):
+        apps = 0
+    return {"gi": bool(data.get("gi")), "bus": bool(data.get("bus")), "apps": apps}
+
+
 def names_in(text: str, limit: int = 40) -> list[str]:
     """Name-like words: capitalized mid-sentence, or mixed case (iPhone, McAllister),
     and not ordinary English words."""

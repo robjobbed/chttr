@@ -74,26 +74,85 @@ def _is_chttr_extension(path: Path) -> bool:
         return path.name == "extension" and "chttr" in str(path)
 
 
-def _add_load_extension(flags: Path, ext: str) -> str:
-    """Add the extension to the browser's --load-extension flag (Omarchy loads its
-    own extensions the same way). Returns what was done."""
+def _tilde(path: Path) -> str:
+    try:
+        return "~/" + str(path.relative_to(Path.home()))
+    except ValueError:
+        return str(path)
+
+
+def _backup(flags: Path) -> None:
+    """Keep the flags file as it was before chttr first changed it (uninstall puts it back)."""
+    backup = flags.with_name(flags.name + ".bak-chttr")
+    if flags.exists() and not backup.exists():
+        shutil.copy2(flags, backup)
+
+
+def _add_flag(flags: Path, flag: str, value: str | None = None) -> str:
+    """Add a flag to a browser's flags file (Omarchy loads its own extensions the
+    same way). `--load-extension` takes a comma-separated list: `value` joins it,
+    replacing other checkouts of this extension. A bare flag (value None) is added
+    once. Returns what was done."""
     lines = flags.read_text(encoding="utf-8").splitlines() if flags.exists() else []
+    if value is None:
+        if any(line.strip() == flag or line.strip().startswith(flag + "=") for line in lines):
+            return "already set"
+        _backup(flags)
+        flags.parent.mkdir(parents=True, exist_ok=True)
+        flags.write_text("\n".join([*lines, flag]) + "\n", encoding="utf-8")
+        return f"added to {flags}"
     for i, line in enumerate(lines):
-        if line.strip().startswith("--load-extension="):
+        if line.strip().startswith(flag + "="):
             paths = line.strip().split("=", 1)[1].split(",")
-            if ext in paths:
+            if value in paths:
                 return "already loaded"
             # another checkout of this extension (same key, same ID) would clash
-            paths = [x for x in paths if not _is_chttr_extension(Path(x))]
-            backup = flags.with_name(flags.name + ".bak-chttr")
-            if not backup.exists():
-                backup.write_text("\n".join(lines) + "\n", encoding="utf-8")
-            lines[i] = "--load-extension=" + ",".join(paths + [ext])
+            paths = [x for x in paths if x and not _is_chttr_extension(Path(x))]
+            _backup(flags)
+            lines[i] = f"{flag}=" + ",".join([*paths, value])
             flags.write_text("\n".join(lines) + "\n", encoding="utf-8")
             return f"added to {flags}"
-    lines.append(f"--load-extension={ext}")
-    flags.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _backup(flags)
+    flags.parent.mkdir(parents=True, exist_ok=True)
+    flags.write_text("\n".join([*lines, f"{flag}={value}"]) + "\n", encoding="utf-8")
     return f"added to {flags}"
+
+
+def _add_load_extension(flags: Path, ext: str) -> str:
+    return _add_flag(flags, "--load-extension", ext)
+
+
+def _remove_extension(flags: Path) -> str | None:
+    """Take this extension (any checkout of it) out of --load-extension, dropping
+    the line when nothing else is left. When the file is then what it was before
+    chttr touched it, the backup goes too; a file chttr created is deleted."""
+    if not flags.exists():
+        return None
+    text = flags.read_text(encoding="utf-8")
+    lines, changed = [], False
+    for line in text.splitlines():
+        if line.strip().startswith("--load-extension="):
+            paths = line.strip().split("=", 1)[1].split(",")
+            keep = [x for x in paths if x and x != str(EXTENSION_DIR) and not _is_chttr_extension(Path(x))]
+            if keep != [x for x in paths if x]:
+                changed = True
+                if keep:
+                    lines.append("--load-extension=" + ",".join(keep))
+                continue
+        lines.append(line)
+    if not changed:
+        return None
+    backup = flags.with_name(flags.name + ".bak-chttr")
+    result = "\n".join(lines) + "\n" if lines else ""
+    if backup.exists() and backup.read_text(encoding="utf-8").rstrip("\n") == result.rstrip("\n"):
+        shutil.copy2(backup, flags)
+        backup.unlink()
+    elif not result.strip():
+        flags.unlink()
+        return f"removed {_tilde(flags)} (only chttr's extension was in it)"
+    else:
+        flags.write_text(result, encoding="utf-8")
+    return f"extension removed from {_tilde(flags)}"
 
 
 def install() -> list[str]:
@@ -117,4 +176,48 @@ def install() -> list[str]:
         (hosts / f"{HOST_NAME}.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
         done.append(f"native host registered for {config_dir.name}")
         done.append(f"extension {_add_load_extension(flags, str(EXTENSION_DIR))}")
+    return done
+
+
+def ensure_accessibility_flag() -> list[str]:
+    """Chromium only exposes page text to the accessibility bus with
+    --force-renderer-accessibility; add it to each installed browser's flags file."""
+    done = []
+    for config_dir, flags in BROWSER_DIRS:
+        if not config_dir.exists() and not flags.exists():
+            continue                    # installed but never started: no profile to read yet
+        result = _add_flag(flags, "--force-renderer-accessibility")
+        if result != "already set":
+            done.append(f"--force-renderer-accessibility {result} (restart {config_dir.name} to apply)")
+    return done
+
+
+def missing_accessibility_flag() -> list[Path]:
+    """Flags files of installed browsers that don't have --force-renderer-accessibility yet."""
+    out = []
+    for config_dir, flags in BROWSER_DIRS:
+        if not config_dir.exists() and not flags.exists():
+            continue
+        lines = flags.read_text(encoding="utf-8").splitlines() if flags.exists() else []
+        if not any(x.strip() == "--force-renderer-accessibility" for x in lines):
+            out.append(flags)
+    return out
+
+
+def uninstall() -> list[str]:
+    """Undo install(): the native host manifests, the --load-extension entry and the
+    wrapper script. Looks at every known browser, installed or not any more."""
+    done = []
+    for _, config_dir, flags in BROWSERS:
+        manifest = config_dir / "NativeMessagingHosts" / f"{HOST_NAME}.json"
+        if manifest.exists():
+            manifest.unlink()
+            done.append(f"native host removed from {config_dir.name}")
+        result = _remove_extension(flags)
+        if result:
+            done.append(result)
+    wrapper = C.DATA_DIR / "native-host"
+    if wrapper.exists():
+        wrapper.unlink()
+        done.append(f"removed {_tilde(wrapper)}")
     return done

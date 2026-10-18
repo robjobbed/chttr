@@ -7,8 +7,11 @@ desktops ship), like overlay.py. Prints one JSON object and exits:
     {"app": "...", "before": "...", "after": "...", "caret": 123, "count": 456}
 
 or {} when nothing focused is a readable text field. Never writes anything.
+With --probe it only says whether screen context can work here (for `chttr doctor`):
 
-    atspi_helper.py [--timeout SECONDS] [--before N] [--after N]
+    {"gi": true, "bus": true, "apps": 7}
+
+    atspi_helper.py [--timeout SECONDS] [--before N] [--after N] [--probe]
 """
 
 import argparse
@@ -17,12 +20,48 @@ import sys
 import time
 
 
+def probe() -> dict:
+    """Is PyGObject's Atspi here, does the accessibility bus answer, and how many
+    apps are on it. Never raises."""
+    out = {"gi": False, "bus": False, "apps": 0}
+    try:
+        import gi
+
+        gi.require_version("Atspi", "2.0")
+        gi.require_version("Gio", "2.0")
+        from gi.repository import Atspi, Gio, GLib
+    except (ImportError, ValueError):
+        return out
+    out["gi"] = True
+    try:
+        # The session bus hands out the accessibility bus's address (starting
+        # at-spi-bus-launcher if needed); no address, no screen context.
+        conn = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        reply = conn.call_sync("org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus", "GetAddress", None,
+                               GLib.VariantType.new("(s)"), Gio.DBusCallFlags.NONE, 1500, None)
+        out["bus"] = bool(reply.unpack()[0])
+    except Exception:  # noqa: BLE001 - no session bus, or no at-spi2-core
+        return out
+    try:
+        out["apps"] = int(Atspi.get_desktop(0).get_child_count())
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--timeout", type=float, default=0.6)
     ap.add_argument("--before", type=int, default=600)
     ap.add_argument("--after", type=int, default=200)
+    ap.add_argument("--probe", action="store_true")
     a = ap.parse_args()
+    if a.probe:
+        try:
+            print(json.dumps(probe()))
+        except Exception:  # noqa: BLE001 - --probe must always answer
+            print(json.dumps({"gi": False, "bus": False, "apps": 0}))
+        return 0
     try:
         import gi
 

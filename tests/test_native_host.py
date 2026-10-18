@@ -69,3 +69,70 @@ def test_load_extension_flag_is_added_once_and_replaces_old_copies(tmp_path):
     text = flags.read_text(encoding="utf-8")
     assert f"--load-extension=/opt/other,{ext}" in text
     assert (tmp_path / "chromium-flags.conf.bak-chttr").exists()
+
+
+def test_add_flag_adds_a_bare_flag_once_and_keeps_the_others(tmp_path):
+    flags = tmp_path / "chromium-flags.conf"
+    flags.write_text("--ozone-platform=wayland\n--load-extension=/opt/other\n")
+    assert NH._add_flag(flags, "--force-renderer-accessibility").startswith("added")
+    assert NH._add_flag(flags, "--force-renderer-accessibility") == "already set"
+    assert flags.read_text() == "--ozone-platform=wayland\n--load-extension=/opt/other\n--force-renderer-accessibility\n"
+    assert (tmp_path / "chromium-flags.conf.bak-chttr").read_text() == "--ozone-platform=wayland\n--load-extension=/opt/other\n"
+
+
+def test_add_flag_creates_a_missing_flags_file(tmp_path):
+    flags = tmp_path / "chrome-flags.conf"
+    assert NH._add_flag(flags, "--load-extension", "/x/extension").startswith("added")
+    assert flags.read_text() == "--load-extension=/x/extension\n"
+    assert not (tmp_path / "chrome-flags.conf.bak-chttr").exists()       # nothing to back up
+
+
+def test_ensure_accessibility_flag_only_touches_browsers_that_have_a_profile(tmp_path, monkeypatch):
+    used, unused = tmp_path / "chromium", tmp_path / "brave"
+    used.mkdir()
+    monkeypatch.setattr(NH, "BROWSER_DIRS", [(used, tmp_path / "chromium-flags.conf"), (unused, tmp_path / "brave-flags.conf")])
+    assert NH.missing_accessibility_flag() == [tmp_path / "chromium-flags.conf"]
+    done = NH.ensure_accessibility_flag()
+    assert len(done) == 1 and "restart chromium" in done[0]
+    assert (tmp_path / "chromium-flags.conf").read_text() == "--force-renderer-accessibility\n"
+    assert not (tmp_path / "brave-flags.conf").exists()
+    assert NH.ensure_accessibility_flag() == [] and NH.missing_accessibility_flag() == []
+
+
+def test_uninstall_takes_out_only_chttr(tmp_path, monkeypatch):
+    profile, flags = tmp_path / "chromium", tmp_path / "chromium-flags.conf"
+    profile.mkdir()
+    original = "--ozone-platform=wayland\n--load-extension=/opt/other\n"
+    flags.write_text(original)
+    monkeypatch.setattr(NH, "BROWSERS", [(("chromium",), profile, flags)])
+    monkeypatch.setattr(NH, "BROWSER_DIRS", [(profile, flags)])
+    monkeypatch.setattr(NH.C, "DATA_DIR", tmp_path / "data")
+    NH.install()
+    assert (profile / "NativeMessagingHosts" / f"{NH.HOST_NAME}.json").exists()
+    done = NH.uninstall()
+    assert not (profile / "NativeMessagingHosts" / f"{NH.HOST_NAME}.json").exists()
+    assert flags.read_text() == original and not (tmp_path / "chromium-flags.conf.bak-chttr").exists()
+    assert not (tmp_path / "data" / "native-host").exists()
+    assert any("native host removed" in line for line in done)
+    assert NH.uninstall() == []                                           # nothing left to do
+
+
+def test_uninstall_deletes_a_flags_file_chttr_created(tmp_path, monkeypatch):
+    profile, flags = tmp_path / "chromium", tmp_path / "chromium-flags.conf"
+    profile.mkdir()
+    monkeypatch.setattr(NH, "BROWSERS", [(("chromium",), profile, flags)])
+    monkeypatch.setattr(NH, "BROWSER_DIRS", [(profile, flags)])
+    monkeypatch.setattr(NH.C, "DATA_DIR", tmp_path / "data")
+    NH.install()
+    assert flags.exists()
+    NH.uninstall()
+    assert not flags.exists()
+
+
+def test_uninstall_keeps_flags_added_since(tmp_path, monkeypatch):
+    profile, flags = tmp_path / "chromium", tmp_path / "chromium-flags.conf"
+    profile.mkdir()
+    flags.write_text(f"--load-extension=/opt/other,{NH.EXTENSION_DIR}\n--enable-features=X\n")
+    monkeypatch.setattr(NH, "BROWSERS", [(("chromium",), profile, flags)])
+    NH.uninstall()
+    assert flags.read_text() == "--load-extension=/opt/other\n--enable-features=X\n"
